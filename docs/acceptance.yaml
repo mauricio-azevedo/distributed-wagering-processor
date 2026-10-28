@@ -1820,6 +1820,22 @@ entries:
     deliverySlice: schema-wallet-opening
     implementationStatus: planned
     verificationStatus: not-run
+  - id: SCHEMA-026
+    priority: required
+    requirement: No monetary column can store the non-finite NUMERIC value NaN.
+    contract: [money.finite-in-database, money.exact-persistence]
+    enforcement:
+      - Every monetary CHECK excludes it with <> 'NaN'::numeric. The range, equality and arithmetic checks do not exclude it, because PostgreSQL orders NaN above every number, NaN = NaN is true, and NaN propagates through addition.
+    scenario:
+      - By SQL as the runtime role, insert NaN into each monetary column: wallet balance, ledger amount, balance_before, balance_after, transaction amount and observed_balance.
+      - As the migrator role, drop the exclusion from the ledger amount, insert a NaN entry that satisfies every remaining per-row check and the deferred consistency triggers, restore the constraint NOT VALID, then insert another NaN entry.
+    expected:
+      - Every insert of the first scenario is refused by its own CHECK.
+      - The insert of the second scenario commits while the exclusion is absent, proving the positive-amount check, the balanced arithmetic and the commit-time chain all accept NaN; the insert after the constraint is restored is refused.
+    evidence: { testId: schema-refuses-non-finite-amounts, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
 
   # ---------------------------------------------------------------- API
   - id: API-001
@@ -1899,10 +1915,11 @@ entries:
 
   - id: API-006
     priority: required
-    requirement: A transient failure answers 503 with Retry-After and persists nothing.
-    contract: api.retry-after
+    requirement: A transient failure known to have occurred before commit answers 503 with Retry-After and persists nothing.
+    contract: [api.retry-after, api.transient-failure]
     enforcement:
       - Infrastructure errors classified as transient map to 503.
+      - A failure raised before the financial transaction commits leaves it rolled back, so the key is free and the resend is a new operation. The case where the commit outcome is unknown is API-013, and its expectation is the opposite.
     scenario:
       - Stop PostgreSQL; submit a bet; restart; submit the same request.
     expected:
@@ -1999,6 +2016,24 @@ entries:
       - Same sets, every row with a caller action.
     evidence: { testId: failure-codes-match-contract, layer: contract }
     deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+  - id: API-013
+    priority: required
+    requirement: An unknown commit outcome is recovered by resending the same idempotency key, and the operation takes effect exactly once.
+    contract: [api.indeterminate-commit, api.transient-failure, idem.replay-same-outcome]
+    enforcement:
+      - The reservation of the key is the insert of the transaction row, so the key is committed exactly when the financial effect is.
+      - A failure injected after commit returns, and before the response is written, reproduces a lost confirmation without the service knowing which side of the commit it is on.
+    scenario:
+      - Submit a bet with a failure injected after the database confirms the commit and before the response is written; resend the identical request with the same key.
+      - Submit a bet with the same failure injected before the commit; resend the identical request with the same key.
+    expected:
+      - The first submission answers 503 with Retry-After and its resend returns the stored outcome with idempotentReplay true and the original observed balance; one debit, one DEBIT entry and one version increment exist in total, and the events are the ones that first commit enqueued.
+      - The second submission answers 503 with Retry-After, persists nothing, and its resend is processed as new; one debit exists in total.
+      - Both wallets reconcile against their own ledgers.
+    evidence: { testId: unknown-commit-outcome-takes-effect-once, layer: integration }
+    deliverySlice: atomic-bet
     implementationStatus: planned
     verificationStatus: not-run
 
@@ -2526,6 +2561,20 @@ entries:
     expected:
       - The helper runs for every touched wallet and passes.
     evidence: { testId: final-invariant-every-suite, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+  - id: RECON-005
+    priority: required
+    requirement: Reconciliation never reports a wallet consistent on the strength of a non-finite stored value.
+    contract: [recon.calculation, money.finite-in-database, money.exact-persistence]
+    enforcement:
+      - Stored amounts are rebuilt through the same parser that refuses NaN, so a corrupted row fails to rehydrate instead of comparing equal to itself. The equality of recon.calculation cannot carry this guarantee: in SQL a NaN stored balance equals a NaN derived sum.
+    scenario:
+      - As the migrator role, drop the exclusion from the ledger amount and the wallet balance, store a NaN entry and a NaN stored balance for one wallet, restore both constraints NOT VALID, then reconcile that wallet.
+    expected:
+      - The wallet is never reported consistent; the failure is logged at error level with the walletId and the stored balance is left unchanged.
+    evidence: { testId: reconciliation-rejects-non-finite-data, layer: integration }
     deliverySlice: schema-wallet-opening
     implementationStatus: planned
     verificationStatus: not-run

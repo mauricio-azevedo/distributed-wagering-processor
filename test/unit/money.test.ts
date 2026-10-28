@@ -225,6 +225,29 @@ describe('money-is-bounded-by-storage', () => {
   });
 });
 
+describe('money-answers-its-sign-and-its-bound', () => {
+  test('isPositive is true above zero and false at or below it', () => {
+    expect(brl('0.01').isPositive()).toBe(true);
+    expect(brl(BOUND).isPositive()).toBe(true);
+    expect(brl('0.00').isPositive()).toBe(false);
+    expect(brl('1.00').negate().isPositive()).toBe(false);
+  });
+
+  test('the bound is exposed as the largest Money of a currency', () => {
+    expect(Money.bound('BRL').toJSON()).toEqual({ amount: BOUND, currency: 'BRL' });
+    expect(Money.bound('USD').currency).toBe('USD');
+  });
+
+  test('the exposed bound is the one arithmetic enforces', () => {
+    expect(() => Money.bound('BRL').add(brl('0.01'))).toThrow(MoneyOverflowError);
+    expect(Money.bound('BRL').subtract(brl('0.01')).add(brl('0.01')).toString()).toBe(BOUND);
+  });
+
+  test('the bound rejects a currency that is not an ISO 4217 code', () => {
+    expect(() => Money.bound('brl')).toThrow(MoneyValidationError);
+  });
+});
+
 describe('money-and-ledger-entry-are-immutable', () => {
   test('an operation returns a new instance and leaves both operands unchanged', () => {
     const left = brl('10.00');

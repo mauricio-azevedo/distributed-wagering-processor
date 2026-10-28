@@ -47,6 +47,15 @@ export class Money {
     return new Money(0n, parseCurrency(currency));
   }
 
+  /**
+   * The largest amount the service stores in a currency (`money.bound`). The places that have to
+   * refuse a credit before it crosses the bound measure the headroom against it, instead of
+   * provoking the `MoneyOverflowError` that `add` would throw (`wallet.balance-limit`).
+   */
+  static bound(currency: string): Money {
+    return new Money(MAX_MINOR_UNITS, parseCurrency(currency));
+  }
+
   add(other: Money): Money {
     this.assertSameCurrency(other);
 
@@ -62,6 +71,11 @@ export class Money {
 
   negate(): Money {
     return this.withMinorUnits(-this.minorUnits);
+  }
+
+  /** Strictly above zero: what an operation and a ledger entry require of their amount. */
+  isPositive(): boolean {
+    return this.minorUnits > 0n;
   }
 
   isLessThan(other: Money): boolean {

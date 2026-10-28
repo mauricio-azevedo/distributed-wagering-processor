@@ -74,6 +74,10 @@ small local helpers over custom verification or orchestration systems.
 
 Follow CONTRIBUTING.md for issue, branch, and PR conventions.
 
+Leave the project board alone. Its own workflows move a card to Backlog, In
+review, and Done; Ready and In progress are the maintainer's. Moving one from
+the CLI costs several calls and proves nothing about the change.
+
 Update the affected docs/acceptance.yaml entries in the same change.
 
 Report what changed, how it was verified, and any remaining limitations.

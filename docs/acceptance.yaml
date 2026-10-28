@@ -1,0 +1,2776 @@
+# Acceptance plan
+#
+# Every obligation of the service, mapped to the rules it realises (docs/system-contract.md), how it
+# is enforced, the scenario that proves it, the expected outcome and the test that will carry the
+# evidence. Implementation slices (docs/implementation-plan.md) turn entries green; this file is the
+# scoreboard and, at the end, the release report.
+#
+# Fields
+#   id                    <AREA>-<NNN>. Areas: MODEL MONEY WALLET TX LEDGER RULE IDEM CONC SCHEMA API
+#                         MSG OUTBOX REF OBS RECON OPS AUTH.
+#   priority              required | optional (optional entries are extensions, never scheduled by default)
+#   requirement           the obligation, in the system's own terms
+#   contract              rule id(s) from docs/system-contract.md
+#   enforcement           what makes it true: code, schema, configuration
+#   scenario / expected   the proving scenario and its observable outcome
+#   evidence.testId       stable identifier of the test that carries the evidence
+#   evidence.layer        unit | schema | integration | concurrency | contract | manual
+#   deliverySlice         slice id from docs/implementation-plan.md
+#   implementationStatus  planned | in-progress | implemented | deferred
+#   verificationStatus    not-run | passing | failing (passing requires implemented)
+#
+# A test id is traceability, not evidence: an entry is verified only when its status says so.
+
+version: 1
+entries:
+  # ---------------------------------------------------------------- MODEL
+  - id: MODEL-001
+    priority: required
+    requirement: Domain objects are created only through static factories; constructors are not reachable.
+    contract: model.private-constructors
+    enforcement:
+      - Private or protected constructors on Money, Wallet, WagerTransaction, WalletLedgerEntry, InboxMessage, OutboxMessage.
+      - Factories from, zero, open, create, receive, enqueue validate their inputs.
+    scenario:
+      - Compile a call to each constructor from outside the class.
+      - Create each object through its factory with valid input.
+    expected:
+      - The constructor call is a type error.
+      - The factory returns an instance in its initial state.
+    evidence: { testId: domain-factories-are-the-only-entry, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MODEL-002
+    priority: required
+    requirement: Rehydration rebuilds persisted state without re-validating transitions.
+    contract: model.rehydrate-no-revalidation
+    enforcement:
+      - rehydrate(state) assigns fields directly and runs no transition rule.
+    scenario:
+      - Rehydrate a WagerTransaction already in PROCESSED with a processedAt and a reference.
+      - Rehydrate a Wallet with version 7 and a non-zero balance.
+    expected:
+      - Both instances expose the stored state unchanged and throw nothing.
+    evidence: { testId: rehydrate-trusts-stored-state, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MODEL-003
+    priority: required
+    requirement: State changes happen through named transitions, and terminal transactions refuse any transition.
+    contract: model.explicit-transitions
+    enforcement:
+      - markProcessed, markPendingReference, reject and fail are the only mutators of status.
+      - Each transition checks isTerminal() first and throws InvalidTransactionStateError.
+    scenario:
+      - Move a PENDING transaction to PROCESSED, then call reject on it.
+    expected:
+      - The second call throws InvalidTransactionStateError and the status stays PROCESSED.
+    evidence: { testId: terminal-transaction-refuses-transitions, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MODEL-004
+    priority: required
+    requirement: Money and ledger entries are structurally immutable.
+    contract: [model.structural-immutability, money.immutable]
+    enforcement:
+      - Only readonly fields; no setters; every Money operation returns a new instance.
+    scenario:
+      - Add two Money values; attempt to assign a field of a WalletLedgerEntry.
+    expected:
+      - The operands are unchanged and the result is a new object; the assignment is a type error.
+    evidence: { testId: money-and-ledger-entry-are-immutable, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MODEL-005
+    priority: required
+    requirement: The domain layer imports nothing from frameworks, the ORM or transports.
+    contract: model.framework-free-domain
+    enforcement:
+      - Dependency rule checked by a test over the import graph of src/domain.
+    scenario:
+      - Collect every import under src/domain.
+    expected:
+      - None resolves to @nestjs, @mikro-orm, @aws-sdk or node:http.
+    evidence: { testId: domain-import-graph-is-clean, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MODEL-006
+    priority: required
+    requirement: Shapes are defined once, in the transport contracts; the code implements them and every amount is a string.
+    contract: [model.money-props-in-contracts, model.contract-first, api.contract-document]
+    enforcement:
+      - DTOs with validation implement docs/openapi.yaml; message and event classes implement docs/asyncapi.yaml; review on change.
+    scenario:
+      - Submit a bet, read the wallet, page the ledger and reconcile; capture one message and one event of each type.
+    expected:
+      - Every captured body and payload validates against the schema of its operation or message in the contract documents; every money field is a string with the two-decimal pattern.
+    evidence: { testId: payloads-validate-against-contracts, layer: contract }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- MONEY
+  - id: MONEY-001
+    priority: required
+    requirement: Money.from accepts exactly the two-decimal string form and nothing else.
+    contract: money.decimal-string
+    enforcement:
+      - Strict pattern match before parsing into bigint minor units.
+    scenario:
+      - Parse "0.00", "0.05", "460.00", "999999999999999999.99".
+    expected:
+      - All parse; toString returns the input unchanged.
+    evidence: { testId: money-accepts-two-decimal-strings, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-002
+    priority: required
+    requirement: Malformed amounts are rejected as domain validation errors.
+    contract: money.rejected-inputs
+    enforcement:
+      - Pattern match rejects before any arithmetic.
+    scenario:
+      - Parse "NaN", "Infinity", "1e3", "", "-1.00", "+1.00", " 1.00", "1,00", "01.00", "1.0", "1.000", "1000000000000000000.00", and the JSON number 1.
+    expected:
+      - Every input throws a validation error naming the offending value.
+    evidence: { testId: money-rejects-malformed-input, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-003
+    priority: required
+    requirement: No code path rounds an amount.
+    contract: money.no-rounding
+    enforcement:
+      - Money exposes no rounding operation; wrong scale is rejected at the boundary.
+    scenario:
+      - Parse "1.005"; add "0.10" and "0.20".
+    expected:
+      - '"1.005" is rejected; the sum is exactly "0.30".'
+    evidence: { testId: money-never-rounds, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-004
+    priority: required
+    requirement: Currency codes are three uppercase letters.
+    contract: money.currency-iso
+    enforcement:
+      - Pattern check in Money.from and in every DTO carrying money.
+    scenario:
+      - Parse money with currency "BRL", "brl", "BR", "BRLX".
+    expected:
+      - Only "BRL" is accepted.
+    evidence: { testId: money-currency-code-format, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-005
+    priority: required
+    requirement: Arithmetic and comparison across currencies throw a domain error.
+    contract: money.same-currency
+    enforcement:
+      - assertSameCurrency in add, subtract, isLessThan and equals.
+    scenario:
+      - Add 10.00 BRL and 10.00 USD; compare them.
+    expected:
+      - Both calls throw CurrencyMismatchError.
+    evidence: { testId: money-rejects-currency-mismatch, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-006
+    priority: required
+    requirement: An operation that moves money carries a strictly positive amount; a LOSS may carry zero.
+    contract: [money.positive-in-operations, money.zero-only-initial-balance]
+    enforcement:
+      - The per-kind variants of the submission schema in docs/openapi.yaml and docs/asyncapi.yaml bind the positive amount to BET, WIN, REFUND and ROLLBACK; the DTOs implement them on POST /wagering/transactions and on the queue message.
+    scenario:
+      - Submit a BET of "0.00", a WIN of "0.00", a REFUND of "0.00", a ROLLBACK of "0.00", a BET of "-5.00" and a LOSS of "-5.00".
+      - Submit a LOSS of "0.00" against a wallet holding 460.00.
+    expected:
+      - Every submission in the first group answers 400 VALIDATION_FAILED and persists no transaction row.
+      - The LOSS of "0.00" answers 200 PROCESSED with balance 460.00, no ledger entry and an unchanged version.
+    evidence: { testId: operation-amount-must-be-positive, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-007
+    priority: required
+    requirement: Zero is accepted as an initial balance and as a LOSS amount, and nowhere else.
+    contract: money.zero-only-initial-balance
+    enforcement:
+      - CreateWalletRequest allows "0.00"; the money-moving operation variants require a positive amount (MONEY-006); the ledger refuses "0.00" outright (LEDGER-006).
+    scenario:
+      - Open a wallet with "0.00".
+    expected:
+      - 201 with balance "0.00" and version 1.
+    evidence: { testId: zero-initial-balance-accepted, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-008
+    priority: required
+    requirement: A negative amount appears only as a reconciliation difference.
+    contract: money.signed-difference-only
+    enforcement:
+      - subtract yields the signed difference; operation DTOs reject signs; -0.00 is normalised to 0.00.
+    scenario:
+      - Compute 10.00 minus 12.50 as a difference; compute 10.00 minus 10.00.
+    expected:
+      - '"-2.50" and "0.00" respectively, never "-0.00".'
+    evidence: { testId: signed-difference-formatting, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-009
+    priority: required
+    requirement: No JavaScript number ever holds money.
+    contract: money.exact-persistence
+    enforcement:
+      - Money stores bigint minor units; toJSON emits strings; the ORM type maps strings.
+    scenario:
+      - Inspect Money internals and serialization for "9007199254740993.00".
+    expected:
+      - The value survives exactly; a number would have lost precision.
+    evidence: { testId: money-uses-bigint-not-number, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-010
+    priority: required
+    requirement: Amounts persist exactly through the ORM mapping.
+    contract: money.exact-persistence
+    enforcement:
+      - Custom MoneyType maps NUMERIC(20,2) text to Money and back.
+    scenario:
+      - Persist a wallet with balance "999999999999999999.99", the bound, and read it back in a new unit of work.
+    expected:
+      - The balance equals the original to the cent and the column holds 999999999999999999.99.
+    evidence: { testId: money-round-trips-through-postgres, layer: integration }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-011
+    priority: required
+    requirement: BRL is the operational currency while the model rejects currency conflicts.
+    contract: money.brl-operational-scope
+    enforcement:
+      - Wallets carry their currency; operations carry theirs; mismatch is a persisted rejection.
+    scenario:
+      - Open a BRL wallet; submit a BET in USD against it.
+    expected:
+      - 422 REJECTED with CURRENCY_MISMATCH; balance and ledger unchanged.
+    evidence: { testId: currency-conflict-is-rejected, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-012
+    priority: required
+    requirement: Money is bounded by the storage capacity and arithmetic never overflows silently.
+    contract: money.bound
+    enforcement:
+      - Money.from rejects a magnitude above 999999999999999999.99; add throws MoneyOverflowError when a sum would exceed it.
+    scenario:
+      - Parse "999999999999999999.99" and "1000000000000000000.00"; add "0.01" to the bound; subtract the bound from "0.00" and negate the result.
+    expected:
+      - The bound parses and prints unchanged; the 19-digit value is rejected; the addition throws MoneyOverflowError; the subtraction yields "-999999999999999999.99" and negating it yields the bound.
+    evidence: { testId: money-is-bounded-by-storage, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MONEY-013
+    priority: required
+    requirement: A credit that would take the balance above the bound is a persisted rejection.
+    contract: wallet.balance-limit
+    enforcement:
+      - Wallet.credit checks the bound before producing an entry; the use case persists REJECTED with BALANCE_LIMIT_EXCEEDED.
+    scenario:
+      - Open a wallet with "999999999999999999.00"; submit a WIN of "1.00"; submit a WIN of "0.99".
+    expected:
+      - The first WIN is 422 REJECTED with BALANCE_LIMIT_EXCEEDED and leaves balance, ledger and version unchanged; the second is PROCESSED and the balance equals the bound.
+    evidence: { testId: credit-past-the-bound-is-rejected, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- WALLET
+  - id: WALLET-001
+    priority: required
+    requirement: A player has at most one wallet per currency; a duplicate is a conflict.
+    contract: [wallet.unique-player-currency, wallet.duplicate-is-conflict]
+    enforcement:
+      - UNIQUE (player_id, currency); the use case maps the violation to 409 WALLET_ALREADY_EXISTS.
+    scenario:
+      - Open a BRL wallet for a player twice, the second time concurrently from two instances.
+    expected:
+      - Exactly one wallet exists; every other attempt answers 409 and changes nothing.
+    evidence: { testId: one-wallet-per-player-and-currency, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-002
+    priority: required
+    requirement: A wallet balance is never negative.
+    contract: wallet.non-negative
+    enforcement:
+      - Wallet.debit refuses to go below zero; CHECK (balance >= 0) in the schema.
+    scenario:
+      - Debit 101.00 from a wallet holding 100.00 in the domain; attempt the same with direct SQL.
+    expected:
+      - The domain raises an insufficient-balance outcome; the SQL statement fails on the check constraint.
+    evidence: { testId: wallet-balance-never-negative, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-003
+    priority: required
+    requirement: A new wallet has version 1, with or without an opening credit.
+    contract: wallet.version-starts-at-one
+    enforcement:
+      - Wallet.open sets version 1 and applies the opening credit without incrementing.
+    scenario:
+      - Open one wallet with "500.00" and one with "0.00".
+    expected:
+      - Both report version 1; the first has one ledger entry with walletVersion 1.
+    evidence: { testId: wallet-opens-at-version-one, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-004
+    priority: required
+    requirement: The version increments exactly once per balance change and never otherwise.
+    contract: wallet.version-increments-on-balance-change
+    enforcement:
+      - Only debit and credit increment; LOSS, rejections and replays do not touch the wallet row.
+    scenario:
+      - Open with "100.00" (v1); BET "40.00"; replay the BET; BET "100.00" rejected; LOSS.
+    expected:
+      - Version is 2 after the first BET and still 2 after the replay, the rejection and the LOSS.
+    evidence: { testId: version-tracks-balance-changes-only, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-005
+    priority: required
+    requirement: Every balance change has exactly one ledger entry and the stored balance mirrors the ledger head at commit.
+    contract: wallet.ledger-mirror
+    enforcement:
+      - The use case writes wallet and entry together; two deferred constraint triggers, on wallets and on the ledger, refuse a mismatch at commit.
+    scenario:
+      - Process a BET; then, as the migrator role, update the balance without an entry and commit.
+    expected:
+      - The BET leaves one entry whose balanceAfter equals the balance; the manual update fails at commit.
+    evidence: { testId: balance-and-ledger-move-together, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-006
+    priority: required
+    requirement: An operation in another currency than the wallet is rejected and persisted.
+    contract: wallet.currency-match
+    enforcement:
+      - Wallet.assertSameCurrency before any arithmetic; outcome REJECTED CURRENCY_MISMATCH.
+    scenario:
+      - Submit a USD BET against a BRL wallet.
+    expected:
+      - 422 with failureCode CURRENCY_MISMATCH; the transaction row exists as REJECTED; no entry.
+    evidence: { testId: wallet-rejects-foreign-currency, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-007
+    priority: required
+    requirement: An operation naming a player other than the wallet owner is rejected and persisted.
+    contract: wallet.owner-match
+    enforcement:
+      - The use case compares payload playerId with the wallet owner under the lock.
+    scenario:
+      - Submit a BET with another player's id against a wallet.
+    expected:
+      - 422 with failureCode WALLET_PLAYER_MISMATCH; balance unchanged; row persisted.
+    evidence: { testId: wallet-rejects-foreign-player, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-008
+    priority: required
+    requirement: A positive initial balance is recorded as an OPENING transaction with its CREDIT entry in the same transaction.
+    contract: wallet.opening-credit
+    enforcement:
+      - OpenWallet writes wallet, OPENING transaction and entry in one unit of work.
+    scenario:
+      - Open a wallet with "500.00"; inject a failure after the wallet insert in a second run.
+    expected:
+      - 'First run: wallet, OPENING row (providerId system) and entry (balanceBefore 0.00, balanceAfter 500.00, walletVersion 1) all exist. Second run: nothing exists.'
+    evidence: { testId: opening-credit-is-atomic, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-009
+    priority: required
+    requirement: A zero initial balance creates the wallet alone.
+    contract: wallet.zero-opening
+    enforcement:
+      - OpenWallet skips the OPENING transaction when the balance is zero.
+    scenario:
+      - Open a wallet with "0.00".
+    expected:
+      - No transaction row, no ledger entry, version 1, no WalletBalanceChanged event.
+    evidence: { testId: zero-opening-writes-only-the-wallet, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-010
+    priority: required
+    requirement: A wallet can be read with its current balance and version.
+    contract: [wallet.read-shape, api.wallet-read]
+    enforcement:
+      - GET /wallets/{walletId} maps the aggregate to the response DTO.
+    scenario:
+      - Read an existing wallet and an unknown id.
+    expected:
+      - 200 with id, playerId, balance, version, createdAt, updatedAt; 404 WALLET_NOT_FOUND otherwise.
+    evidence: { testId: wallet-read-endpoint, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-011
+    priority: required
+    requirement: The aggregate itself refuses an uncovered debit, a foreign currency, a foreign owner and a credit past the money bound.
+    contract: [wallet.non-negative, wallet.currency-match, wallet.owner-match, wallet.balance-limit]
+    enforcement:
+      - Wallet.debit and Wallet.credit validate owner, currency, cover and bound before changing anything, and expose no setter.
+      - The use case only persists the refusal and maps its failure code; the schema repeats the guarantee (SCHEMA-002, WALLET-002).
+    scenario:
+      - 'Rehydrate a wallet holding 100.00 BRL for player-1, with no database and no clock: debit 100.01; debit 50.00 USD; credit 50.00 USD; operate as player-2; credit an amount that would take the balance past money.bound.'
+      - On fresh instances of the same wallet, debit 100.00 and credit 1.00.
+    expected:
+      - The five attempts are refused by the aggregate with INSUFFICIENT_BALANCE, CURRENCY_MISMATCH, CURRENCY_MISMATCH, WALLET_PLAYER_MISMATCH and BALANCE_LIMIT_EXCEEDED, leaving balance and version unchanged.
+      - The last two succeed; the test touches no port, no repository and no container.
+    evidence: { testId: wallet-aggregate-invariants, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: WALLET-012
+    priority: required
+    requirement: A balance change on the aggregate yields exactly one ledger entry mirroring the new state, and nothing else moves the version.
+    contract: [wallet.version-increments-on-balance-change, wallet.ledger-mirror]
+    enforcement:
+      - debit and credit return the WalletLedgerEntry they imply, carrying balanceBefore, balanceAfter and the new walletVersion; a refused operation returns none and mutates nothing.
+    scenario:
+      - 'On a wallet at version 3 holding 100.00, with no database: debit 40.00, then credit 10.00, then attempt a debit of 1000.00.'
+    expected:
+      - Version 4 then 5, and 5 again after the refusal; balance 60.00, 70.00, 70.00.
+      - The two entries are DEBIT 40.00 (100.00 to 60.00, walletVersion 4) and CREDIT 10.00 (60.00 to 70.00, walletVersion 5); the refused debit yields no entry.
+    evidence: { testId: balance-and-version-move-with-one-entry, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- TX
+  - id: TX-001
+    priority: required
+    requirement: Only the five provider kinds can be submitted; OPENING and the provider id system are refused on both entry points.
+    contract: [tx.kinds, tx.opening-internal]
+    enforcement:
+      - DTO enum excludes OPENING; providerId validation excludes system; the consumer classifies the violation as permanent.
+    scenario:
+      - Submit kind OPENING over HTTP; submit providerId system over HTTP; send both through the queue.
+    expected:
+      - HTTP answers 400 VALIDATION_FAILED; the messages land in the dead-letter queue; nothing is persisted.
+    evidence: { testId: internal-kind-and-provider-are-refused, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: TX-002
+    priority: required
+    requirement: A provider transaction id identifies exactly one transaction per provider.
+    contract: tx.identity
+    enforcement:
+      - UNIQUE (provider_id, external_transaction_id); reservation insert uses ON CONFLICT.
+    scenario:
+      - Submit two different payloads with the same providerId and externalTransactionId under different keys.
+    expected:
+      - The second answers 409 EXTERNAL_TRANSACTION_ALREADY_BOUND; one row exists.
+    evidence: { testId: provider-transaction-id-is-unique, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: TX-003
+    priority: required
+    requirement: A new transaction is PENDING and its reference requirement is validated by kind.
+    contract: [tx.born-pending, tx.reference-matrix]
+    enforcement:
+      - WagerTransaction.create checks requiresReference() and allowsReference().
+    scenario:
+      - Create REFUND and ROLLBACK without a reference; BET with a reference; WIN and LOSS with and without.
+    expected:
+      - The first three throw; the WIN and LOSS variants are created in PENDING.
+    evidence: { testId: reference-requirement-by-kind, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: TX-004
+    priority: required
+    requirement: A transaction cannot reference itself.
+    contract: tx.self-reference-invalid
+    enforcement:
+      - DTO-level check that referenceExternalTransactionId differs from externalTransactionId.
+    scenario:
+      - Submit a ROLLBACK whose reference equals its own external id.
+    expected:
+      - 400 VALIDATION_FAILED; nothing persisted.
+    evidence: { testId: self-reference-is-invalid, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: TX-005
+    priority: required
+    requirement: Only the documented status transitions exist.
+    contract: tx.transitions
+    enforcement:
+      - A transition table in WagerTransaction; every method consults it.
+    scenario:
+      - Exercise every pair of statuses.
+    expected:
+      - PENDING reaches PROCESSED, REJECTED, PENDING_REFERENCE, FAILED; PENDING_REFERENCE reaches PROCESSED, REJECTED, FAILED, PENDING_REFERENCE; everything else throws.
+    evidence: { testId: status-transition-table, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: TX-006
+    priority: required
+    requirement: A terminal transaction refuses every transition and keeps its outcome, in the domain.
+    contract: tx.terminal-immutable
+    enforcement:
+      - isTerminal() guard consulted by markProcessed, markPendingReference, reject and fail.
+    scenario:
+      - Call every transition on PROCESSED, REJECTED and FAILED instances.
+      - Read status, failureCode, processedAt and observedBalance after each refused call.
+    expected:
+      - Every call throws InvalidTransactionStateError and leaves the four fields unchanged.
+      - The schema half of this rule is SCHEMA-024; nothing here depends on a database.
+    evidence: { testId: terminal-status-is-final, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: TX-007
+    priority: required
+    requirement: Every recorded outcome stores the balance observed at that moment.
+    contract: tx.observed-balance
+    enforcement:
+      - observed_balance column written with the outcome; equals the entry's balanceAfter when one exists.
+    scenario:
+      - Process a BET, a rejected BET and a parked ROLLBACK; read each transaction.
+    expected:
+      - observedBalance is 460.00, 460.00 and 460.00 respectively, and the processed one equals its entry's balanceAfter.
+    evidence: { testId: observed-balance-is-recorded, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: TX-008
+    priority: required
+    requirement: Only BET, WIN, REFUND, ROLLBACK and OPENING affect the balance.
+    contract: tx.affects-balance
+    enforcement:
+      - affectsBalance() returns false for LOSS only.
+    scenario:
+      - Query affectsBalance() for every kind.
+    expected:
+      - False for LOSS, true for the others.
+    evidence: { testId: affects-balance-by-kind, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: TX-009
+    priority: required
+    requirement: FAILED is reachable only from the scheduler on a permanent error, carries PROCESSING_FAILED, is auditable and replays as 500.
+    contract: [tx.failed-semantics, ref.permanent-failure]
+    enforcement:
+      - ReprocessPendingReference marks FAILED only after an error classified as permanent; the controller maps a FAILED outcome to 500 with the outcome body.
+    scenario:
+      - Park a ROLLBACK; make the reprocessing hit a permanent infrastructure error; replay the original request over HTTP.
+    expected:
+      - Status FAILED with PROCESSING_FAILED, readable through both GET endpoints, no event, no dead-letter message; the replay answers 500 with the outcome body, failureCode PROCESSING_FAILED and idempotentReplay true.
+    evidence: { testId: failed-status-semantics, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: TX-010
+    priority: required
+    requirement: A transaction can be read by service id and by provider ids, including opening credits.
+    contract: [tx.read-shape, api.transaction-read]
+    enforcement:
+      - Two GET endpoints over the same read model; the provider path accepts system.
+    scenario:
+      - Read a processed BET both ways; read the OPENING row through /providers/system/...; read an unknown id.
+    expected:
+      - 200 with the full view in the first three cases; 404 TRANSACTION_NOT_FOUND in the last.
+    evidence: { testId: transaction-read-endpoints, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- LEDGER
+  - id: LEDGER-001
+    priority: required
+    requirement: Ledger entries cannot be updated or deleted.
+    contract: ledger.immutable
+    enforcement:
+      - BEFORE UPDATE OR DELETE trigger raising; runtime role without UPDATE or DELETE on the table.
+    scenario:
+      - As wagering_app, update and delete an entry; as wagering_migrator, do the same.
+    expected:
+      - The app role fails on privileges; the migrator role fails on the trigger.
+    evidence: { testId: ledger-rejects-update-and-delete, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: LEDGER-002
+    priority: required
+    requirement: A transaction has at most one ledger entry.
+    contract: ledger.one-entry-per-transaction
+    enforcement:
+      - UNIQUE (transaction_id).
+    scenario:
+      - Insert a second entry for a transaction by SQL.
+    expected:
+      - Unique violation.
+    evidence: { testId: one-ledger-entry-per-transaction, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: LEDGER-003
+    priority: required
+    requirement: An entry is created only when its arithmetic balances.
+    contract: ledger.balanced-arithmetic
+    enforcement:
+      - WalletLedgerEntry.create validates balanceBefore, money, direction, balanceAfter; isBalanced() exposes it.
+    scenario:
+      - Create a CREDIT 40.00 from 100.00 to 140.00 and one from 100.00 to 150.00.
+    expected:
+      - The first is created and balanced; the second throws.
+    evidence: { testId: ledger-entry-arithmetic-validated, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: LEDGER-004
+    priority: required
+    requirement: The entry direction follows the kind, and ROLLBACK inverts its reference.
+    contract: ledger.direction-by-kind
+    enforcement:
+      - WagerTransaction.ledgerDirectionFor(reference).
+    scenario:
+      - Compute the direction for BET, WIN, REFUND, OPENING, and for ROLLBACK of a BET, a WIN and a REFUND.
+    expected:
+      - DEBIT, CREDIT, CREDIT, CREDIT, then CREDIT, DEBIT, DEBIT.
+    evidence: { testId: ledger-direction-by-kind, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: LEDGER-005
+    priority: required
+    requirement: LOSS and rejected or failed transactions write no entry.
+    contract: ledger.no-entry-without-effect
+    enforcement:
+      - The use case writes an entry only when affectsBalance() and the outcome is PROCESSED.
+    scenario:
+      - Process a LOSS, a rejected BET and a FAILED reprocessing.
+    expected:
+      - The ledger has no entry for any of the three; the wallet version is unchanged.
+    evidence: { testId: no-ledger-entry-without-effect, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: LEDGER-006
+    priority: required
+    requirement: Entry amounts are strictly positive.
+    contract: ledger.positive-amount
+    enforcement:
+      - CHECK (amount > 0) on the ledger table; the domain uses direction for sign.
+    scenario:
+      - Insert an entry with amount 0.00 and one with -1.00 by SQL.
+    expected:
+      - Both fail on the check constraint.
+    evidence: { testId: ledger-amount-positive, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: LEDGER-007
+    priority: required
+    requirement: Entries carry the wallet version they produced, unique per wallet, and nothing orders by UUID.
+    contract: ledger.wallet-version-sequence
+    enforcement:
+      - wallet_version column, UNIQUE (wallet_id, wallet_version); queries order by wallet_version.
+    scenario:
+      - Process five operations on one wallet from three instances with skewed clocks.
+    expected:
+      - walletVersion runs 1..6 without gaps; ordering by walletVersion matches the balance chain even where UUID order does not.
+    evidence: { testId: ledger-sequence-by-wallet-version, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: LEDGER-008
+    priority: required
+    requirement: The ledger is paged with an opaque, stable cursor.
+    contract: [ledger.cursor, ledger.read-shape, api.ledger-read]
+    enforcement:
+      - Cursor encodes v1 plus the last walletVersion; limit bounded 1..200; malformed cursor is 400 INVALID_CURSOR.
+    scenario:
+      - Create 120 entries; page with limit 50 while appending 10 more between pages; send a malformed cursor.
+    expected:
+      - Pages are contiguous and contain every entry exactly once; nextCursor is null on the last page; the malformed cursor answers 400 INVALID_CURSOR.
+    evidence: { testId: ledger-cursor-pagination, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: LEDGER-009
+    priority: required
+    requirement: An entry's currency always equals its wallet's currency.
+    contract: ledger.currency-matches-wallet
+    enforcement:
+      - Composite FOREIGN KEY (wallet_id, currency) REFERENCES wallets (id, currency).
+    scenario:
+      - Insert an entry in USD for a BRL wallet by SQL.
+    expected:
+      - Foreign key violation.
+    evidence: { testId: ledger-currency-matches-wallet, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: LEDGER-010
+    priority: optional
+    requirement: Double-entry bookkeeping with a counterparty account per provider.
+    contract: ledger.balanced-arithmetic
+    enforcement:
+      - Not scheduled; would add a provider liability account and a second leg per entry.
+    scenario:
+      - Process a BET and read both legs.
+    expected:
+      - Debit on the wallet, credit on the provider account, equal amounts.
+    evidence: { testId: double-entry-legs-balance, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: deferred
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- RULE
+  - id: RULE-001
+    priority: required
+    requirement: A BET debits its amount with one DEBIT entry.
+    contract: rule.bet.debit
+    enforcement:
+      - SubmitWagerTransaction debits under the wallet lock and writes the entry.
+    scenario:
+      - Open with 500.00; BET 40.00.
+    expected:
+      - 200 PROCESSED with balance 460.00; one DEBIT entry 40.00 from 500.00 to 460.00; version 2.
+    evidence: { testId: bet-debits-once, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-002
+    priority: required
+    requirement: A BET above the balance is rejected with INSUFFICIENT_BALANCE and persisted.
+    contract: rule.bet.insufficient-balance
+    enforcement:
+      - Decision under the lock; REJECTED row with failure code; no entry.
+    scenario:
+      - Open with 100.00; BET 100.01.
+    expected:
+      - 422 with INSUFFICIENT_BALANCE; balance 100.00; version 1; no entry; WagerTransactionRejected emitted.
+    evidence: { testId: bet-insufficient-balance-rejected, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-003
+    priority: required
+    requirement: A WIN credits its amount with one CREDIT entry.
+    contract: rule.win.credit
+    enforcement:
+      - Credit under the lock; entry written.
+    scenario:
+      - Balance 460.00; WIN 65.00.
+    expected:
+      - 200 PROCESSED with 525.00; one CREDIT entry; version incremented by one.
+    evidence: { testId: win-credits-once, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-004
+    priority: required
+    requirement: A WIN may reference the round's BET; when it does, the reference is validated.
+    contract: rule.win.optional-reference
+    enforcement:
+      - Optional reference resolution with the same rules as reversals; amount unconstrained.
+    scenario:
+      - WIN without reference; WIN referencing the round's BET with a different amount; WIN referencing a BET of another round.
+    expected:
+      - First two are PROCESSED; the third is REJECTED with REFERENCE_MISMATCH.
+    evidence: { testId: win-optional-reference, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-005
+    priority: required
+    requirement: A LOSS is processed without touching balance, ledger or version, whatever its amount.
+    contract: [rule.loss.no-effect, money.positive-in-operations]
+    enforcement:
+      - affectsBalance() false; the use case skips wallet and ledger writes.
+    scenario:
+      - Balance 460.00, version 2; LOSS 40.00, then LOSS 0.00 under another id.
+    expected:
+      - Both answer 200 PROCESSED with balance 460.00; version 2; no entry; WagerTransactionProcessed emitted for each, no WalletBalanceChanged.
+    evidence: { testId: loss-has-no-balance-effect, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-006
+    priority: required
+    requirement: A LOSS may reference the round's BET under the same validation as WIN.
+    contract: rule.loss.optional-reference
+    enforcement:
+      - Same optional reference path as WIN.
+    scenario:
+      - LOSS referencing the round's BET; LOSS referencing a BET of another player.
+    expected:
+      - PROCESSED and REJECTED with REFERENCE_MISMATCH respectively.
+    evidence: { testId: loss-optional-reference, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-007
+    priority: required
+    requirement: A REFUND credits the referenced BET amount back once.
+    contract: rule.refund.credit
+    enforcement:
+      - Reference resolved; equal amount checked; CREDIT entry.
+    scenario:
+      - BET 40.00 (460.00 left); REFUND 40.00 referencing it.
+    expected:
+      - 200 PROCESSED with 500.00; one CREDIT entry; the BET is marked as reversed.
+    evidence: { testId: refund-credits-bet-once, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-008
+    priority: required
+    requirement: A REFUND may reference only a BET.
+    contract: rule.refund.bet-only
+    enforcement:
+      - Kind matrix in the reference validation.
+    scenario:
+      - REFUND referencing a processed WIN.
+    expected:
+      - 422 REJECTED with REFERENCE_KIND_NOT_ALLOWED.
+    evidence: { testId: refund-references-only-bets, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-009
+    priority: required
+    requirement: A ROLLBACK applies the inverse of the referenced transaction.
+    contract: rule.rollback.inverse
+    enforcement:
+      - ledgerDirectionFor(reference) and equal amount.
+    scenario:
+      - ROLLBACK of a BET 40.00; ROLLBACK of a WIN 65.00; ROLLBACK of a REFUND 40.00.
+    expected:
+      - CREDIT 40.00, DEBIT 65.00, DEBIT 40.00, each PROCESSED with one entry.
+    evidence: { testId: rollback-inverts-reference, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-010
+    priority: required
+    requirement: A ROLLBACK may reference BET, WIN or REFUND only.
+    contract: rule.rollback.allowed-kinds
+    enforcement:
+      - Kind matrix in the reference validation.
+    scenario:
+      - ROLLBACK referencing a ROLLBACK, a LOSS and the OPENING credit.
+    expected:
+      - Each is 422 REJECTED with REFERENCE_KIND_NOT_ALLOWED.
+    evidence: { testId: rollback-allowed-kinds, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-011
+    priority: required
+    requirement: References resolve by provider id and provider transaction id, never by service id.
+    contract: rule.reference.resolution
+    enforcement:
+      - Lookup on (provider_id, external_transaction_id) only.
+    scenario:
+      - Two providers share an external id; each submits a REFUND referencing it.
+    expected:
+      - Each REFUND resolves to its own provider's BET.
+    evidence: { testId: reference-resolves-within-provider, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-012
+    priority: required
+    requirement: A reference must share provider, player, wallet, currency and round.
+    contract: rule.reference.same-context
+    enforcement:
+      - Context comparison after resolution.
+    scenario:
+      - REFUND referencing a BET of another wallet; of another round; of another player.
+    expected:
+      - Each is 422 REJECTED with REFERENCE_MISMATCH.
+    evidence: { testId: reference-same-context, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-013
+    priority: required
+    requirement: A reference whose target was rejected or failed is rejected with REFERENCE_NOT_PROCESSED.
+    contract: rule.reference.must-be-processed
+    enforcement:
+      - Status check on the resolved target.
+    scenario:
+      - BET rejected for insufficient balance; REFUND referencing it.
+    expected:
+      - 422 REJECTED with REFERENCE_NOT_PROCESSED; balance unchanged.
+    evidence: { testId: reference-must-be-processed, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-014
+    priority: required
+    requirement: A missing or non-terminal reference parks the transaction as PENDING_REFERENCE.
+    contract: rule.reference.missing-is-pending
+    enforcement:
+      - Unresolved or non-terminal target marks PENDING_REFERENCE and schedules a retry.
+    scenario:
+      - ROLLBACK referencing an external id never seen.
+    expected:
+      - 202 with status PENDING_REFERENCE; a schedule row exists; WagerTransactionPendingReference emitted once.
+    evidence: { testId: missing-reference-is-parked, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-015
+    priority: required
+    requirement: Reversal amounts must equal the referenced amount.
+    contract: rule.reference.equal-amount
+    enforcement:
+      - Money.equals between operation and reference.
+    scenario:
+      - REFUND 39.99 and ROLLBACK 40.01 of a BET 40.00.
+    expected:
+      - Both are 422 REJECTED with REFERENCE_AMOUNT_MISMATCH.
+    evidence: { testId: reversal-amount-must-match, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-016
+    priority: required
+    requirement: A transaction is reversed at most once in total, whatever the reversal kind (additional policy A in the system contract).
+    contract: rule.reference.reversed-once
+    enforcement:
+      - Partial unique index on processed reversals; the use case maps the conflict to REFERENCE_ALREADY_REVERSED.
+    scenario:
+      - REFUND a BET, then ROLLBACK the same BET; also two concurrent REFUNDs of one BET from two instances.
+    expected:
+      - The second reversal is 422 REJECTED with REFERENCE_ALREADY_REVERSED; exactly one credit happened in each case.
+    evidence: { testId: reference-reversed-once, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-017
+    priority: required
+    requirement: A reversal that would make the balance negative is rejected with its own code.
+    contract: [rule.reversal.insufficient-balance, failure.distinct-insufficient]
+    enforcement:
+      - Debit check under the lock with the reversal-specific code.
+    scenario:
+      - WIN 65.00 credited and then spent by a BET; ROLLBACK of the WIN.
+    expected:
+      - 422 REJECTED with REVERSAL_INSUFFICIENT_BALANCE, not INSUFFICIENT_BALANCE; row persisted; balance unchanged.
+    evidence: { testId: reversal-insufficient-balance-distinct-code, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-018
+    priority: required
+    requirement: A rejected transaction changes nothing but its own row and event.
+    contract: rule.rejected.no-effect
+    enforcement:
+      - Rejection path skips wallet, ledger and balance-changed event.
+    scenario:
+      - Reject a BET; snapshot wallet, ledger and outbox before and after.
+    expected:
+      - Wallet and ledger identical; outbox gained exactly one WagerTransactionRejected.
+    evidence: { testId: rejection-has-no-side-effects, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-019
+    priority: required
+    requirement: Reversal chains stop at one level and fail with the existing codes.
+    contract: rule.reversal.chain-limits
+    enforcement:
+      - Kind matrix and reversed-once rule; documented limitation.
+    scenario:
+      - ROLLBACK of a ROLLBACK; REFUND of a BET whose REFUND was rolled back.
+    expected:
+      - REFERENCE_KIND_NOT_ALLOWED and REFERENCE_ALREADY_REVERSED respectively.
+    evidence: { testId: reversal-chain-limits, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RULE-020
+    priority: required
+    requirement: Whether a resolved reference may be reversed or reported on is decided in the domain, without a database.
+    contract:
+      [
+        rule.refund.bet-only,
+        rule.rollback.allowed-kinds,
+        rule.reference.same-context,
+        rule.reference.equal-amount,
+        rule.reference.must-be-processed,
+      ]
+    enforcement:
+      - A domain decision on WagerTransaction takes the resolved reference and returns the failure code that refuses it, or none; the use case persists that outcome and maps the code to a status.
+      - Whether another reversal already exists is not a domain question: it is RULE-016 and SCHEMA-015.
+    scenario:
+      - 'With two in-memory WagerTransaction instances and no database: a REFUND of 80.00 against a PROCESSED BET of 80.00 in the same context; a REFUND against a WIN; a ROLLBACK against a ROLLBACK, a LOSS and an OPENING; a reversal against a PENDING and against a REJECTED target; references differing in provider, player, wallet, currency and round, one at a time; a reversal of 50.00 against a BET of 80.00.'
+    expected:
+      - The first returns no failure code.
+      - The others return exactly REFERENCE_KIND_NOT_ALLOWED, REFERENCE_NOT_PROCESSED, REFERENCE_MISMATCH or REFERENCE_AMOUNT_MISMATCH, one assertion per case.
+      - The decision reads nothing but the two instances.
+    evidence: { testId: reversal-eligibility-is-a-domain-decision, layer: unit }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- IDEM
+  - id: IDEM-001
+    priority: required
+    requirement: The idempotency key is mandatory and well-formed on both entry points.
+    contract: [idem.key-required, idem.key-format]
+    enforcement:
+      - Header validation on HTTP; data.idempotencyKey validation on the consumer.
+    scenario:
+      - POST without the header; POST with a 300-character key; a message without data.idempotencyKey.
+    expected:
+      - 400 IDEMPOTENCY_KEY_REQUIRED; 400 VALIDATION_FAILED; the message goes to the dead-letter queue.
+    evidence: { testId: idempotency-key-required-and-formatted, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-002
+    priority: required
+    requirement: Keys are unique per provider.
+    contract: idem.provider-scoped
+    enforcement:
+      - UNIQUE (provider_id, idempotency_key).
+    scenario:
+      - Two providers submit different operations with the same key string.
+    expected:
+      - Both are processed; two rows exist.
+    evidence: { testId: idempotency-key-scoped-per-provider, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-003
+    priority: required
+    requirement: The recommended key always fits the key limit.
+    contract: idem.recommended-default
+    enforcement:
+      - External identifiers capped at 120 characters; keys at 255.
+    scenario:
+      - Build the recommended key from two 120-character identifiers.
+    expected:
+      - 241 characters, accepted.
+    evidence: { testId: recommended-key-fits, layer: unit }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-004
+    priority: required
+    requirement: The payload hash is deterministic, covers exactly the business fields and ignores transport.
+    contract: idem.payload-hash
+    enforcement:
+      - 'RFC 8785 canonical JSON over the validated business fields; SHA-256; sha256: prefix.'
+    scenario:
+      - Hash the same payload with keys in different order, with different headers and message ids; hash a payload differing in one business field.
+    expected:
+      - Identical hashes in the first group, equal to a fixed vector; a different hash for the changed field.
+    evidence: { testId: payload-hash-canonical, layer: unit }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-005
+    priority: required
+    requirement: An identical request returns the stored outcome with idempotentReplay true and the same status code.
+    contract: idem.replay-same-outcome
+    enforcement:
+      - Reservation conflict resolves to the stored row; outcome rebuilt from it.
+    scenario:
+      - Submit a BET; submit it again; submit a rejected BET twice.
+    expected:
+      - 200 then 200 with idempotentReplay true and the same transactionId; 422 then 422 likewise.
+    evidence: { testId: replay-returns-stored-outcome, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-006
+    priority: required
+    requirement: A replay follows the persisted outcome and freezes once terminal.
+    contract: idem.replay-follows-persisted-outcome
+    enforcement:
+      - Status, failure code and observed balance read from the row at replay time.
+    scenario:
+      - Park a ROLLBACK (202); replay (202); let the reference arrive and the scheduler apply it; replay again; move the balance with another bet; replay once more.
+    expected:
+      - 202, 202, then 200 with the balance observed when applied, unchanged by the later bet.
+    evidence: { testId: replay-after-wallet-change-and-restart, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-007
+    priority: required
+    requirement: The same key with a different payload is a conflict, not a replay.
+    contract: idem.payload-mismatch-conflict
+    enforcement:
+      - Hash comparison on reservation conflict.
+    scenario:
+      - Submit a BET 40.00; submit a BET 41.00 under the same key.
+    expected:
+      - 409 IDEMPOTENCY_PAYLOAD_MISMATCH; the first transaction is untouched; no second row.
+    evidence: { testId: payload-mismatch-is-conflict, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-008
+    priority: required
+    requirement: A provider transaction id is bound to the key that first used it.
+    contract: idem.external-id-bound
+    enforcement:
+      - UNIQUE (provider_id, external_transaction_id) checked after the key lookup.
+    scenario:
+      - Submit a BET under key A; submit the same external id under key B.
+    expected:
+      - 409 EXTERNAL_TRANSACTION_ALREADY_BOUND; nothing stored for B.
+    evidence: { testId: external-id-bound-to-first-key, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-009
+    priority: required
+    requirement: Replay detection survives restarts and works across instances.
+    contract: idem.persistent
+    enforcement:
+      - No in-memory state; every lookup hits PostgreSQL.
+    scenario:
+      - Submit a BET to instance A; restart A; replay on instance B.
+    expected:
+      - B answers the stored outcome with idempotentReplay true; one debit exists.
+    evidence: { testId: idempotency-survives-restart, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-010
+    priority: required
+    requirement: The same operation through HTTP and the queue is processed once.
+    contract: idem.cross-entry-point
+    enforcement:
+      - Both entry points call the same use case with the same identity.
+    scenario:
+      - Submit a BET over HTTP; send the same operation and key through the queue.
+    expected:
+      - The message is acknowledged as a replay; one debit; duplicates metric incremented.
+    evidence: { testId: idempotency-across-entry-points, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-011
+    priority: required
+    requirement: A replay has no side effects.
+    contract: idem.replay-no-effects
+    enforcement:
+      - The replay path returns before any write.
+    scenario:
+      - Replay a processed BET; compare wallet, ledger and outbox before and after.
+    expected:
+      - Identical; no new event.
+    evidence: { testId: replay-writes-nothing, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: IDEM-012
+    priority: required
+    requirement: Replay versus payload conflict is decided in the domain, by comparing canonical payload hashes.
+    contract: [idem.payload-mismatch-conflict, idem.payload-hash]
+    enforcement:
+      - WagerTransaction.matchesPayload compares the stored hash with the submitted one; the use case turns a mismatch into 409 IDEMPOTENCY_PAYLOAD_MISMATCH and a match into a replay of the persisted outcome (IDEM-005, IDEM-007).
+    scenario:
+      - 'Hash a submission; rehydrate a transaction carrying that hash; call matchesPayload with: the same hash; the hash of the same payload with a different amount; the hash of the same payload with a different roundId; the hash of the same fields serialised in a different key order.'
+    expected:
+      - True, false, false, true: canonical JSON makes key order irrelevant and any business field decisive.
+      - No database and no HTTP layer take part in the decision.
+    evidence: { testId: payload-match-decides-replay-or-conflict, layer: unit }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- CONC
+  - id: CONC-001
+    priority: required
+    requirement: Operations serialize per wallet and run in parallel across wallets.
+    contract: [conc.unit-wallet, conc.parallel-wallets]
+    enforcement:
+      - Row lock on the wallet; no shared lock.
+    scenario:
+      - 200 wallets each receiving 20 bets, all submitted at once from three processes.
+    expected:
+      - Every wallet ends consistent with its ledger; total duration is far below the serialized sum.
+    evidence: { testId: distinct-wallets-in-parallel, layer: concurrency }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: CONC-002
+    priority: required
+    requirement: Processing holds the wallet row lock in a short transaction and treats lock timeouts as transient.
+    contract: conc.row-lock
+    enforcement:
+      - SELECT ... FOR NO KEY UPDATE in the wallet repository; lock_timeout configured; mapping to 503 and to queue retry.
+    scenario:
+      - Hold a lock on a wallet from a test connection; submit a bet over HTTP and through the queue.
+    expected:
+      - 503 with Retry-After; the message is retried later and succeeds once the lock is released; wager_lock_conflicts_total incremented.
+    evidence: { testId: lock-timeout-is-transient, layer: integration }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: CONC-003
+    priority: required
+    requirement: Writes that bypass the lock are detected by the version guard and the check constraint.
+    contract: conc.version-guard
+    enforcement:
+      - UPDATE ... WHERE version = expected; CHECK (balance >= 0).
+    scenario:
+      - Simulate a stale update with a wrong expected version; attempt a negative balance by SQL.
+    expected:
+      - Zero rows updated and an error raised; the check constraint refuses the negative balance.
+    evidence: { testId: version-guard-and-check, layer: integration }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: CONC-004
+    priority: required
+    requirement: No global lock and no unguarded read-compute-write exist.
+    contract: [conc.no-global-lock, conc.no-unguarded-rmw]
+    enforcement:
+      - Code review of every balance write; the only path is the use case under the lock.
+    scenario:
+      - Grep the codebase for advisory locks and wallet updates outside the use case.
+    expected:
+      - None found; reviewed on every change touching the wallet repository.
+    evidence: { testId: review-no-global-lock, layer: manual }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: CONC-005
+    priority: required
+    requirement: Every guarantee holds with three or more instances.
+    contract: conc.multi-instance
+    enforcement:
+      - Coordination only through PostgreSQL.
+    scenario:
+      - Run three api processes and two workers against one database; replay the whole concurrency suite through them.
+    expected:
+      - Same results as with one instance; every wallet consistent with its ledger.
+    evidence: { testId: three-instances-suite, layer: concurrency }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: CONC-006
+    priority: required
+    requirement: Two bets racing for one balance produce exactly one debit.
+    contract: conc.canonical-scenario
+    enforcement:
+      - Row lock serializes; the second decision sees the first debit.
+    scenario:
+      - Open with 100.00; submit two 80.00 bets simultaneously from two processes; retry both.
+    expected:
+      - One PROCESSED, one REJECTED INSUFFICIENT_BALANCE, balance 20.00, one DEBIT entry; retries replay without a second debit.
+    evidence: { testId: two-bets-one-balance, layer: concurrency }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: CONC-007
+    priority: required
+    requirement: Fifty parallel copies of one bet produce one debit and forty-nine replays.
+    contract: conc.duplicate-storm
+    enforcement:
+      - Reservation insert before the lock; duplicates wait on the unique index.
+    scenario:
+      - Submit the same bet fifty times at once across three processes.
+    expected:
+      - One row, one entry, one debit; forty-nine responses with idempotentReplay true.
+    evidence: { testId: fifty-duplicates-one-debit, layer: concurrency }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: CONC-008
+    priority: required
+    requirement: The lock order inside the financial transaction is fixed and deadlock-free.
+    contract: conc.lock-order
+    enforcement:
+      - One code path in the use case; reviewed order; FOR NO KEY UPDATE on the wallet; no network call under the lock.
+    scenario:
+      - Mix reversals, bets and duplicates on one wallet from three processes for sixty seconds.
+    expected:
+      - No deadlock reported by PostgreSQL; every wallet consistent.
+    evidence: { testId: mixed-load-no-deadlock, layer: concurrency }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: CONC-009
+    priority: required
+    requirement: Reserving the transaction row before locking its wallet cannot deadlock.
+    contract: [conc.row-lock, conc.lock-order]
+    enforcement:
+      - The wallet lock is FOR NO KEY UPDATE, compatible with the FOR KEY SHARE the reservation's foreign key holds on the wallet row.
+    scenario:
+      - "Two database sessions on one wallet, by SQL: each inserts a transaction row, pauses, locks the wallet with the repository's statement, updates balance and version and commits; repeat ten times. Control: the same with FOR UPDATE."
+    expected:
+      - With the repository's lock every pair serializes with consecutive versions and no error; the control reports deadlock detected (SQLSTATE 40P01) in every pair.
+    evidence: { testId: reservation-then-lock-no-deadlock, layer: integration }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- SCHEMA
+  - id: SCHEMA-001
+    priority: required
+    requirement: The schema refuses a second wallet for a player and currency.
+    contract: wallet.unique-player-currency
+    enforcement:
+      - UNIQUE (player_id, currency) on wallets.
+    scenario:
+      - Insert two wallets for one player in BRL by SQL as wagering_app.
+    expected:
+      - Unique violation on the second insert.
+    evidence: { testId: schema-unique-wallet-per-player-currency, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-002
+    priority: required
+    requirement: The schema refuses a negative balance.
+    contract: wallet.non-negative
+    enforcement:
+      - CHECK (balance >= 0) on wallets.
+    scenario:
+      - UPDATE a wallet balance to -0.01 by SQL.
+    expected:
+      - Check violation.
+    evidence: { testId: schema-balance-non-negative, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-003
+    priority: required
+    requirement: The schema refuses a version below one.
+    contract: wallet.version-starts-at-one
+    enforcement:
+      - CHECK (version >= 1) on wallets.
+    scenario:
+      - Insert a wallet with version 0 by SQL.
+    expected:
+      - Check violation.
+    evidence: { testId: schema-version-at-least-one, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-004
+    priority: required
+    requirement: The schema refuses two rows for one provider transaction id.
+    contract: tx.identity
+    enforcement:
+      - UNIQUE (provider_id, external_transaction_id) on wager_transactions.
+    scenario:
+      - Insert two transactions with the same provider and external id by SQL.
+    expected:
+      - Unique violation.
+    evidence: { testId: schema-unique-provider-transaction, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-005
+    priority: required
+    requirement: The schema refuses two rows for one provider idempotency key.
+    contract: idem.provider-scoped
+    enforcement:
+      - UNIQUE (provider_id, idempotency_key) on wager_transactions.
+    scenario:
+      - Insert two transactions with the same provider and key by SQL; insert the same key for another provider.
+    expected:
+      - Unique violation for the first pair; success for the other provider.
+    evidence: { testId: schema-unique-provider-key, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-006
+    priority: required
+    requirement: The schema admits only known kinds and statuses and enforces the reference matrix.
+    contract: [tx.kinds, tx.reference-matrix]
+    enforcement:
+      - Enumerated types for kind and status; CHECK on kind versus reference_external_transaction_id.
+    scenario:
+      - Insert kind SPLIT; insert a REFUND without a reference; insert a BET with one; insert an OPENING with one.
+    expected:
+      - Every insert fails.
+    evidence: { testId: schema-kinds-statuses-reference-matrix, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-007
+    priority: required
+    requirement: The schema keeps status, processed time and failure code consistent.
+    contract: tx.terminal-immutable
+    enforcement:
+      - CHECK (status = PROCESSED) = (processed_at IS NOT NULL); CHECK (status IN (REJECTED, FAILED)) = (failure_code IS NOT NULL).
+    scenario:
+      - Insert PROCESSED without processed_at; REJECTED without failure_code; PENDING with failure_code.
+    expected:
+      - Every insert fails.
+    evidence: { testId: schema-terminal-consistency, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-008
+    priority: required
+    requirement: The schema refuses a negative amount anywhere and a zero amount on everything but a LOSS.
+    contract: [ledger.positive-amount, money.positive-in-operations]
+    enforcement:
+      - CHECK (amount > 0) on wallet_ledger_entries; CHECK (amount >= 0) and CHECK (amount > 0 OR kind = 'LOSS') on wager_transactions.
+    scenario:
+      - 'By SQL: insert amount 0.00 and -1.00 into wallet_ledger_entries; insert a BET, a WIN, a REFUND and a ROLLBACK of 0.00, and a LOSS of -1.00, into wager_transactions.'
+      - 'By SQL: insert a LOSS of 0.00 into wager_transactions.'
+    expected:
+      - Every insert in the first group fails on a check constraint.
+      - The LOSS of 0.00 commits, which is the only amount exception in the schema.
+    evidence: { testId: schema-positive-amounts, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-009
+    priority: required
+    requirement: The schema refuses a second entry for one transaction.
+    contract: ledger.one-entry-per-transaction
+    enforcement:
+      - UNIQUE (transaction_id) on wallet_ledger_entries.
+    scenario:
+      - Insert two entries for one transaction.
+    expected:
+      - Unique violation.
+    evidence: { testId: schema-one-entry-per-transaction, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-010
+    priority: required
+    requirement: The schema refuses two entries with one wallet version.
+    contract: ledger.wallet-version-sequence
+    enforcement:
+      - UNIQUE (wallet_id, wallet_version); CHECK (wallet_version >= 1).
+    scenario:
+      - Insert two entries with wallet_version 3 for one wallet; insert wallet_version 0.
+    expected:
+      - Unique violation; check violation.
+    evidence: { testId: schema-unique-wallet-version, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-011
+    priority: required
+    requirement: The schema refuses unbalanced entries and negative balance_after.
+    contract: ledger.balanced-arithmetic
+    enforcement:
+      - CHECK on direction, balance_before, amount, balance_after; CHECK (balance_after >= 0).
+    scenario:
+      - Insert a CREDIT 40.00 from 100.00 to 150.00; a DEBIT from 10.00 of 20.00 to -10.00.
+    expected:
+      - Both inserts fail.
+    evidence: { testId: schema-balanced-entries, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-012
+    priority: required
+    requirement: The schema refuses an entry whose currency differs from its wallet's.
+    contract: ledger.currency-matches-wallet
+    enforcement:
+      - FOREIGN KEY (wallet_id, currency) REFERENCES wallets (id, currency).
+    scenario:
+      - Insert a USD entry for a BRL wallet.
+    expected:
+      - Foreign key violation.
+    evidence: { testId: schema-entry-currency-fk, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-013
+    priority: required
+    requirement: The ledger trigger refuses updates and deletes for every role.
+    contract: ledger.immutable
+    enforcement:
+      - BEFORE UPDATE OR DELETE trigger raising an exception.
+    scenario:
+      - As wagering_migrator, update and delete an entry.
+    expected:
+      - Both statements fail with the trigger's exception.
+    evidence: { testId: schema-ledger-trigger, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-014
+    priority: required
+    requirement: The runtime role cannot modify the ledger or the schema.
+    contract: [ledger.immutable, ops.two-db-roles]
+    enforcement:
+      - GRANT SELECT, INSERT only on the ledger to wagering_app; no CREATE or ALTER.
+    scenario:
+      - As wagering_app, run UPDATE and DELETE on the ledger, DROP TRIGGER, ALTER TABLE.
+    expected:
+      - Every statement fails on privileges.
+    evidence: { testId: schema-runtime-role-privileges, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-015
+    priority: required
+    requirement: The schema refuses a second processed reversal of one transaction.
+    contract: rule.reference.reversed-once
+    enforcement:
+      - Partial UNIQUE (reference_transaction_id) WHERE kind IN (REFUND, ROLLBACK) AND status = PROCESSED.
+    scenario:
+      - Insert a PROCESSED REFUND and a PROCESSED ROLLBACK referencing the same transaction; insert a REJECTED one too.
+    expected:
+      - The second PROCESSED insert fails; the REJECTED insert succeeds.
+    evidence: { testId: schema-reversed-once, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-016
+    priority: required
+    requirement: The schema refuses a second opening credit for one wallet.
+    contract: wallet.opening-credit
+    enforcement:
+      - Partial UNIQUE (wallet_id) WHERE kind = OPENING.
+    scenario:
+      - Insert two OPENING transactions for one wallet.
+    expected:
+      - Unique violation.
+    evidence: { testId: schema-one-opening-per-wallet, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-017
+    priority: required
+    requirement: A commit is refused when the wallet row does not mirror the head of its ledger.
+    contract: wallet.ledger-mirror
+    enforcement:
+      - DEFERRABLE INITIALLY DEFERRED constraint trigger on wallets comparing the row with the entry of greatest wallet_version.
+    scenario:
+      - 'On a wallet with entries, by SQL: update balance and version without an entry; update balance only; update version only; insert a wallet with a positive balance and no entry; then insert an entry and update the wallet consistently.'
+    expected:
+      - The first four transactions fail at commit naming the wallet and its head; the fifth commits.
+    evidence: { testId: schema-balance-matches-ledger-at-commit, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-018
+    priority: required
+    requirement: The inbox refuses a second row for one consumer and message id.
+    contract: msg.inbox-identity
+    enforcement:
+      - PRIMARY KEY (consumer_name, message_id).
+    scenario:
+      - Insert the same consumer and message id twice; insert the same message id for another consumer.
+    expected:
+      - Primary key violation; success.
+    evidence: { testId: schema-inbox-identity, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-019
+    priority: required
+    requirement: Outbox rows are identified by the event id and pending rows are indexed for claims.
+    contract: outbox.stable-event-id
+    enforcement:
+      - PRIMARY KEY (event_id); index on (published_at, next_attempt_at, occurred_at).
+    scenario:
+      - Insert two rows with one event id; EXPLAIN the pending-claim query.
+    expected:
+      - Primary key violation; the plan uses the index.
+    evidence: { testId: schema-outbox-identity-and-index, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-020
+    priority: required
+    requirement: Money columns are NUMERIC(20,2) and round-trip exactly through the mapping.
+    contract: money.exact-persistence
+    enforcement:
+      - Column types in the migration; MoneyType mapping test.
+    scenario:
+      - Inspect information_schema for every money column; persist and read 0.01 and 999999999999999999.99; store 1000000000000000000.00 by SQL.
+    expected:
+      - All columns are numeric(20,2); both values read back unchanged; the oversized value fails with numeric field overflow.
+    evidence: { testId: schema-money-columns, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-021
+    priority: required
+    requirement: A commit is refused when a ledger entry is inserted without the wallet row mirroring it.
+    contract: [wallet.ledger-mirror, ledger.chain]
+    enforcement:
+      - DEFERRABLE INITIALLY DEFERRED constraint trigger on wallet_ledger_entries; an entry with no successor must be mirrored by the wallet row.
+    scenario:
+      - 'By SQL, without touching the wallet row: insert a well-formed next entry on a wallet with entries; insert a first entry on a wallet opened with 0.00; insert a next entry and update the balance but not the version.'
+    expected:
+      - All three fail at commit naming the ledger head and the wallet row; no new entry exists afterwards.
+    evidence: { testId: schema-entry-requires-mirroring-wallet, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-022
+    priority: required
+    requirement: The ledger of a wallet is one contiguous chain from 0.00 to its head.
+    contract: ledger.chain
+    enforcement:
+      - The entries trigger checks the predecessor (wallet_version - 1, balance_after = balance_before) and the successor (wallet_version + 1, balance_before = balance_after).
+    scenario:
+      - "By SQL, each with the wallet row updated to match the new entry: an entry whose balance_before differs from the predecessor's balance_after; an entry at version 4 after version 2; a first entry at version 3; then, without touching the wallet, an entry at version 1 on a wallet opened with 0.00 whose first entry is at version 2."
+    expected:
+      - All four fail at commit naming the broken link; the wallet and its ledger are unchanged.
+    evidence: { testId: schema-ledger-chain-continuous, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-023
+    priority: required
+    requirement: After any committed sequence of direct-SQL writes, balance, ledger sum and ledger head agree.
+    contract: [wallet.ledger-mirror, ledger.chain, recon.calculation]
+    enforcement:
+      - Implied by the two triggers, the arithmetic check, the unique wallet version and ledger immutability; asserted by SQL.
+    scenario:
+      - 'By SQL: open wallets with 100.00 and with 0.00; append operations one per transaction and two in one transaction; interleave the refused attempts of SCHEMA-017, SCHEMA-021 and SCHEMA-022.'
+    expected:
+      - Every well-formed transaction commits; for every wallet, balance = SUM(credits) - SUM(debits) = balance_after of the entry with the greatest wallet_version, and the wallet with no entries has balance 0.00 and version 1.
+    evidence: { testId: schema-balance-equals-ledger-sum, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-024
+    priority: required
+    requirement: A transaction row that reached a terminal status refuses every update, and no transaction row is ever deleted.
+    contract: [tx.terminal-immutable, tx.row-append-only]
+    enforcement:
+      - BEFORE UPDATE OR DELETE trigger on wager_transactions raising integrity_constraint_violation (23000) when the old row is PROCESSED, REJECTED or FAILED, and on every delete.
+      - The runtime role holds no DELETE privilege; the trigger covers the migrator and manual SQL.
+    scenario:
+      - 'By SQL as the runtime role: set a PROCESSED row back to PENDING clearing processed_at; rewrite observed_balance on a PROCESSED row; turn a PROCESSED row into REJECTED with a failure code; change the failure code of a REJECTED row.'
+      - 'By SQL as the schema owner: delete a PROCESSED row and delete a PENDING row.'
+      - 'By SQL as the runtime role, the writes that must still work: PENDING to PROCESSED with processed_at and observed_balance; PENDING to PENDING_REFERENCE; a PENDING_REFERENCE row reaching PROCESSED with its resolved reference_transaction_id.'
+      - Repeat the downgrade against a table carrying the same CHECK constraints and no trigger.
+    expected:
+      - Every attempt in the first two groups is refused with SQLSTATE 23000 and leaves the row unchanged.
+      - Every write in the third group commits.
+      - The table without the trigger accepts the downgrade, which is exactly what SCHEMA-007 alone admits and why this entry exists.
+    evidence: { testId: schema-terminal-rows-are-frozen, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: SCHEMA-025
+    priority: required
+    requirement: The identity, context, kind, amount and currency of a transaction row never change after insertion.
+    contract: tx.row-append-only
+    enforcement:
+      - The same trigger compares the frozen columns of the old and new row images with IS DISTINCT FROM, leaving only status, processed_at, failure_code, observed_balance and reference_transaction_id writable while the row is not terminal.
+    scenario:
+      - 'By SQL as the runtime role, one update per column on a PENDING row and on a PENDING_REFERENCE row: amount, currency, kind, wallet_id, player_id, round_id, game_id, provider_id, external_transaction_id, idempotency_key, payload_hash, reference_external_transaction_id, created_at.'
+      - Update only the outcome fields of the same rows.
+    expected:
+      - Every column update is refused with SQLSTATE 23000 and leaves the row unchanged.
+      - The outcome-field update commits, so a parked transaction can still be resolved and a pending one decided.
+    evidence: { testId: schema-transaction-identity-frozen, layer: schema }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- API
+  - id: API-001
+    priority: required
+    requirement: Status classes are used consistently across every endpoint.
+    contract: api.status-classes
+    enforcement:
+      - One exception filter maps domain and infrastructure errors to statuses.
+    scenario:
+      - Exercise every endpoint with a malformed input, an unknown id, a conflict and a transient failure.
+    expected:
+      - 400, 404, 409 and 503 respectively on every endpoint where the situation applies; 422 only for business rejections.
+    evidence: { testId: status-classes-consistent, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-002
+    priority: required
+    requirement: Request errors are problem details with a code and a correlation id.
+    contract: [api.problem-details, failure.request-errors]
+    enforcement:
+      - Exception filter producing application/problem+json.
+    scenario:
+      - Trigger a 400 with two invalid fields, a 404 and a 409.
+    expected:
+      - Each body has type, title, status, detail, code, correlationId; the 400 lists both fields in errors.
+    evidence: { testId: problem-details-shape, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-003
+    priority: required
+    requirement: Submission outcomes share one body across 200, 202, 422 and 500.
+    contract: api.outcome-shape
+    enforcement:
+      - One TransactionOutcome DTO.
+    scenario:
+      - Obtain a processed, a pending, a rejected and a failed (replayed) outcome.
+    expected:
+      - Same fields; failureCode present only on the rejected and the failed ones.
+    evidence: { testId: outcome-shape-is-uniform, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-004
+    priority: required
+    requirement: The correlation id is echoed or generated and propagated.
+    contract: [api.correlation-header, obs.correlation-propagation]
+    enforcement:
+      - Middleware binds X-Correlation-Id to the request context, logs and events.
+    scenario:
+      - Submit with a header; submit without.
+    expected:
+      - The response echoes the header or carries a generated id; the emitted event and the log lines carry the same value.
+    evidence: { testId: correlation-id-propagates, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-005
+    priority: required
+    requirement: A 202 carries the Location of the transaction.
+    contract: api.location-on-pending
+    enforcement:
+      - Controller sets Location for PENDING_REFERENCE outcomes.
+    scenario:
+      - Park a ROLLBACK.
+    expected:
+      - Location is /wagering/transactions/{transactionId} and the URL resolves.
+    evidence: { testId: pending-has-location, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-006
+    priority: required
+    requirement: A transient failure answers 503 with Retry-After and persists nothing.
+    contract: api.retry-after
+    enforcement:
+      - Infrastructure errors classified as transient map to 503.
+    scenario:
+      - Stop PostgreSQL; submit a bet; restart; submit the same request.
+    expected:
+      - 503 with Retry-After; after restart the request is processed as new, not as a replay.
+    evidence: { testId: transient-failure-503, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-007
+    priority: required
+    requirement: Wallet creation answers 201 with Location, 409 for duplicates and 400 for invalid bodies.
+    contract: api.wallet-create
+    enforcement:
+      - OpenWallet controller.
+    scenario:
+      - Create; create again; send a body without initialBalance.
+    expected:
+      - 201 with Location /wallets/{id}; 409 WALLET_ALREADY_EXISTS; 400 VALIDATION_FAILED.
+    evidence: { testId: wallet-create-endpoint, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-008
+    priority: required
+    requirement: Reconciliation answers 200 whether or not the wallet is consistent.
+    contract: api.reconciliation
+    enforcement:
+      - ReconcileWallet controller.
+    scenario:
+      - Reconcile a consistent wallet, a diverged wallet and an unknown id.
+    expected:
+      - 200 with consistent true; 200 with consistent false; 404 WALLET_NOT_FOUND.
+    evidence: { testId: reconciliation-endpoint, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-009
+    priority: required
+    requirement: Health and metrics endpoints are open and readiness reflects dependencies.
+    contract: [api.health-open, obs.health-split, auth.open-endpoints]
+    enforcement:
+      - Terminus probes; guard excludes the three routes.
+    scenario:
+      - Call live, ready and metrics with no credentials; stop LocalStack and call ready again.
+    expected:
+      - 200, 200, 200; then ready answers 503 with sqs down while live still answers 200.
+    evidence: { testId: health-endpoints, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-010
+    priority: required
+    requirement: 400, 404 and 409 persist nothing and have no financial side effect.
+    contract: api.validation-stateless
+    enforcement:
+      - Validation and conflict detection happen before any write.
+    scenario:
+      - Send an invalid body, a submission for an unknown wallet and a conflicting key twice each; then create the missing wallet and resend the submission.
+    expected:
+      - No row is written by any of the six requests and the repetitions answer like the originals; after the wallet exists the same submission is processed.
+    evidence: { testId: request-errors-are-stateless, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-011
+    priority: required
+    requirement: The service serves docs/openapi.yaml unchanged and its routes are exactly the operations of that document.
+    contract: [api.contract-document, model.contract-first]
+    enforcement:
+      - The api role serves the document at /docs-json and renders it at /docs; nothing is generated in either direction.
+    scenario:
+      - Fetch /docs-json; parse docs/openapi.yaml; list the routes registered by the running application.
+    expected:
+      - The served document equals the file; every registered route and method except /docs and /docs-json is an operation of the document, and every operation is a registered route.
+    evidence: { testId: openapi-document-served-and-complete, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: API-012
+    priority: required
+    requirement: Failure codes are stable and each documents a caller action.
+    contract: [failure.stable-codes, failure.caller-action]
+    enforcement:
+      - FailureCode and ErrorCode enumerations in code, in docs/openapi.yaml and in docs/asyncapi.yaml mirror the tables in the system contract; review on change.
+    scenario:
+      - Compare the enumerations in code and in the contract documents with the two tables.
+    expected:
+      - Same sets, every row with a caller action.
+    evidence: { testId: failure-codes-match-contract, layer: contract }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- MSG
+  - id: MSG-001
+    priority: required
+    requirement: The input, dead-letter and events queues exist with the documented names.
+    contract: [msg.queues, ops.compose]
+    enforcement:
+      - LocalStack bootstrap script in Docker Compose creates the three FIFO queues and the redrive policy.
+    scenario:
+      - Start the stack; list queues.
+    expected:
+      - wager-transactions.fifo, wager-transactions-dlq.fifo and wager-integration-events.fifo exist; the redrive policy points at the dead-letter queue with maxReceiveCount 5.
+    evidence: { testId: queues-bootstrapped, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-002
+    priority: required
+    requirement: Messages are validated against the message contract and failures are permanent.
+    contract: msg.message-contract
+    enforcement:
+      - Consumer validation of the WagerTransactionRequested message as defined in docs/asyncapi.yaml, before the use case.
+    scenario:
+      - Send a message with an unknown type, one missing data.money and one with an invalid amount.
+    expected:
+      - Each lands in the dead-letter queue immediately; nothing persisted.
+    evidence: { testId: message-contract-validated, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-003
+    priority: required
+    requirement: The consumer runs the same use case as the HTTP controller.
+    contract: msg.same-use-case
+    enforcement:
+      - One SubmitWagerTransaction use case injected into both adapters.
+    scenario:
+      - Submit equivalent operations through both entry points.
+    expected:
+      - Identical outcomes, rows and events.
+    evidence: { testId: consumer-uses-same-use-case, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-004
+    priority: required
+    requirement: The inbox identity is the body message id, not the broker receipt id.
+    contract: msg.inbox-identity
+    enforcement:
+      - InboxMessage.receive(consumerName, body.messageId, payloadHash).
+    scenario:
+      - Send a message; send a producer resend with the same body id (new receipt id).
+    expected:
+      - The resend is acknowledged as a duplicate; one transaction exists.
+    evidence: { testId: inbox-keyed-by-body-message-id, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-005
+    priority: required
+    requirement: A reused message id with different content is a permanent error that changes nothing.
+    contract: msg.inbox-payload-conflict
+    enforcement:
+      - Payload hash compared with the stored inbox row.
+    scenario:
+      - Send a message; send another with the same message id and a different amount.
+    expected:
+      - The second goes to the dead-letter queue; the first transaction is untouched; the inbox-conflict metric increments.
+    evidence: { testId: inbox-payload-conflict, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-006
+    priority: required
+    requirement: A message is acknowledged only after commit, and a redelivery after commit has no effect.
+    contract: [msg.ack-after-commit, msg.redelivery-safe]
+    enforcement:
+      - DeleteMessage after the transaction commits; the inbox absorbs the redelivery.
+    scenario:
+      - Kill the worker after the commit and before the delete; let the message be redelivered to another worker.
+    expected:
+      - One debit, one entry, one set of events; the redelivery is acknowledged; duplicates metric increments.
+    evidence: { testId: killed-after-commit-before-ack, layer: concurrency }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-007
+    priority: required
+    requirement: Outcomes are classified as business, transient or permanent before acting.
+    contract: msg.classification
+    enforcement:
+      - OutcomeClassifier mapping use case results and errors to ack, retry or dead-letter.
+    scenario:
+      - Drive a rejected bet, a database outage and a malformed message through the consumer.
+    expected:
+      - Acknowledged, retried, dead-lettered respectively.
+    evidence: { testId: consumer-outcome-classification, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-008
+    priority: required
+    requirement: Transient failures back off through visibility and exhaust into the dead-letter queue.
+    contract: msg.transient-backoff
+    enforcement:
+      - ChangeMessageVisibility with exponential backoff; redrive maxReceiveCount 5.
+    scenario:
+      - Keep PostgreSQL down for the whole retry sequence of one message.
+    expected:
+      - Receive count grows with increasing visibility timeouts; the message reaches the dead-letter queue after five receives; wager_retries_total increments.
+    evidence: { testId: transient-backoff-then-dlq, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-009
+    priority: required
+    requirement: Permanent failures go straight to the dead-letter queue, including unknown wallets.
+    contract: [msg.permanent-to-dlq, msg.unknown-wallet-permanent]
+    enforcement:
+      - Consumer sends to the dead-letter queue, then deletes from the input queue.
+    scenario:
+      - Send a message for a wallet that does not exist.
+    expected:
+      - The message is in the dead-letter queue after one receive; wager_dlq_messages_total increments.
+    evidence: { testId: permanent-failure-to-dlq, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-010
+    priority: required
+    requirement: On SIGTERM the consumer finishes in-flight work or returns visibility.
+    contract: [msg.sigterm, ops.graceful-shutdown]
+    enforcement:
+      - Shutdown hook stops polling, awaits in-flight handlers within the grace period, resets visibility of the rest.
+    scenario:
+      - Send SIGTERM while ten messages are in flight with an artificially slow handler.
+    expected:
+      - Messages finished before the grace period are acknowledged; the others become visible immediately and are processed by another worker; no duplicate effects.
+    evidence: { testId: sigterm-drains-or-releases, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-011
+    priority: required
+    requirement: Correctness does not depend on FIFO ordering or broker deduplication.
+    contract: msg.broker-features-optional
+    enforcement:
+      - Invariants enforced by the database; the suite also runs against a standard queue.
+    scenario:
+      - Run the consumer suite against a non-FIFO queue with duplicates and reordering injected.
+    expected:
+      - Same final state as with the FIFO queue; every wallet consistent.
+    evidence: { testId: correct-without-fifo, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: MSG-012
+    priority: required
+    requirement: Producers are given a group and deduplication contract, and the correlation id is propagated.
+    contract: [msg.producer-contract, msg.correlation]
+    enforcement:
+      - Documented producer contract; consumer binds correlationId or messageId.
+    scenario:
+      - Send a message with a correlationId and one without.
+    expected:
+      - Logs and events carry the given correlationId, or the messageId when absent.
+    evidence: { testId: message-correlation, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- OUTBOX
+  - id: OUTBOX-001
+    priority: required
+    requirement: Transaction, wallet, ledger, inbox and outbox rows commit together or not at all.
+    contract: outbox.single-transaction
+    enforcement:
+      - One UnitOfWork transaction around the use case.
+    scenario:
+      - Inject a failure after the ledger insert and before the outbox insert; inject one after the outbox insert.
+    expected:
+      - No row of any kind exists after either failure.
+    evidence: { testId: financial-write-is-atomic, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-002
+    priority: required
+    requirement: Nothing is published before the financial transaction commits.
+    contract: outbox.publish-after-commit
+    enforcement:
+      - Events are written to the outbox table only; the publisher reads committed rows.
+    scenario:
+      - Hold a financial transaction open past its outbox insert; observe the events queue.
+    expected:
+      - No message until commit; the message appears after.
+    evidence: { testId: publish-after-commit, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-003
+    priority: required
+    requirement: Concurrent publishers drain one outbox without losing a row.
+    contract: outbox.concurrent-publishers
+    enforcement:
+      - FOR UPDATE SKIP LOCKED batch claims.
+    scenario:
+      - Enqueue 5000 rows; run two publishers.
+    expected:
+      - Every event id is received at least once; the overwhelming majority exactly once.
+    evidence: { testId: two-publishers-one-outbox, layer: concurrency }
+    deliverySlice: outbox-publisher
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-004
+    priority: required
+    requirement: The event id is fixed when enqueued and reused on every publication.
+    contract: outbox.stable-event-id
+    enforcement:
+      - eventId generated in IntegrationEvent construction and used as the primary key.
+    scenario:
+      - Publish a row, force a republish.
+    expected:
+      - Both messages carry the same eventId.
+    evidence: { testId: stable-event-id, layer: integration }
+    deliverySlice: atomic-bet
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-005
+    priority: required
+    requirement: A crash after commit and before publication is recovered by another instance.
+    contract: outbox.crash-recovery
+    enforcement:
+      - Locks released by PostgreSQL; rows remain pending.
+    scenario:
+      - Commit a transaction on instance A and kill A before its publisher runs; also kill a publisher after it claimed a batch.
+    expected:
+      - Instance B publishes the rows within one polling interval.
+    evidence: { testId: publisher-crash-recovery, layer: concurrency }
+    deliverySlice: outbox-publisher
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-006
+    priority: required
+    requirement: Duplicate publication is safe for consumers.
+    contract: [outbox.duplicate-safe, event.at-least-once]
+    enforcement:
+      - Same envelope on republish; consumers deduplicate by eventId; FIFO deduplication id set.
+    scenario:
+      - Kill a publisher after SendMessage and before commit.
+    expected:
+      - At least one copy reaches the queue and every copy carries the same eventId and an identical envelope; the row ends with published_at set; a reference consumer applies the event once whatever the number of copies.
+    evidence: { testId: duplicate-publication-safe, layer: integration }
+    deliverySlice: outbox-publisher
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-007
+    priority: required
+    requirement: A failed publication is retried with capped backoff and never dropped.
+    contract: outbox.retry-backoff
+    enforcement:
+      - attempts and next_attempt_at per row; alert metric after ten attempts.
+    scenario:
+      - Stop LocalStack for ten minutes with rows pending; restart.
+    expected:
+      - Attempts grow with capped intervals; after restart every row is published.
+    evidence: { testId: publisher-backoff-never-drops, layer: integration }
+    deliverySlice: outbox-publisher
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-008
+    priority: required
+    requirement: Outbox pending count and lag are exported.
+    contract: outbox.lag-metrics
+    enforcement:
+      - Gauges updated on every publisher cycle.
+    scenario:
+      - Enqueue rows with the publisher stopped; read /metrics; start the publisher.
+    expected:
+      - wager_outbox_pending and wager_outbox_lag_seconds rise, then return to zero.
+    evidence: { testId: outbox-metrics, layer: integration }
+    deliverySlice: outbox-publisher
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-009
+    priority: required
+    requirement: Events are published to the events queue with the wallet as group and the event id as deduplication id.
+    contract: outbox.destination
+    enforcement:
+      - SendMessage parameters in the publisher.
+    scenario:
+      - Publish an event; inspect the message attributes.
+    expected:
+      - MessageGroupId equals aggregateId; MessageDeduplicationId equals eventId.
+    evidence: { testId: events-destination-attributes, layer: integration }
+    deliverySlice: outbox-publisher
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-010
+    priority: required
+    requirement: Events are typed subclasses with fixed type and version, wallet aggregate, correlation and string amounts.
+    contract:
+      [
+        event.envelope,
+        event.aggregate-is-wallet,
+        event.correlation-causation,
+        event.money-props,
+        event.versioning,
+      ]
+    enforcement:
+      - Abstract IntegrationEvent with concrete subclasses; toJSON produces the envelope defined in docs/asyncapi.yaml.
+    scenario:
+      - Build each of the four events and serialize them.
+    expected:
+      - eventType and version come from the class; aggregateId is the wallet id; causationId is the transaction id; every amount is a string.
+    evidence: { testId: event-envelope-typing, layer: unit }
+    deliverySlice: domain-money-transitions
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-011
+    priority: required
+    requirement: Each event fires exactly when its rule says, and FAILED fires none.
+    contract:
+      [
+        event.processed-when,
+        event.rejected-when,
+        event.balance-changed-when,
+        event.pending-reference-when,
+        event.failed-no-event,
+      ]
+    enforcement:
+      - Event emission in the use case keyed on outcome and affectsBalance().
+    scenario:
+      - Drive OPENING, BET, LOSS, rejected BET, parked ROLLBACK (then applied), expired reference, and a FAILED reprocessing.
+    expected:
+      - Processed for OPENING, BET, LOSS and the applied ROLLBACK; BalanceChanged for OPENING, BET and the ROLLBACK only; Rejected for the rejected BET and the expiry; PendingReference once; nothing for FAILED.
+    evidence: { testId: events-fire-when-specified, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OUTBOX-012
+    priority: required
+    requirement: Consumers are told ordering is not guaranteed and are given the fields to order by.
+    contract: event.ordering
+    enforcement:
+      - walletVersion on balance events; occurredAt on all; documented in the system contract.
+    scenario:
+      - Run two publishers over one wallet's events; order the received events by walletVersion.
+    expected:
+      - The reordered sequence rebuilds the ledger chain exactly.
+    evidence: { testId: consumer-side-ordering, layer: integration }
+    deliverySlice: outbox-publisher
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- REF
+  - id: REF-001
+    priority: required
+    requirement: An unresolved reference parks the transaction, answers 202 or acknowledges, and emits the pending event once.
+    contract: [ref.parked-state, rule.reference.missing-is-pending]
+    enforcement:
+      - PENDING_REFERENCE status, schedule row, single WagerTransactionPendingReference.
+    scenario:
+      - Submit a REFUND before its BET over HTTP and through the queue.
+    expected:
+      - 202 and acknowledgement; one schedule row each; one pending event each.
+    evidence: { testId: reference-parked, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: REF-002
+    priority: required
+    requirement: The scheduler claims due rows exclusively and survives crashes.
+    contract: ref.scheduler
+    enforcement:
+      - SELECT ... FOR UPDATE SKIP LOCKED on pending_reference_schedule.
+    scenario:
+      - 500 parked transactions due at once; three workers; kill one mid-batch.
+    expected:
+      - Each transaction is reprocessed exactly once; the killed worker's rows are picked by the others.
+    evidence: { testId: scheduler-exclusive-claims, layer: concurrency }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: REF-003
+    priority: required
+    requirement: Retry attempts follow exponential backoff capped at five minutes.
+    contract: ref.backoff
+    enforcement:
+      - nextAttemptAt = now + min(1s * 2^attempt, 5m).
+    scenario:
+      - Compute the schedule for attempts 0 to 12.
+    expected:
+      - 1s, 2s, 4s, ..., 256s, then 300s for every later attempt.
+    evidence: { testId: pending-reference-backoff, layer: unit }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: REF-004
+    priority: required
+    requirement: A pending reference expires after sixty minutes with REFERENCE_NOT_FOUND and its event.
+    contract: [ref.ttl, ref.expiry]
+    enforcement:
+      - expires_at = first receipt + 60m; the scheduler rejects past expiry.
+    scenario:
+      - Park a ROLLBACK; advance the clock past sixty minutes; run the scheduler.
+    expected:
+      - REJECTED with REFERENCE_NOT_FOUND; WagerTransactionRejected emitted; balance unchanged.
+    evidence: { testId: pending-reference-expires, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: REF-005
+    priority: required
+    requirement: Once the referenced transaction is processed, the next attempt applies the parked one under the normal rules.
+    contract: ref.resolution-on-arrival
+    enforcement:
+      - Reprocessing reuses SubmitWagerTransaction with the stored command.
+    scenario:
+      - Deliver a ROLLBACK before its BET; deliver the BET; run the scheduler.
+    expected:
+      - The ROLLBACK is PROCESSED with the inverse entry; the final balance equals the balance before the BET; ledger consistent.
+    evidence: { testId: rollback-before-bet-resolves, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: REF-006
+    priority: required
+    requirement: Transient failures during reprocessing only reschedule; permanent ones mark FAILED.
+    contract: [ref.transient-failure, ref.permanent-failure]
+    enforcement:
+      - Error classification in ReprocessPendingReference; transient errors reschedule per ref.backoff without touching the transaction; permanent errors mark FAILED.
+    scenario:
+      - Park two transactions. Make the first fail transiently five times, then succeed. Make the second hit a permanent infrastructure error.
+    expected:
+      - The first stays PENDING_REFERENCE through the five failures, with wager_retries_total{component="scheduler"} incremented five times and its expiry untouched, then is PROCESSED; the second is FAILED with PROCESSING_FAILED, logged at error level, wager_transactions_total{status="FAILED"} incremented.
+    evidence: { testId: pending-reference-failure-classes, layer: integration }
+    deliverySlice: reversals-references
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- RECON
+  - id: RECON-001
+    priority: required
+    requirement: Reconciliation is consistent under concurrent writes and never blocks them.
+    contract: recon.snapshot
+    enforcement:
+      - REPEATABLE READ transaction without FOR UPDATE.
+    scenario:
+      - Reconcile a wallet continuously while three processes bet on it.
+    expected:
+      - Every report is consistent; bet latency is unaffected by the reconciliation loop.
+    evidence: { testId: reconciliation-under-load, layer: concurrency }
+    deliverySlice: concurrent-debits
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RECON-002
+    priority: required
+    requirement: The report compares the stored balance with the ledger sum and the latest entry.
+    contract: [recon.calculation, recon.report-shape]
+    enforcement:
+      - SUM over credits minus debits plus the entry at walletVersion = version.
+    scenario:
+      - Reconcile a wallet with two entries and one with none.
+    expected:
+      - checkedEntries 2 and 0; difference 0.00; consistent true; all fields present.
+    evidence: { testId: reconciliation-calculation, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RECON-003
+    priority: required
+    requirement: A divergence is reported, logged and counted, never corrected.
+    contract: recon.divergence-handling
+    enforcement:
+      - Error log with walletId, difference, checkedEntries; metric; response flag.
+    scenario:
+      - As the migrator role, bypass the triggers to create a divergence; reconcile.
+    expected:
+      - consistent false with the signed difference; one error log line; wager_reconciliation_divergence_total incremented; the stored balance unchanged.
+    evidence: { testId: reconciliation-divergence, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: RECON-004
+    priority: required
+    requirement: Every suite that moves money ends by proving stored balance equals ledger-derived balance.
+    contract: recon.final-invariant
+    enforcement:
+      - Shared afterAll helper used by every integration and concurrency suite.
+    scenario:
+      - Run the full suite.
+    expected:
+      - The helper runs for every touched wallet and passes.
+    evidence: { testId: final-invariant-every-suite, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- OBS
+  - id: OBS-001
+    priority: required
+    requirement: Logs are JSON lines with the correlation and identity fields.
+    contract: obs.structured-logs
+    enforcement:
+      - pino through nestjs-pino with request and message context.
+    scenario:
+      - Process one HTTP request and one message; capture the logs.
+    expected:
+      - Every line parses as JSON and carries correlationId, transactionId, walletId, providerId, externalTransactionId and, for the message, messageId.
+    evidence: { testId: structured-log-fields, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OBS-002
+    priority: required
+    requirement: Logs never contain bodies, amounts or balances, except the reconciliation divergence record.
+    contract: obs.no-sensitive-data
+    enforcement:
+      - Redaction list; no body logging middleware.
+    scenario:
+      - Process a bet with a recognizable amount; create a divergence and reconcile.
+    expected:
+      - The amount string appears in no log line of the bet; it appears only in the divergence record.
+    evidence: { testId: logs-redact-financial-data, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OBS-003
+    priority: required
+    requirement: The documented metrics are exported with their labels.
+    contract: obs.metrics
+    enforcement:
+      - prom-client registry; one metric definition per documented name.
+    scenario:
+      - Drive one event of each kind and scrape /metrics.
+    expected:
+      - Every documented metric name is present with the documented labels.
+    evidence: { testId: metrics-exported, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OBS-004
+    priority: required
+    requirement: Liveness and readiness are separate and readiness reflects PostgreSQL and SQS.
+    contract: obs.health-split
+    enforcement:
+      - Two Terminus endpoints; readiness runs a SELECT 1 probe and a GetQueueUrl probe, liveness none.
+    scenario:
+      - Call both endpoints on an instance with both dependencies reachable.
+      - Call both endpoints on an instance whose PostgreSQL address is unreachable, and on one whose SQS endpoint is unreachable.
+    expected:
+      - live answers 200 on every instance.
+      - ready answers 200 with both details entries up, and 503 with the unreachable dependency down and the other up.
+    evidence: { testId: readiness-tracks-dependencies, layer: integration }
+    deliverySlice: infrastructure
+    implementationStatus: implemented
+    verificationStatus: passing
+
+  - id: OBS-005
+    priority: required
+    requirement: The correlation id reaches every log line and event of a request or message.
+    contract: obs.correlation-propagation
+    enforcement:
+      - AsyncLocalStorage-bound context used by the logger and the event factory.
+    scenario:
+      - Process a message with a correlationId that produces two events.
+    expected:
+      - Both events and every log line carry that correlationId.
+    evidence: { testId: correlation-reaches-events, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- OPS
+  - id: OPS-001
+    priority: required
+    requirement: make check is the repository gate and CI runs the same target.
+    contract: ops.repository-gate
+    enforcement:
+      - Makefile with fmt-check, lint, typecheck, test and audit under check; ci workflow runs make check.
+    scenario:
+      - Run make check locally; push and open a pull request.
+    expected:
+      - Green locally and in the ci workflow.
+    evidence: { testId: make-check-gate, layer: contract }
+    deliverySlice: foundation
+    implementationStatus: implemented
+    verificationStatus: passing
+
+  - id: OPS-002
+    priority: required
+    requirement: Migrations are versioned and reversible.
+    contract: ops.migrations-reversible
+    enforcement:
+      - MikroORM migrations with up and down.
+    scenario:
+      - On a clean database run up, down, up.
+    expected:
+      - Each step succeeds; the schema after the second up equals the schema after the first.
+    evidence: { testId: migrations-up-down-up, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OPS-003
+    priority: required
+    requirement: One image runs as api, worker or all.
+    contract: ops.single-image-roles
+    enforcement:
+      - APP_ROLE read at bootstrap selects the modules to start.
+    scenario:
+      - Start the image with each role.
+    expected:
+      - api serves HTTP and runs no consumer; worker runs the consumer, publisher and scheduler and serves only health; all does both.
+    evidence: { testId: app-roles, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OPS-004
+    priority: required
+    requirement: Migrations run as the migrator role and the service as the runtime role.
+    contract: ops.two-db-roles
+    enforcement:
+      - Two connection configurations; Compose bootstrap creates both roles.
+    scenario:
+      - Start the stack; inspect which role owns the tables and which the service connects with.
+    expected:
+      - Tables owned by wagering_migrator; the service's connections authenticate as wagering_app.
+    evidence: { testId: two-database-roles, layer: integration }
+    deliverySlice: schema-wallet-opening
+    implementationStatus: in-progress
+    verificationStatus: not-run
+
+  - id: OPS-005
+    priority: required
+    requirement: Invalid configuration stops the process before it serves traffic.
+    contract: ops.config-env
+    enforcement:
+      - Typed environment schema validated at bootstrap.
+    scenario:
+      - Start with a missing database URL and with a non-numeric lock timeout.
+    expected:
+      - The process exits non-zero with a message naming the variable; no port is opened.
+    evidence: { testId: config-validation, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: in-progress
+    verificationStatus: not-run
+
+  - id: OPS-006
+    priority: required
+    requirement: Docker Compose starts the full stack used by the integration suites.
+    contract: ops.compose
+    enforcement:
+      - PostgreSQL, LocalStack with queues, migration step, api and two workers.
+    scenario:
+      - docker compose up; run the integration suites.
+    expected:
+      - All services healthy; suites pass against the containers.
+    evidence: { testId: compose-stack, layer: integration }
+    deliverySlice: sqs-inbox-dlq
+    implementationStatus: in-progress
+    verificationStatus: not-run
+
+  - id: OPS-007
+    priority: required
+    requirement: Every role shuts down gracefully on SIGTERM.
+    contract: ops.graceful-shutdown
+    enforcement:
+      - NestJS shutdown hooks; HTTP drain; consumer and publisher completion within the grace period.
+    scenario:
+      - Send SIGTERM to an api instance with in-flight requests and to a worker with a batch in progress.
+    expected:
+      - In-flight requests complete; the batch finishes or releases; exit code zero.
+    evidence: { testId: graceful-shutdown-all-roles, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: OPS-008
+    priority: optional
+    requirement: A load test reports throughput, latency percentiles, error rate, lock conflicts and outbox lag.
+    contract: [conc.multi-instance, obs.metrics, outbox.lag-metrics]
+    enforcement:
+      - Not scheduled; would be exposed as make load-test with a written methodology.
+    scenario:
+      - Run the load test against the Compose stack with three api instances.
+    expected:
+      - A report with environment, methodology, p50, p95, p99, error rate, lock conflicts and outbox lag.
+    evidence: { testId: load-test-report, layer: manual }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: deferred
+    verificationStatus: not-run
+
+  - id: OPS-009
+    priority: optional
+    requirement: Traces follow a request across HTTP, database and queue with OpenTelemetry.
+    contract: obs.correlation-propagation
+    enforcement:
+      - Not scheduled; would add OpenTelemetry instrumentation and an exporter.
+    scenario:
+      - Process a message and inspect the trace.
+    expected:
+      - One trace spanning consumer, use case, database and publisher.
+    evidence: { testId: opentelemetry-trace, layer: manual }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: deferred
+    verificationStatus: not-run
+
+  # ---------------------------------------------------------------- AUTH
+  - id: AUTH-001
+    priority: required
+    requirement: Authentication is deferred behind an explicit port and a guard that admits every request.
+    contract: [auth.deferred, auth.extension-point, auth.intended-design]
+    enforcement:
+      - ProviderIdentityPort in the application layer; no-op guard in the HTTP layer; design recorded in ARCHITECTURE.md.
+    scenario:
+      - Submit without credentials; replace the guard with a test implementation that binds a provider identity.
+    expected:
+      - The first request is processed; with the test guard, a payload naming another provider is rejected before reaching the domain.
+    evidence: { testId: auth-extension-point, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run
+
+  - id: AUTH-002
+    priority: required
+    requirement: Health and metrics stay open, and queue messages are validated like any other input.
+    contract: [auth.open-endpoints, auth.queue-trusted-channel]
+    enforcement:
+      - Guard exclusions; consumer runs the full domain validation.
+    scenario:
+      - Enable the test guard; call health and metrics without credentials; send a message with a mismatching player and wallet.
+    expected:
+      - 200 on the three endpoints; the message is rejected with WALLET_PLAYER_MISMATCH.
+    evidence: { testId: open-endpoints-and-queue-validation, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: planned
+    verificationStatus: not-run

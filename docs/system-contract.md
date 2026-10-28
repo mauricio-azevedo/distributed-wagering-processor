@@ -1,0 +1,328 @@
+# System contract
+
+What the service guarantees, stated as rules with stable identifiers. Each rule is written as `area.name` and is cited by the [acceptance plan](acceptance.yaml), the [ADRs](decisions/README.md) and [ARCHITECTURE.md](../ARCHITECTURE.md).
+
+Shapes have one home: the transport contracts. [docs/openapi.yaml](openapi.yaml) defines every HTTP path, parameter, header, status code and body; [docs/asyncapi.yaml](asyncapi.yaml) defines the queues, the input message, the integration events, their envelopes and the delivery semantics. DTOs and message classes implement those documents with validation in the adapters. This document defines behaviour and names the fields that behaviour depends on; it does not maintain a parallel schema.
+
+Status of every rule: specified. Verification evidence is tracked per rule in the acceptance plan.
+
+## 1. Scope
+
+The service keeps player wallets and processes the operations game providers send against them: `BET`, `WIN`, `LOSS`, `REFUND` and `ROLLBACK`. It exposes an HTTP API and a queue consumer that run the same use case, keeps an immutable ledger, and publishes integration events through a transactional outbox. Terms are defined in the [glossary](glossary.md).
+
+Operational scope: providers settle in BRL, so every example uses BRL. The model is currency-aware and every currency conflict is a tested rejection; nothing assumes a single currency.
+
+## 2. Modelling rules
+
+- `model.private-constructors` — Domain classes have private or protected constructors. Instances are created through static factories only: `Money.from`, `Money.zero`, `Wallet.open`, `WagerTransaction.create`, `WalletLedgerEntry.create`, `InboxMessage.receive`, `OutboxMessage.enqueue`.
+- `model.rehydrate-no-revalidation` — Every persisted class exposes `rehydrate(state)`, which rebuilds an instance from stored state and never re-validates transitions or business rules; it trusts what the database holds.
+- `model.explicit-transitions` — State changes happen only through named methods (`markProcessed`, `markPendingReference`, `reject`, `fail`, `markPublished`, `scheduleRetry`). Calling a transition on a terminal `WagerTransaction` throws `InvalidTransactionStateError`; that is a programming error, not a business outcome.
+- `model.structural-immutability` — `Money` and `WalletLedgerEntry` have only `readonly` fields and no mutating methods. Immutability is structural, not a convention.
+- `model.framework-free-domain` — The domain layer imports nothing from NestJS, MikroORM, HTTP or SQS libraries. Mapping to persistence lives in the infrastructure layer.
+- `model.money-props-in-contracts` — Request bodies, responses, events and logs carry `MoneyProps` (`{ amount, currency }` with a string amount), never a `Money` instance and never a JSON number.
+- `model.contract-first` — `docs/openapi.yaml` and `docs/asyncapi.yaml` are the authoritative definitions of every request, response, message and event shape. DTOs and message classes implement them with validation in the adapters; a shape change starts in the contract document and then reaches the code. Nothing generates one from the other.
+
+## 3. Money
+
+- `money.decimal-string` — An amount is a decimal string matching `^(0|[1-9][0-9]{0,17})\.[0-9]{2}$`: exactly two decimal places, no sign, no leading zeros, up to 18 integer digits, the capacity of the storage column (`money.bound`).
+- `money.rejected-inputs` — `Money.from` rejects: `NaN`, `Infinity`, exponent notation (`1e3`), empty strings, sign characters, whitespace, decimal commas, leading zeros, any scale other than two, more than 18 integer digits, and JSON numbers. Each rejection is a domain validation error.
+- `money.no-rounding` — No code path rounds. A value with the wrong scale is rejected, never adjusted. The system therefore has no rounding mode to document.
+- `money.currency-iso` — `currency` is an ISO 4217 alphabetic code: three uppercase letters.
+- `money.same-currency` — `add`, `subtract`, `isLessThan` and `equals` across different currencies throw `CurrencyMismatchError`.
+- `money.immutable` — Every arithmetic operation returns a new `Money`; no method mutates an instance. `subtract` and `negate` can yield a negative value. That is an ordinary intermediate result inside the domain: a debit decides insufficient balance by checking whether `balance.subtract(amount)` is negative, and reconciliation computes `difference` by subtraction. Every place that requires a non-negative amount says so: inputs (`money.rejected-inputs`), balances (`wallet.non-negative`), entry amounts (`ledger.positive-amount`).
+- `money.positive-in-operations` — The amount of an operation that moves money (`BET`, `WIN`, `REFUND`, `ROLLBACK`) must be strictly greater than `0.00`, because it becomes a ledger entry and `ledger.positive-amount` refuses `0.00`. A `LOSS` moves no money and writes no entry, so `0.00` is accepted and processed like any other `LOSS`. Negative amounts are never accepted anywhere (`money.rejected-inputs`); a zero amount on a money-moving kind is a `400 VALIDATION_FAILED`.
+- `money.zero-only-initial-balance` — `0.00` is accepted as a wallet's `initialBalance` and as the amount of a `LOSS`, and nowhere else: never on a money-moving operation, never on a ledger entry, never as a wallet balance written without its entry.
+- `money.signed-difference-only` — A negative amount is serialized in exactly one place: `difference` of a reconciliation report. Negative values are never persisted and never enter a request, response or event otherwise. `-0.00` is never produced.
+- `money.exact-persistence` — Amounts are persisted as `NUMERIC(20,2)` and travel between the database and the domain as strings. The domain stores minor units in a `bigint`. No JavaScript `number` ever holds money.
+- `money.bound` — Every `Money` value has a magnitude of at most `999999999999999999.99`, the largest value `NUMERIC(20,2)` stores. `Money.from` rejects a larger magnitude; `add` throws `MoneyOverflowError` when a sum would exceed it. The bound is checked in the domain, so the database never reports a numeric overflow. Inputs, arithmetic results and stored values share this one bound; values read from the database are inside it by construction and are rehydrated with the same parser.
+- `money.brl-operational-scope` — Providers settle in BRL today. The model stays multi-currency: the wallet carries its currency, every operation carries its currency, and mismatches are rejected (see `wallet.currency-match`).
+
+## 4. Wallet
+
+- `wallet.unique-player-currency` — At most one wallet exists per `(playerId, currency)`; the database enforces it.
+- `wallet.non-negative` — A wallet balance is never below `0.00`; the database enforces it as the last line of defence.
+- `wallet.balance-limit` — A credit that would take the balance above `money.bound` is `REJECTED` with `BALANCE_LIMIT_EXCEEDED`; balance, ledger and version are unchanged. The rejection is persisted and auditable like any other.
+- `wallet.version-starts-at-one` — A wallet is created with `version` 1, whether or not it received an opening credit.
+- `wallet.version-increments-on-balance-change` — `version` increases by exactly one for each balance change and never otherwise. `LOSS` and rejections leave it untouched.
+- `wallet.ledger-mirror` — Every balance change writes exactly one ledger entry carrying the new `walletVersion`, and every ledger entry corresponds to exactly one balance change. The database enforces it at commit from both sides: a wallet row must mirror the head of its ledger, the entry with the greatest `walletVersion` (same version, balance equal to its `balanceAfter`; or no entries, balance `0.00` and version 1), and every entry must either be that mirrored head or be continued by the entry at `walletVersion + 1` (`ledger.chain`). An entry inserted without its balance change, or a balance change without its entry, cannot be committed.
+- `wallet.currency-match` — An operation whose `money.currency` differs from the wallet currency is `REJECTED` with `CURRENCY_MISMATCH`.
+- `wallet.owner-match` — An operation whose `playerId` differs from the wallet owner is `REJECTED` with `WALLET_PLAYER_MISMATCH`.
+- `wallet.opening-credit` — A positive `initialBalance` creates an internal `OPENING` transaction and its `CREDIT` ledger entry (`balanceBefore` `0.00`, `walletVersion` 1) in the same database transaction as the wallet row.
+- `wallet.zero-opening` — An `initialBalance` of `0.00` creates the wallet alone: no transaction, no ledger entry, version 1.
+- `wallet.duplicate-is-conflict` — Creating a wallet for a `(playerId, currency)` that already has one is a `409 WALLET_ALREADY_EXISTS`; the existing wallet is unchanged.
+- `wallet.read-shape` — A wallet is returned as `id`, `playerId`, `balance`, `version`, `createdAt`, `updatedAt`.
+
+## 5. Transactions
+
+- `tx.kinds` — Providers submit `BET`, `WIN`, `LOSS`, `REFUND` and `ROLLBACK`. `OPENING` exists only for the wallet opening credit.
+- `tx.opening-internal` — `OPENING` cannot be submitted: HTTP answers `400 VALIDATION_FAILED`, the queue treats it as a permanent error. The reserved `providerId` `system` is rejected the same way on both entry points.
+- `tx.identity` — `(providerId, externalTransactionId)` identifies a provider transaction and is unique; the database enforces it.
+- `tx.born-pending` — `WagerTransaction.create` yields a `PENDING` transaction and validates the reference requirement of its kind.
+- `tx.reference-matrix` — `BET` must not carry `referenceExternalTransactionId` (`400`); `WIN` and `LOSS` may carry one; `REFUND` and `ROLLBACK` must carry one (`400` when absent).
+- `tx.self-reference-invalid` — A transaction that references its own `externalTransactionId` is a `400 VALIDATION_FAILED`.
+- `tx.transitions` — Valid transitions: `PENDING` to `PROCESSED`, `REJECTED`, `PENDING_REFERENCE` or `FAILED`; `PENDING_REFERENCE` to `PROCESSED`, `REJECTED`, `FAILED`, or `PENDING_REFERENCE` again when a retry attempt is recorded. No other transition exists.
+- `tx.terminal-immutable` — `PROCESSED`, `REJECTED` and `FAILED` are terminal. A terminal transaction never changes status, failure code, processed time or observed balance. The domain refuses the transition, and a trigger refuses the write whatever issued it: the `CHECK` constraints keep status, processed time and failure code consistent, but they would admit a downgrade that clears `processed_at` along with the status, and a freed outcome is a second debit or a second reversal waiting to happen.
+- `tx.row-append-only` — A `wager_transactions` row is never deleted, and its identity, context, kind, amount and currency never change after insertion. While a transaction is not terminal, only `status`, `processedAt`, `failureCode`, `observedBalance` and `referenceTransactionId` may be written. The table is the audit log of what each provider submitted, and one trigger carries both halves of the rule.
+- `tx.observed-balance` — Every recorded outcome (terminal or pending) stores the wallet balance observed when it was recorded. For `PROCESSED` balance-changing transactions it equals the ledger entry's `balanceAfter`.
+- `tx.affects-balance` — `BET`, `WIN`, `REFUND`, `ROLLBACK` and `OPENING` affect the balance; `LOSS` never does.
+- `tx.failed-semantics` — `FAILED` means a persisted transaction hit a permanent infrastructure error while being applied, one that retrying cannot fix (`ref.permanent-failure`). Transient errors never produce `FAILED`; they are retried without limit (`ref.transient-failure`). A `FAILED` transaction carries `PROCESSING_FAILED`, is auditable through the read endpoints, replays as `500` with the outcome body, and emits no integration event in this version.
+- `tx.read-shape` — A transaction is returned as `transactionId`, `providerId`, `externalTransactionId`, `idempotencyKey`, `payloadHash`, `walletId`, `playerId`, `roundId`, `gameId`, `kind`, `money`, `status`, `observedBalance`, `createdAt`, plus `failureCode`, `referenceExternalTransactionId`, `referenceTransactionId` and `processedAt` when they exist.
+
+## 6. Ledger
+
+- `ledger.immutable` — Ledger entries are never updated or deleted. The database refuses both through a trigger and through the runtime role's privileges.
+- `ledger.one-entry-per-transaction` — A transaction produces at most one ledger entry; the database enforces it.
+- `ledger.balanced-arithmetic` — `balanceBefore + money = balanceAfter` for a `CREDIT` and `balanceBefore - money = balanceAfter` for a `DEBIT`. `WalletLedgerEntry.create` validates it and the database checks it again.
+- `ledger.direction-by-kind` — `BET` is a `DEBIT`; `WIN`, `REFUND` and `OPENING` are `CREDIT`s; `ROLLBACK` takes the direction opposite to the entry of the transaction it reverses.
+- `ledger.no-entry-without-effect` — `LOSS`, every `REJECTED` and every `FAILED` transaction produce no ledger entry.
+- `ledger.positive-amount` — Every entry amount is strictly positive; the sign lives in `direction`.
+- `ledger.wallet-version-sequence` — Each entry carries `walletVersion`, the wallet version it produced. It is unique per wallet and monotonic, and it is the only ordering key of a wallet's ledger. UUIDs identify entries and are never used for ordering.
+- `ledger.chain` — An entry's `balanceBefore` equals the `balanceAfter` of the entry at `walletVersion - 1` of the same wallet. The first entry of a wallet starts at `0.00` and carries `walletVersion` 1 (opening credit) or 2 (first operation on a wallet opened with `0.00`). The database checks the link to the predecessor and to the successor at commit, so versions have no gaps, no entry can be inserted between two others, and by induction the head's `balanceAfter` equals the sum of credits minus debits; reconciliation recomputes that sum independently (`recon.calculation`).
+- `ledger.cursor` — `GET /wallets/{walletId}/ledger` returns entries in ascending `walletVersion`. The cursor is the base64url encoding of `v1:<walletVersion of the last returned entry>`; it is opaque to clients and stable under concurrent appends. `limit` is 1 to 200, default 50. A malformed cursor is a `400 INVALID_CURSOR`. The page is `items` plus `nextCursor` (`null` on the last page).
+- `ledger.currency-matches-wallet` — An entry's currency equals its wallet's currency; the database enforces it through a composite foreign key on `(walletId, currency)`.
+- `ledger.read-shape` — An entry is returned as `id`, `walletId`, `transactionId`, `kind`, `direction`, `money`, `balanceBefore`, `balanceAfter`, `walletVersion`, `createdAt`.
+
+## 7. Business rules by kind
+
+- `rule.bet.debit` — A `BET` debits its amount and writes one `DEBIT` entry.
+- `rule.bet.insufficient-balance` — A `BET` larger than the current balance is `REJECTED` with `INSUFFICIENT_BALANCE`; balance, ledger and version are unchanged.
+- `rule.win.credit` — A `WIN` credits its amount and writes one `CREDIT` entry.
+- `rule.win.optional-reference` — A `WIN` may reference the `BET` of its round. When present the reference is validated like any other (`rule.reference.*`); the `WIN` amount is independent of the `BET` amount.
+- `rule.loss.no-effect` — A `LOSS` is `PROCESSED` without balance change, ledger entry or version increment, and its amount may be `0.00` (`money.positive-in-operations`). Only `WagerTransactionProcessed` is emitted.
+- `rule.loss.optional-reference` — A `LOSS` may reference the `BET` of its round under the same validation as `WIN`.
+- `rule.refund.credit` — A `REFUND` credits the referenced `BET` amount back and writes one `CREDIT` entry.
+- `rule.refund.bet-only` — A `REFUND` may reference only a `BET`; any other kind is `REJECTED` with `REFERENCE_KIND_NOT_ALLOWED`.
+- `rule.rollback.inverse` — A `ROLLBACK` applies the inverse of the referenced transaction: it credits a `BET`, debits a `WIN`, debits a `REFUND`; one entry in the inverse direction.
+- `rule.rollback.allowed-kinds` — A `ROLLBACK` may reference `BET`, `WIN` or `REFUND`. `ROLLBACK`, `LOSS` and `OPENING` targets are `REJECTED` with `REFERENCE_KIND_NOT_ALLOWED`.
+- `rule.reference.resolution` — A reference is resolved by `(providerId, referenceExternalTransactionId)`, never by the service id.
+- `rule.reference.same-context` — The referenced transaction must belong to the same provider, player, wallet, currency and round; otherwise `REJECTED` with `REFERENCE_MISMATCH`.
+- `rule.reference.must-be-processed` — A reference whose target is `REJECTED` or `FAILED` is `REJECTED` with `REFERENCE_NOT_PROCESSED`.
+- `rule.reference.missing-is-pending` — When the target does not exist yet, or exists but is not terminal, the transaction is persisted as `PENDING_REFERENCE` and retried (section 14).
+- `rule.reference.equal-amount` — `REFUND` and `ROLLBACK` amounts must equal the referenced amount; otherwise `REJECTED` with `REFERENCE_AMOUNT_MISMATCH`. Partial reversals are out of scope.
+- `rule.reference.reversed-once` — A `PROCESSED` transaction can be reversed at most once, by any reversal kind. A second `REFUND` or `ROLLBACK` against the same target is `REJECTED` with `REFERENCE_ALREADY_REVERSED`. The database enforces it with a partial unique index over processed reversals.
+- `rule.reversal.insufficient-balance` — A `ROLLBACK` that would take the balance below `0.00` (reversing a `WIN` or a `REFUND` already spent) is `REJECTED` with `REVERSAL_INSUFFICIENT_BALANCE`, a code distinct from `INSUFFICIENT_BALANCE` because the operator reaction differs. The rejection is persisted and auditable.
+- `rule.rejected.no-effect` — A `REJECTED` transaction changes nothing: no balance, no ledger entry, no version. Its row and its `WagerTransactionRejected` event are the only effects.
+- `rule.reversal.chain-limits` — Undoing a `REFUND` is a `ROLLBACK` of that `REFUND`. Deeper chains (a `ROLLBACK` of a `ROLLBACK`, a second `REFUND` after the first was rolled back) are not supported: they fall into `rule.rollback.allowed-kinds` or `rule.reference.reversed-once`. This is a documented limitation.
+
+## 8. Idempotency and replay
+
+- `idem.key-required` — `POST /wagering/transactions` without `Idempotency-Key` is a `400 IDEMPOTENCY_KEY_REQUIRED`. A queue message without `data.idempotencyKey` fails validation and is a permanent error.
+- `idem.key-format` — A key is 1 to 255 printable ASCII characters without spaces.
+- `idem.provider-scoped` — Idempotency keys are unique per `(providerId, idempotencyKey)`; two providers may use the same key string. The database enforces it.
+- `idem.recommended-default` — The recommended key is `{providerId}:{externalTransactionId}`; external identifiers are capped at 120 characters so that the recommended key always fits the 255-character limit.
+- `idem.payload-hash` — `payloadHash` is `sha256:` followed by the lowercase hex SHA-256 of the RFC 8785 canonical JSON of the validated business fields as one object, `money` nested as submitted: `providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money.amount`, `money.currency` and `referenceExternalTransactionId` (omitted when absent). Over HTTP that object is the request body; on the queue it is `data` without `idempotencyKey`. Headers, message ids, timestamps and the idempotency key itself never enter the hash. Because the amount format admits one spelling per value, equal payloads always hash equal.
+- `idem.replay-same-outcome` — A request whose key and hash match a stored transaction returns the stored outcome with `idempotentReplay: true` and the same status code the outcome maps to.
+- `idem.replay-follows-persisted-outcome` — The replayed status is the persisted one: a `PENDING_REFERENCE` transaction replays as `202` until it becomes terminal; a terminal transaction replays its frozen status, failure code and observed balance forever (`200`, `422` or `500` by status).
+- `idem.payload-mismatch-conflict` — The same key with a different hash is a `409 IDEMPOTENCY_PAYLOAD_MISMATCH`; nothing is processed or stored.
+- `idem.external-id-bound` — A different key for a `(providerId, externalTransactionId)` that already exists is a `409 EXTERNAL_TRANSACTION_ALREADY_BOUND`; nothing is processed or stored.
+- `idem.persistent` — Replay detection reads the database only. No in-memory cache, broker deduplication window or FIFO property is ever the deciding mechanism.
+- `idem.cross-entry-point` — The same key submitted through HTTP and through the queue is one operation; the second arrival is a replay.
+- `idem.replay-no-effects` — A replay never touches the balance, the ledger or the outbox; no event is emitted for a replay.
+
+## 9. Failure taxonomy
+
+- `failure.stable-codes` — Every `REJECTED` or `FAILED` transaction carries exactly one `FailureCode`. Codes are stable identifiers: they are never renamed or reused with a different meaning.
+- `failure.caller-action` — Each code documents the action expected from the provider, so that no provider needs to parse messages.
+- `failure.request-errors` — Request-level problems use `ErrorCode`, carried by a problem details body; they persist nothing.
+- `failure.distinct-insufficient` — `INSUFFICIENT_BALANCE` (a stake the player cannot afford) and `REVERSAL_INSUFFICIENT_BALANCE` (a reversal the wallet cannot absorb) are distinct codes.
+
+### 9.1 FailureCode (persisted on REJECTED and FAILED transactions)
+
+| Code                            | Meaning                                                                                            | Caller action                                                                |
+| ------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `INSUFFICIENT_BALANCE`          | The stake exceeds the current balance.                                                             | Do not resend; the player must fund the wallet first.                        |
+| `REVERSAL_INSUFFICIENT_BALANCE` | Reversing the referenced transaction would make the balance negative.                              | Do not resend as is; escalate to operations, the player has spent the funds. |
+| `BALANCE_LIMIT_EXCEEDED`        | Crediting this amount would take the balance above the maximum the service stores (`money.bound`). | Do not resend as is; escalate to operations.                                 |
+| `CURRENCY_MISMATCH`             | `money.currency` differs from the wallet currency.                                                 | Fix the payload or target the player's wallet in that currency.              |
+| `WALLET_PLAYER_MISMATCH`        | `playerId` is not the owner of `walletId`.                                                         | Fix the payload; investigate the mapping on the provider side.               |
+| `REFERENCE_NOT_FOUND`           | The referenced transaction never arrived within the waiting window.                                | Submit the referenced transaction, then resend under a new id.               |
+| `REFERENCE_NOT_PROCESSED`       | The referenced transaction exists but was rejected or failed.                                      | Give up; there is nothing to reverse.                                        |
+| `REFERENCE_MISMATCH`            | The referenced transaction belongs to another player, wallet, currency or round.                   | Fix the reference.                                                           |
+| `REFERENCE_KIND_NOT_ALLOWED`    | The kind of the referenced transaction cannot be reversed by this operation.                       | Fix the operation kind or give up.                                           |
+| `REFERENCE_AMOUNT_MISMATCH`     | The reversal amount differs from the referenced amount.                                            | Fix the amount; partial reversals are not supported.                         |
+| `REFERENCE_ALREADY_REVERSED`    | The referenced transaction was already reversed.                                                   | Give up; the reversal already happened.                                      |
+| `PROCESSING_FAILED`             | A permanent infrastructure error prevented the service from applying a persisted transaction.      | Do not resend; contact operations with the transaction id.                   |
+
+### 9.2 ErrorCode (request-level, nothing persisted)
+
+| Code                                 | Status | Meaning                                                             | Caller action                                        |
+| ------------------------------------ | ------ | ------------------------------------------------------------------- | ---------------------------------------------------- |
+| `VALIDATION_FAILED`                  | 400    | The body or a parameter violates the contract; details in `errors`. | Fix the payload and resend with the same key.        |
+| `IDEMPOTENCY_KEY_REQUIRED`           | 400    | The `Idempotency-Key` header is missing.                            | Add the header and resend.                           |
+| `INVALID_CURSOR`                     | 400    | The ledger cursor is malformed.                                     | Restart pagination from the first page.              |
+| `WALLET_NOT_FOUND`                   | 404    | No wallet has this id.                                              | Create the wallet or fix the id.                     |
+| `TRANSACTION_NOT_FOUND`              | 404    | No transaction matches the lookup.                                  | Check the ids; a submission may not have reached us. |
+| `WALLET_ALREADY_EXISTS`              | 409    | The player already has a wallet in this currency.                   | Use the existing wallet.                             |
+| `IDEMPOTENCY_PAYLOAD_MISMATCH`       | 409    | The key was first used with a different payload.                    | Use a new key for a new operation.                   |
+| `EXTERNAL_TRANSACTION_ALREADY_BOUND` | 409    | The provider transaction id is bound to another key.                | Resend with the original key, or use a new id.       |
+| `SERVICE_UNAVAILABLE`                | 503    | A dependency is unavailable or a lock timed out.                    | Resend after `Retry-After` with the same key.        |
+
+## 10. HTTP semantics
+
+- `api.status-classes` — Every operation uses the same status classes: `400` malformed or structurally invalid request, `404` unknown wallet or transaction, `409` conflict with stored state, `422` business-rule rejection (persisted), `200` applied, `202` accepted and waiting for a reference, `201` created, `500` permanent processing failure recorded on a persisted transaction (the replay of a `FAILED` outcome), `503` transient infrastructure failure. The full mapping is the table below.
+- `api.problem-details` — Request-level errors (`400`, `404`, `409`, `503`) return RFC 9457 `application/problem+json` with `type`, `title`, `status`, `detail` and the extensions `code` (an `ErrorCode`) and `correlationId`; `VALIDATION_FAILED` adds `errors`, a list of `path` and `message`.
+- `api.outcome-shape` — `200`, `202`, `422` and `500` of `POST /wagering/transactions` share one body: `transactionId`, `status`, `balance` (the observed balance), `idempotentReplay`, and `failureCode` when the status is `REJECTED` or `FAILED`.
+- `api.correlation-header` — `X-Correlation-Id` is optional on requests and always present on responses; when absent it is generated.
+- `api.location-on-pending` — A `202` carries `Location` pointing at `GET /wagering/transactions/{transactionId}`.
+- `api.retry-after` — A `503 SERVICE_UNAVAILABLE` problem carries `Retry-After` in seconds; the readiness `503` is a health signal and carries none.
+- `api.wallet-create` — `POST /wallets` takes `playerId` and `initialBalance`, returns `201` with the wallet and a `Location` header, `409 WALLET_ALREADY_EXISTS` for a duplicate, `400` for an invalid body.
+- `api.wallet-read` — `GET /wallets/{walletId}` returns the current wallet or `404 WALLET_NOT_FOUND`.
+- `api.ledger-read` — `GET /wallets/{walletId}/ledger?cursor=&limit=` pages the ledger per `ledger.cursor`.
+- `api.transaction-read` — `GET /wagering/transactions/{transactionId}` and `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` return the full transaction view or `404 TRANSACTION_NOT_FOUND`. The provider path accepts `system` so that opening credits are readable.
+- `api.reconciliation` — `POST /wallets/{walletId}/reconciliation` returns `200` with the report whether or not the wallet is consistent; `404` when the wallet is unknown.
+- `api.health-open` — `GET /health/live`, `GET /health/ready` and `GET /metrics` never require authentication.
+- `api.validation-stateless` — `400`, `404` and `409` responses persist nothing and have no financial side effect; repeating such a request is always safe. A `400` depends only on the request itself. `404` and `409` describe the stored state at the time of the request and can change when that state changes: a wallet created after a `404` makes the same submission succeed.
+- `api.contract-document` — `docs/openapi.yaml` is the HTTP contract. The running service serves that document unchanged at `/docs-json` and renders it at `/docs`; the two routes are documentation, outside the API surface the document describes.
+
+| Situation                                                                                                                                                                  | Status     | Body                                                                           |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------ |
+| Wallet created                                                                                                                                                             | 201        | Wallet                                                                         |
+| Duplicate wallet for the player and currency                                                                                                                               | 409        | Problem `WALLET_ALREADY_EXISTS`                                                |
+| Malformed body, missing `Idempotency-Key`, malformed cursor, `OPENING` or provider `system` submitted, reference present or absent against the kind matrix, self-reference | 400        | Problem `VALIDATION_FAILED`, `IDEMPOTENCY_KEY_REQUIRED` or `INVALID_CURSOR`    |
+| Unknown wallet or transaction                                                                                                                                              | 404        | Problem `WALLET_NOT_FOUND` or `TRANSACTION_NOT_FOUND`                          |
+| Same key with a different payload; provider transaction id bound to another key                                                                                            | 409        | Problem `IDEMPOTENCY_PAYLOAD_MISMATCH` or `EXTERNAL_TRANSACTION_ALREADY_BOUND` |
+| Transaction `PROCESSED`, first time or replay                                                                                                                              | 200        | Transaction outcome                                                            |
+| Transaction `REJECTED`, first time or replay                                                                                                                               | 422        | Transaction outcome with `failureCode`                                         |
+| Transaction `PENDING_REFERENCE`, first time or replay                                                                                                                      | 202        | Transaction outcome, plus `Location`                                           |
+| Transaction `FAILED`, replay                                                                                                                                               | 500        | Transaction outcome with `failureCode`                                         |
+| Dependency unavailable or lock timeout                                                                                                                                     | 503        | Problem `SERVICE_UNAVAILABLE`, plus `Retry-After`                              |
+| Reconciliation completed, consistent or not                                                                                                                                | 200        | Reconciliation report                                                          |
+| Liveness, readiness                                                                                                                                                        | 200 or 503 | Health                                                                         |
+
+## 11. Messaging
+
+- `msg.queues` — Input queue `wager-transactions.fifo`; dead-letter queue `wager-transactions-dlq.fifo`.
+- `msg.message-contract` — A message carries `messageId` (producer-assigned, 1 to 128 characters), `type` equal to `WagerTransactionRequested`, an optional `version` equal to 1 (absent means 1), `occurredAt` (RFC 3339), an optional `correlationId`, and `data` holding the business fields plus `idempotencyKey`; the shape is defined in `docs/asyncapi.yaml`. A body that fails validation, an unknown `type`, or an unsupported `version` is a permanent error.
+- `msg.same-use-case` — The consumer invokes the same `SubmitWagerTransaction` use case as the HTTP controller; no rule exists in only one entry point.
+- `msg.inbox-identity` — The inbox identity is `(consumerName, messageId)` where `messageId` is the body field. The broker's receipt id is logged for diagnosis and never used as identity, because a producer resend keeps the body id and gets a new receipt id.
+- `msg.inbox-payload-conflict` — A `messageId` seen before with a different payload hash is a permanent error: the message goes to the dead-letter queue, the original effects stay untouched, and `wager_duplicates_detected_total{source="inbox-conflict"}` increments.
+- `msg.ack-after-commit` — A message is deleted from the queue only after the database transaction that recorded its inbox row committed. A crash between commit and delete leads to a redelivery that the inbox absorbs.
+- `msg.classification` — Outcomes are classified before acting: business outcomes (`PROCESSED`, `REJECTED`, `PENDING_REFERENCE`, replay) are terminal for the message and acknowledged; transient failures (database or broker unavailable, lock timeout, serialization failure) are retried; permanent failures (validation failure, unknown type, inbox payload conflict, unknown wallet) go to the dead-letter queue at once.
+- `msg.transient-backoff` — A transient failure returns the message with `ChangeMessageVisibility` set to an exponential backoff derived from the receive count; the queue's redrive policy moves a message to the dead-letter queue after 5 receives.
+- `msg.permanent-to-dlq` — A permanent failure is sent to the dead-letter queue by the consumer and then deleted from the input queue, without waiting for the redrive policy. `wager_dlq_messages_total` increments.
+- `msg.unknown-wallet-permanent` — A queue message for a wallet that does not exist cannot be persisted (the transaction row requires the wallet) and is a permanent error.
+- `msg.redelivery-safe` — A redelivered message whose inbox row is already processed is acknowledged without any effect; `wager_duplicates_detected_total{source="inbox"}` increments.
+- `msg.sigterm` — On `SIGTERM` the consumer stops receiving, lets in-flight messages finish within the shutdown grace period, and returns the visibility of any message it could not finish so another instance picks it up immediately.
+- `msg.broker-features-optional` — FIFO ordering and the broker's deduplication window are optimizations. Every invariant holds without them because the database enforces it.
+- `msg.producer-contract` — Producers are asked to set `MessageGroupId` to the wallet id (so one wallet's operations arrive in order) and `MessageDeduplicationId` to `messageId`. Both are advisory.
+- `msg.correlation` — The message `correlationId` is propagated to logs and events; when absent, `messageId` is used.
+
+## 12. Atomicity and outbox
+
+- `outbox.single-transaction` — The transaction row, the wallet update, the ledger entry, the inbox row (queue entry point) and the outbox rows are written in one database transaction: all of them commit or none does.
+- `outbox.publish-after-commit` — No event is published before the financial transaction commits. The publisher reads only committed outbox rows.
+- `outbox.concurrent-publishers` — Any number of publisher instances work on the same outbox table. Each pending row is published at least once and is never lost.
+- `outbox.stable-event-id` — `eventId` is fixed when the event is enqueued; every publication of the same row carries the same id.
+- `outbox.crash-recovery` — If an instance dies after commit and before publication, another instance publishes the row without operator intervention.
+- `outbox.duplicate-safe` — Publishing the same row twice is safe: the envelope is identical and consumers deduplicate by `eventId`.
+- `outbox.retry-backoff` — A failed publication increments `attempts` and schedules `nextAttemptAt` with exponential backoff capped at five minutes. Rows are never discarded; after ten attempts an alert metric fires and retries continue.
+- `outbox.lag-metrics` — `wager_outbox_pending` (rows awaiting publication) and `wager_outbox_lag_seconds` (age of the oldest unpublished row) are exported continuously.
+- `outbox.destination` — Events are published to `wager-integration-events.fifo` with `MessageGroupId` set to `aggregateId` and `MessageDeduplicationId` set to `eventId`.
+
+## 13. Integration events
+
+- `event.envelope` — Every event is an instance of a concrete subclass of the abstract `IntegrationEvent<T>`; `eventType` and `version` are fixed in the subclass, never passed as strings at the call site. The serialized envelope carries `eventId`, `eventType`, `aggregateId`, `correlationId`, optional `causationId`, `occurredAt` (RFC 3339), `version` and `data`.
+- `event.aggregate-is-wallet` — `aggregateId` is the wallet id for every event.
+- `event.correlation-causation` — `correlationId` is the request's correlation id (`api.correlation-header`, `msg.correlation`); `causationId` is the id of the transaction whose processing produced the event.
+- `event.processed-when` — `WagerTransactionProcessed` is emitted for every transaction that reaches `PROCESSED`, including `LOSS` and the internal `OPENING` credit. Its `data`: the transaction identity (`transactionId`, `providerId`, `externalTransactionId`, `walletId`, `playerId`, `roundId`, `gameId`, `kind`, `money`), `balanceAfter`, `walletVersion`, `processedAt`, plus `referenceTransactionId` and `referenceExternalTransactionId` when a reference was resolved.
+- `event.rejected-when` — `WagerTransactionRejected` is emitted for every transaction that reaches `REJECTED`, including a pending reference that expired. Its `data`: the transaction identity, `failureCode`, `observedBalance`, `rejectedAt`, plus `referenceExternalTransactionId` when present.
+- `event.balance-changed-when` — `WalletBalanceChanged` is emitted exactly once per ledger entry and never otherwise. `LOSS`, rejections and replays emit none. Its `data`: `walletId`, `transactionId`, `direction`, `money`, `balanceBefore`, `balanceAfter`, `walletVersion`.
+- `event.pending-reference-when` — `WagerTransactionPendingReference` is emitted once, when a transaction first becomes `PENDING_REFERENCE`; retry attempts emit nothing. Its `data`: the transaction identity, `referenceExternalTransactionId`, `expiresAt`.
+- `event.failed-no-event` — A transaction reaching `FAILED` emits no event in this version; the state is visible through the read endpoints and metrics.
+- `event.money-props` — Event data carries `MoneyProps` strings for every amount; never a `Money` instance, never a number.
+- `event.at-least-once` — Events are delivered at least once. Consumers must deduplicate by `eventId`.
+- `event.ordering` — Ordering across publisher instances is not guaranteed. Consumers that need order use `walletVersion` (balance events) or `occurredAt`; the FIFO message group is a best effort.
+- `event.versioning` — Each event type carries an integer `version`, starting at 1. A breaking change to `data` creates a new version; consumers select by `(eventType, version)`.
+
+## 14. Pending references
+
+- `ref.parked-state` — A `REFUND`, `ROLLBACK`, `WIN` or `LOSS` whose reference cannot be resolved to a terminal transaction is persisted as `PENDING_REFERENCE`, answered with `202` (HTTP) or acknowledged (queue), and `WagerTransactionPendingReference` is emitted.
+- `ref.scheduler` — A scheduled worker claims due pending transactions with `SELECT ... FOR UPDATE SKIP LOCKED` and reprocesses them through the same use case; several worker instances never pick the same row.
+- `ref.backoff` — Attempts are spaced by `min(1s × 2^attempt, 5m)`.
+- `ref.ttl` — A pending transaction is awaited for 60 minutes after its first receipt. The window covers the reordering and retry delays observed between provider systems; a reference still missing after an hour almost certainly never existed.
+- `ref.expiry` — When the window closes without resolution the transaction is `REJECTED` with `REFERENCE_NOT_FOUND` and `WagerTransactionRejected` is emitted.
+- `ref.resolution-on-arrival` — Once the referenced transaction is `PROCESSED`, the next scheduled attempt applies the pending transaction under the normal rules (`rule.reference.*`); the arrival itself does not trigger processing.
+- `ref.transient-failure` — A transient failure during reprocessing (database or broker unavailable, lock timeout, serialization failure) changes nothing on the transaction: the attempt is rescheduled per `ref.backoff` and counted in `wager_retries_total{component="scheduler"}`. There is no limit on transient retries, and expiry is not consulted, because `ref.expiry` is a decision about a missing reference that only an attempt that ran can take. When the database itself is unavailable nothing is recorded and the row is still due.
+- `ref.permanent-failure` — A pending transaction whose reprocessing hits a permanent infrastructure error, one that retrying cannot fix, is marked `FAILED` with `PROCESSING_FAILED`, logged at error level and counted in `wager_transactions_total{status="FAILED"}`. The error class comes from the same classification as `msg.classification`; an error that cannot be classified is treated as transient, so nothing becomes terminal by mistake.
+
+## 15. Reconciliation
+
+- `recon.snapshot` — Reconciliation reads the wallet row and its ledger in one `REPEATABLE READ` transaction without locking the wallet, so the two readings are mutually consistent and processing is never blocked.
+- `recon.calculation` — `calculatedBalance` is the sum of `CREDIT` amounts minus the sum of `DEBIT` amounts over every entry in the snapshot. The wallet is `consistent` when `storedBalance` equals `calculatedBalance` and equals `balanceAfter` of the entry whose `walletVersion` is the wallet's version (or when there are no entries, the balance is `0.00` and the version is 1).
+- `recon.report-shape` — The report carries `walletId`, `storedBalance`, `calculatedBalance`, `difference` (`storedBalance - calculatedBalance`, signed), `consistent`, `checkedEntries`, `checkedAt`.
+- `recon.divergence-handling` — A divergence is reported with `consistent: false`, logged at error level with `walletId`, `difference` and `checkedEntries`, and counted in `wager_reconciliation_divergence_total`. The service never corrects a balance on its own.
+- `recon.final-invariant` — Every test suite that moves money ends by asserting, for every wallet it touched, that the stored balance equals the balance rebuilt from the ledger.
+
+## 16. Observability
+
+- `obs.structured-logs` — Logs are JSON lines carrying, when known, `correlationId`, `messageId`, `transactionId`, `walletId`, `providerId` and `externalTransactionId`.
+- `obs.no-sensitive-data` — Logs never contain request bodies, amounts or balances. The single exception is the reconciliation divergence record (`recon.divergence-handling`), which needs the difference to be actionable.
+- `obs.metrics` — Prometheus metrics exported at `/metrics`: `wager_transactions_total{kind,status}`, `wager_duplicates_detected_total{source}`, `wager_retries_total{component}`, `wager_dlq_messages_total`, `wager_lock_conflicts_total`, `wager_outbox_pending`, `wager_outbox_lag_seconds`, `wager_processing_duration_seconds{entrypoint}`, `wager_reconciliation_divergence_total`, `wager_pending_reference_total{outcome}`.
+- `obs.health-split` — `GET /health/live` answers `{ status: "ok" }` whenever the process serves HTTP; `GET /health/ready` answers `200` only when PostgreSQL and SQS are reachable and `503` otherwise, with a `details` map holding one entry per dependency, so that traffic stops before requests fail.
+- `obs.correlation-propagation` — The correlation id travels from the request or message into every log line and every event produced while handling it.
+
+## 17. Concurrency
+
+- `conc.unit-wallet` — The unit of concurrency is the wallet. Operations on one wallet are serialized; operations on different wallets never wait for each other.
+- `conc.row-lock` — Processing locks the wallet row with `SELECT ... FOR NO KEY UPDATE` inside one short database transaction. The mode matters: the idempotency reservation that precedes the lock (`conc.lock-order`) holds `FOR KEY SHARE` on the wallet through its foreign key; `FOR UPDATE` conflicts with it, so two concurrent reservations would deadlock, while `FOR NO KEY UPDATE` does not. A lock wait longer than the configured `lock_timeout` is a transient failure (`503`, or a queue retry).
+- `conc.version-guard` — The wallet update is guarded by the expected `version` and the balance is protected by a database check constraint; both detect any write that bypassed the lock.
+- `conc.no-global-lock` — No lock, advisory or otherwise, is shared by all wallets.
+- `conc.no-unguarded-rmw` — The balance is never read, computed and written without holding the wallet lock.
+- `conc.multi-instance` — Every guarantee holds with three or more instances processing the same wallets at the same time.
+- `conc.canonical-scenario` — A wallet opened with `100.00` receiving two concurrent `80.00` bets ends with exactly one `PROCESSED` bet, one bet `REJECTED` with `INSUFFICIENT_BALANCE`, balance `20.00`, exactly one `DEBIT` entry, and no retry of either request produces a second debit.
+- `conc.parallel-wallets` — Operations on distinct wallets proceed in parallel without contention beyond the database's own.
+- `conc.duplicate-storm` — The same bet submitted fifty times in parallel produces exactly one debit, one ledger entry and forty-nine replays.
+- `conc.lock-order` — Inside the financial transaction the order is fixed: idempotency reservation (insert of the transaction row), wallet lock, reference lookup, ledger insert, outbox insert, inbox completion. The sequence is deadlock-free with the lock mode of `conc.row-lock`. No network call happens while the lock is held.
+
+## 18. Authentication
+
+- `auth.deferred` — This version performs no authentication of HTTP callers. The decision and the intended design are recorded in [ARCHITECTURE.md](../ARCHITECTURE.md).
+- `auth.extension-point` — The application layer exposes `ProviderIdentityPort`, and the HTTP layer applies a guard that currently admits every request. Enabling authentication means implementing the port, not touching use cases.
+- `auth.intended-design` — When enabled: an external OpenID Connect identity provider issues client-credentials tokens per provider; the token's `providerId` claim must equal the payload's `providerId` or the request is rejected before reaching the domain.
+- `auth.open-endpoints` — `GET /health/live`, `GET /health/ready` and `GET /metrics` stay open whatever the authentication setting.
+- `auth.queue-trusted-channel` — The queue is an internal channel and carries no credentials; the `providerId` in a message is still subject to every domain validation.
+
+## 19. Operations
+
+- `ops.migrations-reversible` — Database migrations are versioned files with `up` and `down`; the test suite applies up, down and up again on a clean database.
+- `ops.single-image-roles` — One container image runs as `api`, `worker` or `all` through `APP_ROLE`; the roles share code and configuration.
+- `ops.two-db-roles` — Migrations run as `wagering_migrator`, which owns the schema. The service runs as `wagering_app`, which has no `UPDATE` or `DELETE` privilege on the ledger and no DDL privilege.
+- `ops.config-env` — Configuration comes from environment variables validated at startup; an invalid or missing value stops the process before it serves traffic.
+- `ops.repository-gate` — `make check` is the repository gate: formatting, lint, types, tests and dependency audit. CI runs the same target on every pull request and on `main`; nothing merges red.
+- `ops.compose` — `docker compose up` starts PostgreSQL, LocalStack with the three queues and the service roles; the integration and concurrency suites run against these containers, never against mocks.
+- `ops.graceful-shutdown` — On `SIGTERM` the HTTP server stops accepting connections and drains in-flight requests, the consumer behaves per `msg.sigterm`, and the publisher finishes its current batch before exiting.
+
+## 20. Adopted interpretations and additional policies
+
+### 20.1 Interpretations
+
+Choices made where more than one reading of the operation semantics was possible. Each row names the rules that carry it.
+
+| #   | Topic                                     | Policy                                                                                                                                                                                                                                                                                                                                                                                                                      | Rules                                                                                                |
+| --- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| 1   | Signs                                     | Negative amounts are never accepted in any input and are serialized only as a reconciliation `difference`. Inside the domain a subtraction may go negative; that result is what decides insufficient balance.                                                                                                                                                                                                               | `money.rejected-inputs`, `money.signed-difference-only`, `money.immutable`                           |
+| 2   | One money bound                           | Inputs, arithmetic and storage share one bound, the capacity of `NUMERIC(20,2)`. The domain enforces it; a credit that would cross it is a persisted rejection.                                                                                                                                                                                                                                                             | `money.bound`, `wallet.balance-limit`                                                                |
+| 3   | References on `WIN` and `LOSS`            | Optional, and validated when present under the same rules as reversals; an absent target parks the outcome as `PENDING_REFERENCE`. `BET` never carries a reference.                                                                                                                                                                                                                                                         | `rule.win.optional-reference`, `rule.loss.optional-reference`, `tx.reference-matrix`                 |
+| 4   | Reference states                          | Missing or non-terminal target: wait. Rejected or failed target: `REFERENCE_NOT_PROCESSED`. Wrong kind, other context, other amount, already reversed: the matching code. Self-reference: `400`.                                                                                                                                                                                                                            | `rule.reference.*`, `tx.self-reference-invalid`                                                      |
+| 5   | Replay of a pending outcome               | Replays return the persisted outcome: `202` while pending, then the frozen terminal outcome with its observed balance, always with `idempotentReplay: true`.                                                                                                                                                                                                                                                                | `idem.replay-follows-persisted-outcome`, `tx.observed-balance`                                       |
+| 6   | Key scope                                 | Idempotency keys are scoped per provider: two providers may use the same key string.                                                                                                                                                                                                                                                                                                                                        | `idem.provider-scoped`                                                                               |
+| 7   | Reused `messageId` with different content | Permanent error: dead-letter queue, metric, original effects untouched.                                                                                                                                                                                                                                                                                                                                                     | `msg.inbox-payload-conflict`                                                                         |
+| 8   | Opening credit                            | The wallet is created at version 1 with its opening balance; the `OPENING` transaction uses `providerId` `system`, `externalTransactionId` and `roundId` equal to the wallet id, `gameId` `wallet-opening`, `idempotencyKey` `system:<walletId>`; it emits both the processed and the balance-changed events.                                                                                                               | `wallet.opening-credit`, `tx.opening-internal`, `event.processed-when`, `event.balance-changed-when` |
+| 9   | Permanent versus transient failures       | Transient: unavailable dependency, timeout, lock timeout, serialization failure, broker throttling; retried without limit, never terminal. Permanent: validation failure, unknown type, inbox conflict, unknown wallet, and any infrastructure error retrying cannot fix. `FAILED` is reserved for the scheduler, replays as `500`, and raises no dead-letter message because the inbound message was already acknowledged. | `msg.classification`, `ref.transient-failure`, `ref.permanent-failure`, `tx.failed-semantics`        |
+| 10  | Reconciliation under concurrent writes    | One repeatable-read snapshot, no wallet lock.                                                                                                                                                                                                                                                                                                                                                                               | `recon.snapshot`                                                                                     |
+| 11  | Stateless versus persisted outcomes       | `400`, `404` and `409` persist nothing and have no financial side effect; `422` persists a `REJECTED` row for audit; `500` on a replay reports a persisted `FAILED` row.                                                                                                                                                                                                                                                    | `api.validation-stateless`, `rule.rejected.no-effect`, `tx.failed-semantics`                         |
+| 12  | Event ordering                            | Not guaranteed across publishers; consumers order by `walletVersion` or `occurredAt`.                                                                                                                                                                                                                                                                                                                                       | `event.ordering`, `outbox.concurrent-publishers`                                                     |
+| 13  | Inbox identity                            | The body `messageId` is the identity; the broker receipt id is diagnostic only.                                                                                                                                                                                                                                                                                                                                             | `msg.inbox-identity`                                                                                 |
+| 14  | Ledger sequence                           | `walletVersion` orders the ledger and links it to the materialized balance; the chain of entries is enforced at commit from both sides. UUIDs are identity only, because UUIDv7 is not monotonic across instances.                                                                                                                                                                                                          | `ledger.wallet-version-sequence`, `ledger.chain`, `ledger.cursor`, `wallet.ledger-mirror`            |
+| 15  | Shapes live in the transport contracts    | `docs/openapi.yaml` and `docs/asyncapi.yaml` define every shape, header, status code, envelope and delivery semantic; DTOs and message classes implement them, and the service serves the HTTP document unchanged. Behaviour stays here; the contracts cite its rule ids.                                                                                                                                                   | `model.contract-first`, `api.contract-document`                                                      |
+
+### 20.2 Additional policies
+
+Rules stricter than the operation semantics alone require. Each is a deliberate tightening; the table states the looser rule a caller might expect, what such a caller observes here, and the rules that carry the policy.
+
+| #   | Policy                                                     | Looser rule it tightens                                                                                             | Compatibility consequence                                                                                                                                                                                                                                                                                | Rules                                                                                       |
+| --- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| A   | One reversal per transaction, across kinds                 | Once per reversal kind: one `REFUND` and one `ROLLBACK` of the same `BET`, each accepted.                           | A `REFUND` followed by a `ROLLBACK` of the same `BET` would credit the stake twice, so the second reversal is `422 REFERENCE_ALREADY_REVERSED` whatever its kind. To undo a `REFUND`, send a `ROLLBACK` of the `REFUND`.                                                                                 | `rule.reference.reversed-once`, `rule.reversal.chain-limits`                                |
+| B   | Strictly positive amounts on every kind that moves money   | `0.00` could be accepted on any kind and treated as a no-op.                                                        | A `BET`, `WIN`, `REFUND` or `ROLLBACK` of `0.00` is `400 VALIDATION_FAILED`, because it would need a ledger entry of `0.00` and `ledger.positive-amount` refuses one. A `LOSS` of `0.00` is accepted and `PROCESSED`: it moves nothing and writes no entry, so nothing in the ledger has to bend for it. | `money.positive-in-operations`, `money.zero-only-initial-balance`, `ledger.positive-amount` |
+| C   | Provider transaction id bound to its first idempotency key | Only the key identifies an operation; the same `externalTransactionId` under a second key would be a new operation. | A second key for an existing `(providerId, externalTransactionId)` is `409 EXTERNAL_TRANSACTION_ALREADY_BOUND` and nothing is stored; resend with the original key or use a new id. In return there is exactly one row per provider transaction for lookups and reference resolution.                    | `idem.external-id-bound`                                                                    |
+| D   | Reserved provider id `system`                              | Any provider id string is a valid provider.                                                                         | A provider cannot be named `system`; a submission carrying it is `400` over HTTP and a permanent error on the queue.                                                                                                                                                                                     | `tx.opening-internal`                                                                       |

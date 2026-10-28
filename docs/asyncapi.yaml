@@ -1,0 +1,948 @@
+# Messaging contract of the wallet and wagering transaction service.
+#
+# Authoritative for the queue transport: the queues, the input message, the integration events,
+# their envelopes and the delivery semantics. Behaviour and business rules live in
+# docs/system-contract.md and are cited below by rule id (`area.name`); the HTTP transport is
+# docs/openapi.yaml. A shape change starts here and then reaches the message and event classes that
+# implement it. Money, identifiers and enumerations are defined identically in both contract
+# documents so that each one stands alone.
+asyncapi: 3.0.0
+id: https://github.com/mauricio-azevedo/distributed-wagering-processor
+info:
+  title: Distributed Wagering Processor Messaging
+  version: 0.1.0
+  description: |
+    Providers may submit operations through the input queue instead of HTTP; both entry points run
+    the same use case (`msg.same-use-case`), so every business rule, failure code and idempotency
+    guarantee of the HTTP contract applies unchanged. Committed outcomes are announced to downstream
+    systems through a transactional outbox and the integration events queue.
+
+    ## Delivery semantics
+
+    **Input, `wager-transactions.fifo`**
+
+    - Identity is `(consumerName, messageId)`, where `messageId` is the body field assigned by the
+      producer; the broker's receipt id is diagnostic only (`msg.inbox-identity`). A producer resend
+      keeps the same `messageId`.
+    - At least once: a redelivery of a processed message is acknowledged without effect
+      (`msg.redelivery-safe`); a `messageId` seen before with another payload hash is a permanent
+      error (`msg.inbox-payload-conflict`).
+    - A message is deleted only after the database transaction that recorded its outcome committed
+      (`msg.ack-after-commit`).
+    - Outcomes are classified before acting (`msg.classification`): business outcomes are
+      acknowledged; transient failures are retried through the visibility timeout with exponential
+      backoff and dead-lettered by the redrive policy after 5 receives (`msg.transient-backoff`);
+      permanent failures are dead-lettered at once (`msg.permanent-to-dlq`).
+    - FIFO ordering and broker deduplication are optimisations; every invariant holds without them
+      because the database enforces it (`msg.broker-features-optional`). Producers set
+      `MessageGroupId` to `data.walletId` and `MessageDeduplicationId` to `messageId`
+      (`msg.producer-contract`); both are advisory.
+    - `correlationId` propagates to logs and events; when absent, `messageId` is used
+      (`msg.correlation`). The queue carries no credentials; the `providerId` inside a message is
+      still subject to every domain rule (`auth.queue-trusted-channel`).
+
+    **Events, `wager-integration-events.fifo`**
+
+    - Written to the outbox in the same database transaction as the financial change
+      (`outbox.single-transaction`) and published only after commit (`outbox.publish-after-commit`).
+    - At least once: a row may be published more than once with an identical envelope; consumers
+      deduplicate by `eventId` (`event.at-least-once`, `outbox.duplicate-safe`).
+    - No ordering across publisher instances: consumers order `WalletBalanceChanged` by
+      `data.walletVersion` and everything else by `occurredAt`; the FIFO group per wallet is a best
+      effort (`event.ordering`).
+    - Each event type carries an integer `version` starting at 1; a breaking change to `data`
+      creates a new version and consumers select by `(eventType, version)` (`event.versioning`).
+      Additive changes keep the version; consumers ignore members they do not know.
+    - A transaction that reaches `FAILED` emits nothing in this version (`event.failed-no-event`);
+      a replay emits nothing (`idem.replay-no-effects`).
+
+    ## Conventions
+
+    Money is `{ "amount": "40.00", "currency": "BRL" }` with a decimal string of exactly two
+    decimals, no sign and at most 18 integer digits, never a JSON number (`event.money-props`).
+    Identifiers minted by the service are lowercase UUIDs; provider identifiers are 1 to 120
+    characters of `A-Z a-z 0-9 . _ : -` starting with a letter or digit. Input bodies are validated
+    strictly: unknown members are a validation failure. Event payloads may gain members in later
+    versions.
+  contact:
+    name: Maurício Azevedo
+    url: https://github.com/mauricio-azevedo/distributed-wagering-processor
+  tags:
+    - name: input
+      description: The queue entry point for provider operations and its dead-letter queue.
+    - name: integration-events
+      description: Committed facts published for downstream systems.
+defaultContentType: application/json
+servers:
+  local:
+    host: localhost:4566
+    pathname: /000000000000
+    protocol: sqs
+    description: >-
+      LocalStack started by Docker Compose (`SQS_ENDPOINT`); the three FIFO queues are created at
+      startup with content-based deduplication and the redrive policy below. Region and
+      credentials are configuration; on AWS the host is the regional SQS endpoint and the pathname
+      the account id.
+channels:
+  wagerTransactions:
+    address: wager-transactions.fifo
+    title: Wager transactions
+    summary: Provider operations submitted asynchronously; the queue entry point of the service.
+    description: |
+      Producers send one `WagerTransactionRequested` message per operation with `MessageGroupId`
+      set to `data.walletId`, so one wallet's operations arrive in order, and
+      `MessageDeduplicationId` set to `messageId` (`msg.producer-contract`). Both are advisory: the
+      queue is created with content-based deduplication as a fallback, and correctness never
+      depends on either (`msg.broker-features-optional`).
+
+      The queue redrives to `wager-transactions-dlq.fifo` after 5 receives (`msg.transient-backoff`).
+    messages:
+      wagerTransactionRequested:
+        $ref: '#/components/messages/WagerTransactionRequested'
+    bindings:
+      sqs:
+        bindingVersion: '0.2.0'
+        queue:
+          name: wager-transactions.fifo
+          fifoQueue: true
+          redrivePolicy:
+            deadLetterQueue:
+              name: wager-transactions-dlq.fifo
+            maxReceiveCount: 5
+        deadLetterQueue:
+          name: wager-transactions-dlq.fifo
+          fifoQueue: true
+  wagerTransactionsDeadLetter:
+    address: wager-transactions-dlq.fifo
+    title: Wager transactions dead-letter queue
+    summary: Messages the service could not process, kept for operators.
+    description: |
+      A message arrives here by two paths: the consumer sends it at once on a permanent failure
+      (`msg.permanent-to-dlq`), and the broker moves it after 5 receives that ended in transient
+      failures (`msg.transient-backoff`). The body is the message as it arrived, unchanged, so it
+      may violate the `WagerTransactionRequested` schema: validation failure is one of the
+      permanent failures. Nothing consumes this queue automatically; operators inspect the body
+      with its `messageId` and `correlationId`, fix the cause and resend by hand.
+      `wager_dlq_messages_total` counts the messages the consumer sends here.
+    messages:
+      wagerTransactionRequested:
+        $ref: '#/components/messages/WagerTransactionRequested'
+    bindings:
+      sqs:
+        bindingVersion: '0.2.0'
+        queue:
+          name: wager-transactions-dlq.fifo
+          fifoQueue: true
+  wagerIntegrationEvents:
+    address: wager-integration-events.fifo
+    title: Wager integration events
+    summary: Committed facts about transactions and balances, for downstream systems.
+    description: |
+      Every message is one integration event in the common envelope; `eventType` and `version`
+      select the schema of `data`. Published with `MessageGroupId` set to `aggregateId`, the wallet
+      id, and `MessageDeduplicationId` set to `eventId` (`outbox.destination`). The group keeps one
+      wallet's events in order only as a best effort (`event.ordering`).
+    messages:
+      wagerTransactionProcessed:
+        $ref: '#/components/messages/WagerTransactionProcessed'
+      wagerTransactionRejected:
+        $ref: '#/components/messages/WagerTransactionRejected'
+      walletBalanceChanged:
+        $ref: '#/components/messages/WalletBalanceChanged'
+      wagerTransactionPendingReference:
+        $ref: '#/components/messages/WagerTransactionPendingReference'
+    bindings:
+      sqs:
+        bindingVersion: '0.2.0'
+        queue:
+          name: wager-integration-events.fifo
+          fifoQueue: true
+operations:
+  receiveWagerTransactionRequested:
+    action: receive
+    channel:
+      $ref: '#/channels/wagerTransactions'
+    title: Consume provider operations
+    summary: The queue entry point; runs the same use case as `POST /wagering/transactions`.
+    tags:
+      - name: input
+    description: |
+      Every rule of the HTTP contract applies unchanged (`msg.same-use-case`); only the answer
+      differs: nothing is replied, the message is acknowledged or not, and the outcome is visible
+      through the read endpoints and the integration events.
+
+      Processing of one message:
+
+      1. Validate the body against `WagerTransactionRequested`. A body that fails validation, an
+         unknown `type`, an unsupported `version`, kind `OPENING` or provider `system` is a
+         permanent failure (`msg.message-contract`, `tx.opening-internal`).
+      2. Look up the inbox by `(consumerName, messageId)` (`msg.inbox-identity`). A processed row
+         with the same payload hash means a redelivery: acknowledge without any effect
+         (`msg.redelivery-safe`). A processed row with another payload hash is a permanent failure
+         (`msg.inbox-payload-conflict`).
+      3. Run the use case with `data.idempotencyKey` as the idempotency key; the same operation
+         first seen over HTTP is a replay (`idem.cross-entry-point`).
+      4. Commit the transaction row, the wallet update, the ledger entry, the outbox rows and the
+         inbox row together (`outbox.single-transaction`), then delete the message
+         (`msg.ack-after-commit`). A crash between commit and delete leads to a redelivery that
+         step 2 absorbs.
+
+      Outcome classification (`msg.classification`):
+
+      | Class | Outcomes | Action |
+      | --- | --- | --- |
+      | Business | `PROCESSED`, `REJECTED`, `PENDING_REFERENCE`, replay | Acknowledge: delete the message |
+      | Transient | PostgreSQL or SQS unavailable, lock timeout, serialization failure | Return the message with `ChangeMessageVisibility` set to an exponential backoff derived from the receive count; the redrive policy dead-letters it after 5 receives |
+      | Permanent | Validation failure, unknown `type`, unsupported `version`, inbox payload conflict, unknown wallet | Send to `wager-transactions-dlq.fifo`, then delete from the input queue (`msg.permanent-to-dlq`, `msg.unknown-wallet-permanent`) |
+
+      On `SIGTERM` the consumer stops receiving, finishes in-flight messages within the shutdown
+      grace period and resets the visibility of the rest so another instance picks them up at once
+      (`msg.sigterm`).
+    messages:
+      - $ref: '#/channels/wagerTransactions/messages/wagerTransactionRequested'
+  deadLetterWagerTransactionRequested:
+    action: send
+    channel:
+      $ref: '#/channels/wagerTransactionsDeadLetter'
+    title: Dead-letter a permanently failed message
+    summary: Forwards a message with a permanent failure, body unchanged, before deleting it.
+    tags:
+      - name: input
+    description: >-
+      Sent by the consumer before the message is deleted from the input queue
+      (`msg.permanent-to-dlq`). `MessageGroupId` and `MessageDeduplicationId` are copied from the
+      received message, so a redelivery after a crash between the forward and the delete
+      dead-letters the same body again; the broker deduplicates it within its window and operators
+      recognise it by `messageId` otherwise.
+    messages:
+      - $ref: '#/channels/wagerTransactionsDeadLetter/messages/wagerTransactionRequested'
+  publishIntegrationEvents:
+    action: send
+    channel:
+      $ref: '#/channels/wagerIntegrationEvents'
+    title: Publish integration events
+    summary: Relays committed outbox rows to the events queue, at least once.
+    tags:
+      - name: integration-events
+    description: |
+      Rows are written to the outbox inside the financial transaction and published only after it
+      committed (`outbox.publish-after-commit`). Any number of publisher instances claim batches
+      with `FOR UPDATE SKIP LOCKED` (`outbox.concurrent-publishers`); a crash at any point is
+      recovered by the next claim (`outbox.crash-recovery`). A failed publication is retried with
+      exponential backoff capped at five minutes and never discarded (`outbox.retry-backoff`);
+      `wager_outbox_pending` and `wager_outbox_lag_seconds` expose the backlog
+      (`outbox.lag-metrics`).
+
+      What a consumer must assume:
+
+      - The same `eventId` may arrive more than once with an identical envelope; deduplicate by
+        `eventId` (`event.at-least-once`, `outbox.duplicate-safe`).
+      - No ordering across publisher instances; order `WalletBalanceChanged` by
+        `data.walletVersion` and everything else by `occurredAt` (`event.ordering`).
+      - Select the handler by `(eventType, version)`; ignore members you do not know
+        (`event.versioning`).
+      - `aggregateId` is the wallet id (`event.aggregate-is-wallet`); `causationId` is the
+        transaction whose processing produced the event; `correlationId` is the correlation id of
+        the originating request or message (`event.correlation-causation`).
+    messages:
+      - $ref: '#/channels/wagerIntegrationEvents/messages/wagerTransactionProcessed'
+      - $ref: '#/channels/wagerIntegrationEvents/messages/wagerTransactionRejected'
+      - $ref: '#/channels/wagerIntegrationEvents/messages/walletBalanceChanged'
+      - $ref: '#/channels/wagerIntegrationEvents/messages/wagerTransactionPendingReference'
+components:
+  messages:
+    WagerTransactionRequested:
+      name: WagerTransactionRequested
+      title: Wager transaction requested
+      summary: A provider asks the service to apply one operation to a wallet.
+      description: |
+        `data` carries the business fields of `POST /wagering/transactions` plus the idempotency
+        key that the HTTP entry point takes from the `Idempotency-Key` header
+        (`idem.key-required`). The payload hash is computed over `data` without `idempotencyKey`,
+        exactly as over the HTTP body, so the same operation hashes equal on both entry points
+        (`idem.payload-hash`).
+
+        `messageId` is assigned by the producer, is the inbox identity and is kept on a resend
+        (`msg.inbox-identity`); the broker's own message id is diagnostic only. Unknown members
+        anywhere in the body are a validation failure, hence a permanent error.
+      contentType: application/json
+      correlationId:
+        location: '$message.payload#/correlationId'
+        description: >-
+          Optional; when absent the service uses `messageId` as the correlation id
+          (`msg.correlation`).
+      payload:
+        $ref: '#/components/schemas/WagerTransactionRequestedPayload'
+      examples:
+        - name: bet
+          summary: A bet with a caller-chosen correlation id
+          payload:
+            messageId: acme-msg-000123
+            type: WagerTransactionRequested
+            occurredAt: '2026-10-28T12:05:00.000Z'
+            correlationId: acme-req-5f2c
+            data:
+              providerId: provider-acme
+              externalTransactionId: acme-tx-000123
+              idempotencyKey: provider-acme:acme-tx-000123
+              playerId: 01a17cb1-f5c0-7588-9a61-47a9444c049e
+              walletId: 01a18261-a600-7589-8768-3d958460eced
+              roundId: round-7f3a
+              gameId: lucky-sevens
+              kind: BET
+              money: { amount: '40.00', currency: BRL }
+        - name: rollbackBeforeReference
+          summary: A rollback delivered before its reference; parked as PENDING_REFERENCE
+          payload:
+            messageId: acme-msg-000126
+            type: WagerTransactionRequested
+            version: 1
+            occurredAt: '2026-10-28T12:08:00.000Z'
+            data:
+              providerId: provider-acme
+              externalTransactionId: acme-tx-000126
+              idempotencyKey: provider-acme:acme-tx-000126
+              playerId: 01a17cb1-f5c0-7588-9a61-47a9444c049e
+              walletId: 01a18261-a600-7589-8768-3d958460eced
+              roundId: round-7f3a
+              gameId: lucky-sevens
+              kind: ROLLBACK
+              money: { amount: '25.00', currency: BRL }
+              referenceExternalTransactionId: acme-tx-000999
+    WagerTransactionProcessed:
+      name: WagerTransactionProcessed
+      title: Wager transaction processed
+      summary: A transaction reached PROCESSED, including LOSS and the internal OPENING credit.
+      description: >-
+        Emitted once for every transaction that reaches `PROCESSED` (`event.processed-when`).
+        `data.balanceAfter` and `data.walletVersion` are the wallet balance and version once the
+        transaction is applied; for a `LOSS` they are the unchanged values. The transaction that
+        opens a wallet carries `providerId` `system`, `kind` `OPENING` and, as `externalTransactionId`
+        and `roundId`, the wallet id.
+      contentType: application/json
+      correlationId:
+        location: '$message.payload#/correlationId'
+      payload:
+        $ref: '#/components/schemas/WagerTransactionProcessedPayload'
+      examples:
+        - name: openingCredit
+          summary: The internal opening credit of a wallet opened with 500.00
+          payload:
+            eventId: 01a18261-a600-7592-bcfd-c2fb65747905
+            eventType: WagerTransactionProcessed
+            aggregateId: 01a18261-a600-7589-8768-3d958460eced
+            correlationId: 01a18261-a600-7599-8d31-0f6a2c9b7e44
+            causationId: 01a18261-a600-758a-aeb0-b30c6f25f3fa
+            occurredAt: '2026-10-28T12:00:00.000Z'
+            version: 1
+            data:
+              transactionId: 01a18261-a600-758a-aeb0-b30c6f25f3fa
+              providerId: system
+              externalTransactionId: 01a18261-a600-7589-8768-3d958460eced
+              walletId: 01a18261-a600-7589-8768-3d958460eced
+              playerId: 01a17cb1-f5c0-7588-9a61-47a9444c049e
+              roundId: 01a18261-a600-7589-8768-3d958460eced
+              gameId: wallet-opening
+              kind: OPENING
+              money: { amount: '500.00', currency: BRL }
+              balanceAfter: { amount: '500.00', currency: BRL }
+              walletVersion: 1
+              processedAt: '2026-10-28T12:00:00.000Z'
+        - name: bet
+          summary: A provider bet of 40.00 applied to a 500.00 balance
+          payload:
+            eventId: 01a18266-39ec-7593-8f3b-4ac2775c9a42
+            eventType: WagerTransactionProcessed
+            aggregateId: 01a18261-a600-7589-8768-3d958460eced
+            correlationId: 01a18266-39e0-7597-812c-a89950b9acf2
+            causationId: 01a18266-39e0-758b-a289-fb48c2dd9c8b
+            occurredAt: '2026-10-28T12:05:00.012Z'
+            version: 1
+            data:
+              transactionId: 01a18266-39e0-758b-a289-fb48c2dd9c8b
+              providerId: provider-acme
+              externalTransactionId: acme-tx-000123
+              walletId: 01a18261-a600-7589-8768-3d958460eced
+              playerId: 01a17cb1-f5c0-7588-9a61-47a9444c049e
+              roundId: round-7f3a
+              gameId: lucky-sevens
+              kind: BET
+              money: { amount: '40.00', currency: BRL }
+              balanceAfter: { amount: '460.00', currency: BRL }
+              walletVersion: 2
+              processedAt: '2026-10-28T12:05:00.012Z'
+    WagerTransactionRejected:
+      name: WagerTransactionRejected
+      title: Wager transaction rejected
+      summary: A transaction reached REJECTED, including a pending reference that expired.
+      description: >-
+        Emitted once for every transaction that reaches `REJECTED` (`event.rejected-when`), with
+        the `failureCode` of the rejection and the balance observed at that moment. A rejection
+        changes no balance, ledger entry or version (`rule.rejected.no-effect`).
+      contentType: application/json
+      correlationId:
+        location: '$message.payload#/correlationId'
+      payload:
+        $ref: '#/components/schemas/WagerTransactionRejectedPayload'
+      examples:
+        - name: insufficientBalance
+          summary: A 600.00 bet against a 525.00 balance
+          payload:
+            eventId: 01a18268-0ea9-7595-a1bc-dd69a1ee18d6
+            eventType: WagerTransactionRejected
+            aggregateId: 01a18261-a600-7589-8768-3d958460eced
+            correlationId: acme-req-7d10
+            causationId: 01a18268-0ea0-758d-9828-d2f91413b8b3
+            occurredAt: '2026-10-28T12:07:00.009Z'
+            version: 1
+            data:
+              transactionId: 01a18268-0ea0-758d-9828-d2f91413b8b3
+              providerId: provider-acme
+              externalTransactionId: acme-tx-000125
+              walletId: 01a18261-a600-7589-8768-3d958460eced
+              playerId: 01a17cb1-f5c0-7588-9a61-47a9444c049e
+              roundId: round-7f3a
+              gameId: lucky-sevens
+              kind: BET
+              money: { amount: '600.00', currency: BRL }
+              failureCode: INSUFFICIENT_BALANCE
+              observedBalance: { amount: '525.00', currency: BRL }
+              rejectedAt: '2026-10-28T12:07:00.009Z'
+    WalletBalanceChanged:
+      name: WalletBalanceChanged
+      title: Wallet balance changed
+      summary: One ledger entry was written; emitted exactly once per entry and never otherwise.
+      description: >-
+        Emitted exactly once per ledger entry (`event.balance-changed-when`): `LOSS`, rejections
+        and replays emit none. `data` mirrors the entry (`ledger.read-shape`); `walletVersion` is
+        the ordering key of one wallet's balance events.
+      contentType: application/json
+      correlationId:
+        location: '$message.payload#/correlationId'
+      payload:
+        $ref: '#/components/schemas/WalletBalanceChangedPayload'
+      examples:
+        - name: betDebit
+          summary: The debit written by a 40.00 bet
+          payload:
+            eventId: 01a18266-39ec-7594-bba3-3e7a07301c1f
+            eventType: WalletBalanceChanged
+            aggregateId: 01a18261-a600-7589-8768-3d958460eced
+            correlationId: 01a18266-39e0-7597-812c-a89950b9acf2
+            causationId: 01a18266-39e0-758b-a289-fb48c2dd9c8b
+            occurredAt: '2026-10-28T12:05:00.012Z'
+            version: 1
+            data:
+              walletId: 01a18261-a600-7589-8768-3d958460eced
+              transactionId: 01a18266-39e0-758b-a289-fb48c2dd9c8b
+              direction: DEBIT
+              money: { amount: '40.00', currency: BRL }
+              balanceBefore: { amount: '500.00', currency: BRL }
+              balanceAfter: { amount: '460.00', currency: BRL }
+              walletVersion: 2
+    WagerTransactionPendingReference:
+      name: WagerTransactionPendingReference
+      title: Wager transaction pending reference
+      summary: A transaction was parked because its reference is not processed yet.
+      description: >-
+        Emitted once, when a transaction first becomes `PENDING_REFERENCE`
+        (`event.pending-reference-when`); retry attempts emit nothing. The transaction is applied
+        under the normal rules once the reference is `PROCESSED` (`ref.resolution-on-arrival`), or
+        rejected with `REFERENCE_NOT_FOUND` at `expiresAt` (`ref.expiry`); either outcome emits its
+        own event.
+      contentType: application/json
+      correlationId:
+        location: '$message.payload#/correlationId'
+      payload:
+        $ref: '#/components/schemas/WagerTransactionPendingReferencePayload'
+      examples:
+        - name: rollbackBeforeReference
+          summary: A rollback waiting for a bet that has not arrived; correlation id taken from the message id
+          payload:
+            eventId: 01a18268-f907-7596-b941-b59e7f031080
+            eventType: WagerTransactionPendingReference
+            aggregateId: 01a18261-a600-7589-8768-3d958460eced
+            correlationId: acme-msg-000126
+            causationId: 01a18268-f900-758e-8c3e-13ce27511119
+            occurredAt: '2026-10-28T12:08:00.007Z'
+            version: 1
+            data:
+              transactionId: 01a18268-f900-758e-8c3e-13ce27511119
+              providerId: provider-acme
+              externalTransactionId: acme-tx-000126
+              walletId: 01a18261-a600-7589-8768-3d958460eced
+              playerId: 01a17cb1-f5c0-7588-9a61-47a9444c049e
+              roundId: round-7f3a
+              gameId: lucky-sevens
+              kind: ROLLBACK
+              money: { amount: '25.00', currency: BRL }
+              referenceExternalTransactionId: acme-tx-000999
+              expiresAt: '2026-10-28T13:08:00.000Z'
+  schemas:
+    MoneyProps:
+      type: object
+      description: >-
+        An exact amount in a currency (`model.money-props-in-contracts`). `amount` has exactly two
+        decimals, no sign, no leading zeros and at most 18 integer digits (`money.decimal-string`,
+        `money.bound`); any other spelling, including a JSON number, is rejected and nothing is ever
+        rounded (`money.no-rounding`).
+      required: [amount, currency]
+      additionalProperties: false
+      properties:
+        amount:
+          type: string
+          pattern: '^(0|[1-9][0-9]{0,17})\.[0-9]{2}$'
+          examples: ['40.00', '0.00', '999999999999999999.99']
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          description: ISO 4217 alphabetic code (`money.currency-iso`). Providers settle in BRL.
+          examples: [BRL]
+    PositiveMoneyProps:
+      description: >-
+        `MoneyProps` strictly greater than `0.00`: the amount of every operation that moves money
+        and of every ledger entry (`money.positive-in-operations`, `ledger.positive-amount`). A
+        `LOSS` moves none, so its amount may be `0.00`.
+      allOf:
+        - $ref: '#/components/schemas/MoneyProps'
+        - type: object
+          properties:
+            amount:
+              type: string
+              pattern: '^(0\.(0[1-9]|[1-9][0-9])|[1-9][0-9]{0,17}\.[0-9]{2})$'
+    Uuid:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      description: >-
+        RFC 9562 UUID in canonical lowercase form. Ids minted by the service are UUIDv7; they
+        identify and never order anything.
+      examples: [01a18261-a600-7589-8768-3d958460eced]
+    ExternalId:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$'
+      description: >-
+        An identifier minted outside the service: `providerId`, `externalTransactionId`, `roundId`
+        or `gameId`. 1 to 120 characters from `A-Z a-z 0-9 . _ : -`, starting with a letter or
+        digit.
+      examples: [provider-acme, acme-tx-000123, round-7f3a, lucky-sevens]
+    SubmittedProviderId:
+      description: >-
+        A provider identifier on a submission. `system` is reserved for the internal `OPENING`
+        transaction; a message carrying it is a permanent error (`tx.opening-internal`).
+      allOf:
+        - $ref: '#/components/schemas/ExternalId'
+        - not:
+            const: system
+    IdempotencyKey:
+      type: string
+      pattern: '^[!-~]{1,255}$'
+      description: >-
+        1 to 255 printable ASCII characters without spaces (`idem.key-format`), unique per
+        `providerId` (`idem.provider-scoped`). Recommended value
+        `{providerId}:{externalTransactionId}` (`idem.recommended-default`).
+      examples: [provider-acme:acme-tx-000123]
+    MessageId:
+      type: string
+      pattern: '^[!-~]{1,128}$'
+      description: >-
+        Producer-assigned message identity, 1 to 128 printable ASCII characters without spaces
+        (`msg.message-contract`); also the recommended `MessageDeduplicationId`.
+      examples: [acme-msg-000123]
+    CorrelationId:
+      type: string
+      pattern: '^[!-~]{1,128}$'
+      description: >-
+        1 to 128 printable ASCII characters without spaces. Generated ids are UUIDs; callers may
+        send any value in that form.
+      examples: [01a18266-39e0-7597-812c-a89950b9acf2, acme-req-5f2c]
+    WagerOperationKind:
+      type: string
+      enum: [BET, WIN, LOSS, REFUND, ROLLBACK]
+      description: >-
+        The kinds a provider may submit (`tx.kinds`). `OPENING` is internal and cannot be submitted.
+    TransactionKind:
+      type: string
+      enum: [OPENING, BET, WIN, LOSS, REFUND, ROLLBACK]
+      description: >-
+        Every transaction kind, including the internal `OPENING` credit created when a wallet is
+        opened with a positive initial balance.
+    LedgerDirection:
+      type: string
+      enum: [DEBIT, CREDIT]
+      description: '`DEBIT` removes money from the wallet; `CREDIT` adds money (`ledger.direction-by-kind`).'
+    FailureCode:
+      type: string
+      enum:
+        - INSUFFICIENT_BALANCE
+        - REVERSAL_INSUFFICIENT_BALANCE
+        - BALANCE_LIMIT_EXCEEDED
+        - CURRENCY_MISMATCH
+        - WALLET_PLAYER_MISMATCH
+        - REFERENCE_NOT_FOUND
+        - REFERENCE_NOT_PROCESSED
+        - REFERENCE_MISMATCH
+        - REFERENCE_KIND_NOT_ALLOWED
+        - REFERENCE_AMOUNT_MISMATCH
+        - REFERENCE_ALREADY_REVERSED
+        - PROCESSING_FAILED
+      description: >-
+        The reason a transaction is `REJECTED` or `FAILED` (`failure.stable-codes`). Codes are never
+        renamed or reused; the system contract (section 9.1) states the action expected from the
+        caller for each. `PROCESSING_FAILED` belongs only to `FAILED` transactions, which emit no
+        event; every code in a `WagerTransactionRejected` event is one of the others.
+    WagerTransactionRequestedPayload:
+      type: object
+      description: >-
+        The body of a `WagerTransactionRequested` message (`msg.message-contract`). `type` must be
+        `WagerTransactionRequested`; `version` is optional and absent means 1, any other value is
+        unsupported; both violations are permanent errors. `occurredAt` is when the producer
+        created the message and never enters the payload hash.
+      required: [messageId, type, occurredAt, data]
+      additionalProperties: false
+      properties:
+        messageId:
+          $ref: '#/components/schemas/MessageId'
+        type:
+          type: string
+          const: WagerTransactionRequested
+        version:
+          type: integer
+          const: 1
+        occurredAt:
+          type: string
+          format: date-time
+        correlationId:
+          $ref: '#/components/schemas/CorrelationId'
+        data:
+          $ref: '#/components/schemas/WagerTransactionRequestedData'
+    WagerOperationFields:
+      type: object
+      description: >-
+        The business fields of a provider operation plus `idempotencyKey`. Without
+        `idempotencyKey` this object is exactly the HTTP request body and the input of the payload
+        hash. `playerId` must own `walletId` and `money.currency` must be the wallet currency,
+        otherwise the transaction is `REJECTED`; an unknown `walletId` is a permanent error
+        (`msg.unknown-wallet-permanent`). `referenceExternalTransactionId` is resolved by
+        `(providerId, referenceExternalTransactionId)`, is forbidden on `BET`, optional on `WIN` and
+        `LOSS`, required on `REFUND` and `ROLLBACK` (`tx.reference-matrix`) and must differ from
+        `externalTransactionId` (`tx.self-reference-invalid`).
+      required:
+        - providerId
+        - externalTransactionId
+        - idempotencyKey
+        - playerId
+        - walletId
+        - roundId
+        - gameId
+        - kind
+        - money
+      additionalProperties: false
+      discriminator: kind
+      properties:
+        providerId:
+          $ref: '#/components/schemas/SubmittedProviderId'
+        externalTransactionId:
+          $ref: '#/components/schemas/ExternalId'
+        idempotencyKey:
+          $ref: '#/components/schemas/IdempotencyKey'
+        playerId:
+          $ref: '#/components/schemas/Uuid'
+        walletId:
+          $ref: '#/components/schemas/Uuid'
+        roundId:
+          $ref: '#/components/schemas/ExternalId'
+        gameId:
+          $ref: '#/components/schemas/ExternalId'
+        kind:
+          $ref: '#/components/schemas/WagerOperationKind'
+        money:
+          description: >-
+            Strictly positive for every kind that moves money; only a `LOSS` may carry `0.00`
+            (`money.positive-in-operations`).
+          $ref: '#/components/schemas/MoneyProps'
+        referenceExternalTransactionId:
+          $ref: '#/components/schemas/ExternalId'
+    BetRequested:
+      title: BET
+      description: Debits the stake (`rule.bet.debit`). Never carries a reference.
+      allOf:
+        - $ref: '#/components/schemas/WagerOperationFields'
+        - type: object
+          properties:
+            kind:
+              const: BET
+            money:
+              $ref: '#/components/schemas/PositiveMoneyProps'
+            referenceExternalTransactionId:
+              not: {} # must be absent
+    WinRequested:
+      title: WIN
+      description: >-
+        Credits the payout (`rule.win.credit`). May reference the round's `BET`; the amount is
+        independent of the bet (`rule.win.optional-reference`).
+      allOf:
+        - $ref: '#/components/schemas/WagerOperationFields'
+        - type: object
+          properties:
+            kind:
+              const: WIN
+            money:
+              $ref: '#/components/schemas/PositiveMoneyProps'
+    LossRequested:
+      title: LOSS
+      description: >-
+        Records the outcome without moving money, writing a ledger entry or changing the version
+        (`rule.loss.no-effect`). Its amount may be `0.00`, the one kind for which that is accepted
+        (`money.positive-in-operations`). May reference the round's `BET`
+        (`rule.loss.optional-reference`).
+      allOf:
+        - $ref: '#/components/schemas/WagerOperationFields'
+        - type: object
+          properties:
+            kind:
+              const: LOSS
+    RefundRequested:
+      title: REFUND
+      description: >-
+        Credits the referenced `BET` back, once (`rule.refund.credit`). The reference is required
+        and may target only a `BET` (`rule.refund.bet-only`).
+      allOf:
+        - $ref: '#/components/schemas/WagerOperationFields'
+        - type: object
+          required: [referenceExternalTransactionId]
+          properties:
+            kind:
+              const: REFUND
+            money:
+              $ref: '#/components/schemas/PositiveMoneyProps'
+    RollbackRequested:
+      title: ROLLBACK
+      description: >-
+        Applies the inverse of the referenced transaction, once (`rule.rollback.inverse`). The
+        reference is required and may target a `BET`, a `WIN` or a `REFUND`
+        (`rule.rollback.allowed-kinds`).
+      allOf:
+        - $ref: '#/components/schemas/WagerOperationFields'
+        - type: object
+          required: [referenceExternalTransactionId]
+          properties:
+            kind:
+              const: ROLLBACK
+            money:
+              $ref: '#/components/schemas/PositiveMoneyProps'
+    WagerTransactionRequestedData:
+      description: >-
+        One provider operation, discriminated by `kind`. The variants encode the reference matrix
+        (`tx.reference-matrix`); every other rule is validated by the use case and recorded as a
+        persisted outcome.
+      oneOf:
+        - $ref: '#/components/schemas/BetRequested'
+        - $ref: '#/components/schemas/WinRequested'
+        - $ref: '#/components/schemas/LossRequested'
+        - $ref: '#/components/schemas/RefundRequested'
+        - $ref: '#/components/schemas/RollbackRequested'
+    IntegrationEventEnvelope:
+      type: object
+      description: >-
+        The serialized envelope of every integration event (`event.envelope`). `eventId` is fixed
+        when the row is enqueued and identical on every publication (`outbox.stable-event-id`);
+        `aggregateId` is the wallet id; `causationId` is the id of the transaction whose processing
+        produced the event; `correlationId` comes from the originating request or message;
+        `occurredAt` is when the event was recorded (RFC 3339); `version` selects the schema of
+        `data` together with `eventType`.
+      required: [eventId, eventType, aggregateId, correlationId, occurredAt, version, data]
+      properties:
+        eventId:
+          $ref: '#/components/schemas/Uuid'
+        eventType:
+          type: string
+          enum:
+            - WagerTransactionProcessed
+            - WagerTransactionRejected
+            - WalletBalanceChanged
+            - WagerTransactionPendingReference
+        aggregateId:
+          $ref: '#/components/schemas/Uuid'
+        correlationId:
+          $ref: '#/components/schemas/CorrelationId'
+        causationId:
+          $ref: '#/components/schemas/Uuid'
+        occurredAt:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          minimum: 1
+        data:
+          type: object
+    TransactionIdentity:
+      type: object
+      description: >-
+        The identity of a transaction as carried by transaction events. For the internal opening
+        credit, `providerId` is `system`, `kind` is `OPENING`, and `externalTransactionId` and
+        `roundId` are the wallet id.
+      required:
+        - transactionId
+        - providerId
+        - externalTransactionId
+        - walletId
+        - playerId
+        - roundId
+        - gameId
+        - kind
+        - money
+      properties:
+        transactionId:
+          $ref: '#/components/schemas/Uuid'
+        providerId:
+          $ref: '#/components/schemas/ExternalId'
+        externalTransactionId:
+          $ref: '#/components/schemas/ExternalId'
+        walletId:
+          $ref: '#/components/schemas/Uuid'
+        playerId:
+          $ref: '#/components/schemas/Uuid'
+        roundId:
+          $ref: '#/components/schemas/ExternalId'
+        gameId:
+          $ref: '#/components/schemas/ExternalId'
+        kind:
+          $ref: '#/components/schemas/TransactionKind'
+        money:
+          description: Strictly positive except on a `LOSS`, which may be `0.00`.
+          $ref: '#/components/schemas/MoneyProps'
+    WagerTransactionProcessedData:
+      description: >-
+        `balanceAfter` and `walletVersion` are the wallet balance and version once the transaction
+        is applied, unchanged for a `LOSS`; `processedAt` is when it was applied.
+        `referenceTransactionId` and `referenceExternalTransactionId` are present when a reference
+        was resolved (`event.processed-when`).
+      allOf:
+        - $ref: '#/components/schemas/TransactionIdentity'
+        - type: object
+          required: [balanceAfter, walletVersion, processedAt]
+          properties:
+            balanceAfter:
+              $ref: '#/components/schemas/MoneyProps'
+            walletVersion:
+              type: integer
+              minimum: 1
+            processedAt:
+              type: string
+              format: date-time
+            referenceTransactionId:
+              $ref: '#/components/schemas/Uuid'
+            referenceExternalTransactionId:
+              $ref: '#/components/schemas/ExternalId'
+    WagerTransactionProcessedPayload:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEventEnvelope'
+        - type: object
+          required: [causationId]
+          properties:
+            eventType:
+              const: WagerTransactionProcessed
+            version:
+              const: 1
+            data:
+              $ref: '#/components/schemas/WagerTransactionProcessedData'
+    WagerTransactionRejectedData:
+      description: >-
+        `failureCode` is the reason of the rejection; `observedBalance` the wallet balance observed
+        when it was recorded (`tx.observed-balance`); `rejectedAt` when it was recorded.
+        `referenceExternalTransactionId` is present when the operation carried one
+        (`event.rejected-when`).
+      allOf:
+        - $ref: '#/components/schemas/TransactionIdentity'
+        - type: object
+          required: [failureCode, observedBalance, rejectedAt]
+          properties:
+            failureCode:
+              allOf:
+                - $ref: '#/components/schemas/FailureCode'
+                - not:
+                    const: PROCESSING_FAILED
+            observedBalance:
+              $ref: '#/components/schemas/MoneyProps'
+            rejectedAt:
+              type: string
+              format: date-time
+            referenceExternalTransactionId:
+              $ref: '#/components/schemas/ExternalId'
+    WagerTransactionRejectedPayload:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEventEnvelope'
+        - type: object
+          required: [causationId]
+          properties:
+            eventType:
+              const: WagerTransactionRejected
+            version:
+              const: 1
+            data:
+              $ref: '#/components/schemas/WagerTransactionRejectedData'
+    WalletBalanceChangedData:
+      type: object
+      description: >-
+        The ledger entry that changed the balance: `balanceBefore` plus `money` equals
+        `balanceAfter` for a `CREDIT`, minus for a `DEBIT` (`ledger.balanced-arithmetic`);
+        `walletVersion` is the version the entry produced and the ordering key of one wallet's
+        balance events (`event.balance-changed-when`).
+      required:
+        [walletId, transactionId, direction, money, balanceBefore, balanceAfter, walletVersion]
+      properties:
+        walletId:
+          $ref: '#/components/schemas/Uuid'
+        transactionId:
+          $ref: '#/components/schemas/Uuid'
+        direction:
+          $ref: '#/components/schemas/LedgerDirection'
+        money:
+          $ref: '#/components/schemas/PositiveMoneyProps'
+        balanceBefore:
+          $ref: '#/components/schemas/MoneyProps'
+        balanceAfter:
+          $ref: '#/components/schemas/MoneyProps'
+        walletVersion:
+          type: integer
+          minimum: 1
+    WalletBalanceChangedPayload:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEventEnvelope'
+        - type: object
+          required: [causationId]
+          properties:
+            eventType:
+              const: WalletBalanceChanged
+            version:
+              const: 1
+            data:
+              $ref: '#/components/schemas/WalletBalanceChangedData'
+    WagerTransactionPendingReferenceData:
+      description: >-
+        `referenceExternalTransactionId` is the reference being awaited; `expiresAt` is when the
+        waiting window closes, 60 minutes after first receipt (`ref.ttl`), after which the
+        transaction is rejected with `REFERENCE_NOT_FOUND` (`event.pending-reference-when`).
+      allOf:
+        - $ref: '#/components/schemas/TransactionIdentity'
+        - type: object
+          required: [referenceExternalTransactionId, expiresAt]
+          properties:
+            referenceExternalTransactionId:
+              $ref: '#/components/schemas/ExternalId'
+            expiresAt:
+              type: string
+              format: date-time
+    WagerTransactionPendingReferencePayload:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEventEnvelope'
+        - type: object
+          required: [causationId]
+          properties:
+            eventType:
+              const: WagerTransactionPendingReference
+            version:
+              const: 1
+            data:
+              $ref: '#/components/schemas/WagerTransactionPendingReferenceData'

@@ -1,0 +1,33 @@
+{
+  "name": "distributed-wagering-processor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Wallet and wagering transaction service for multi-provider game integrations",
+  "engines": {
+    "bun": ">=1.4.4 <2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10",
+    "@types/bun": "^1.4.4",
+    "eslint": "^10",
+    "eslint-config-prettier": "^10",
+    "prettier": "^3",
+    "typescript": "^5",
+    "typescript-eslint": "^8"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3",
+    "@mikro-orm/core": "^7",
+    "@mikro-orm/migrations": "^7",
+    "@mikro-orm/nestjs": "^7",
+    "@mikro-orm/postgresql": "^7",
+    "@nestjs/common": "^12",
+    "@nestjs/core": "^12",
+    "@nestjs/platform-express": "^12",
+    "@nestjs/terminus": "^12",
+    "reflect-metadata": "^0.2",
+    "rxjs": "^7",
+    "zod": "^4"
+  }
+}

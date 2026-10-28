@@ -1,0 +1,43 @@
+name: Work item
+description: Propose a feature, improvement, or development task.
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What problem needs solving, and why?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Describe the intended change and relevant boundaries.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List observable conditions that establish completion.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: How should the change be tested or checked?
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: Dependencies and references
+      description: Link blocking issues, related work, requirements, or ADRs.

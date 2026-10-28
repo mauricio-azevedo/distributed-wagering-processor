@@ -86,7 +86,7 @@ entries:
       - The operands are unchanged and the result is a new object; the assignment is a type error.
     evidence: { testId: money-and-ledger-entry-are-immutable, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: MODEL-005
@@ -132,8 +132,8 @@ entries:
       - All parse; toString returns the input unchanged.
     evidence: { testId: money-accepts-two-decimal-strings, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-002
     priority: required
@@ -147,8 +147,8 @@ entries:
       - Every input throws a validation error naming the offending value.
     evidence: { testId: money-rejects-malformed-input, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-003
     priority: required
@@ -162,8 +162,8 @@ entries:
       - '"1.005" is rejected; the sum is exactly "0.30".'
     evidence: { testId: money-never-rounds, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-004
     priority: required
@@ -177,8 +177,8 @@ entries:
       - Only "BRL" is accepted.
     evidence: { testId: money-currency-code-format, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-005
     priority: required
@@ -192,8 +192,8 @@ entries:
       - Both calls throw CurrencyMismatchError.
     evidence: { testId: money-rejects-currency-mismatch, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-006
     priority: required
@@ -239,8 +239,8 @@ entries:
       - '"-2.50" and "0.00" respectively, never "-0.00".'
     evidence: { testId: signed-difference-formatting, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-009
     priority: required
@@ -254,8 +254,8 @@ entries:
       - The value survives exactly; a number would have lost precision.
     evidence: { testId: money-uses-bigint-not-number, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-010
     priority: required
@@ -299,8 +299,8 @@ entries:
       - The bound parses and prints unchanged; the 19-digit value is rejected; the addition throws MoneyOverflowError; the subtraction yields "-999999999999999999.99" and negating it yields the bound.
     evidence: { testId: money-is-bounded-by-storage, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-013
     priority: required

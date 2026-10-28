@@ -8,9 +8,10 @@ A wallet and wagering transaction service for game providers. Providers open wal
 | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | System contract, decisions, acceptance plan | Complete; `make check` passing                                                                                                                      |
 | Infrastructure foundation                   | Runs: the NestJS service on Bun, PostgreSQL with both roles, LocalStack with the three queues, the migration step, liveness and readiness endpoints |
+| Domain model                                | `Money` implemented: exact `bigint` minor units, no rounding path, one bound; the aggregates follow                                                 |
 | Financial behaviour                         | Planned; see the [implementation plan](docs/implementation-plan.md)                                                                                 |
 
-The service starts, reports its readiness and applies migrations against the Compose dependencies; no wallet or wagering behaviour exists yet. The contract, the decisions and the acceptance plan fix what the service guarantees, how it is built and how each guarantee is proven, so that implementation proceeds slice by slice with the acceptance plan as its scoreboard.
+The service starts, reports its readiness and applies migrations against the Compose dependencies. The domain layer holds the `Money` value object and its errors; no wallet, transaction, ledger or messaging behaviour exists yet. The contract, the decisions and the acceptance plan fix what the service guarantees, how it is built and how each guarantee is proven, so that implementation proceeds slice by slice with the acceptance plan as its scoreboard.
 
 ## Stack
 
@@ -67,6 +68,7 @@ docs/acceptance.yaml         acceptance plan and verification status
 docs/implementation-plan.md  delivery slices
 src/main.ts                  bootstrap: validated environment, NestJS application, shutdown hooks
 src/app.module.ts            composition root
+src/domain/                  framework-free domain model: Money, domain errors
 src/infrastructure/          configuration, persistence (MikroORM, migrations), messaging (SQS), health
 test/                        unit and integration suites, run by bun test
 compose.yaml, Dockerfile     the stack and the image

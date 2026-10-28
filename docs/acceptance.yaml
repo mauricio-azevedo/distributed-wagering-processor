@@ -55,8 +55,8 @@ entries:
       - Both instances expose the stored state unchanged and throw nothing.
     evidence: { testId: rehydrate-trusts-stored-state, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MODEL-003
     priority: required
@@ -71,8 +71,8 @@ entries:
       - The second call throws InvalidTransactionStateError and the status stays PROCESSED.
     evidence: { testId: terminal-transaction-refuses-transitions, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MODEL-004
     priority: required
@@ -545,8 +545,8 @@ entries:
       - The first three throw; the WIN and LOSS variants are created in PENDING.
     evidence: { testId: reference-requirement-by-kind, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: TX-004
     priority: required
@@ -575,8 +575,8 @@ entries:
       - PENDING reaches PROCESSED, REJECTED, PENDING_REFERENCE, FAILED; PENDING_REFERENCE reaches PROCESSED, REJECTED, FAILED, PENDING_REFERENCE; everything else throws.
     evidence: { testId: status-transition-table, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: TX-006
     priority: required
@@ -592,8 +592,8 @@ entries:
       - The schema half of this rule is SCHEMA-024; nothing here depends on a database.
     evidence: { testId: terminal-status-is-final, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: TX-007
     priority: required
@@ -607,7 +607,7 @@ entries:
       - observedBalance is 460.00, 460.00 and 460.00 respectively, and the processed one equals its entry's balanceAfter.
     evidence: { testId: observed-balance-is-recorded, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: TX-008
@@ -622,8 +622,8 @@ entries:
       - False for LOSS, true for the others.
     evidence: { testId: affects-balance-by-kind, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: TX-009
     priority: required

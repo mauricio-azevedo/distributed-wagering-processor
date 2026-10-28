@@ -28,3 +28,15 @@ export class CurrencyMismatchError extends DomainError {
     super(`money operations require one currency, got ${left} and ${right}`);
   }
 }
+
+/**
+ * A ledger entry that does not hold as a record of one balance change: an amount that is not
+ * strictly positive (`ledger.positive-amount`), arithmetic that does not balance
+ * (`ledger.balanced-arithmetic`) or a wallet version outside the sequence
+ * (`ledger.wallet-version-sequence`).
+ *
+ * It is a programming error, not a business outcome: the aggregate decides every refusal a
+ * provider can cause before it builds an entry, so an unbalanced entry means the code that
+ * computed the new balance and the code that records it disagree.
+ */
+export class InvalidLedgerEntryError extends DomainError {}

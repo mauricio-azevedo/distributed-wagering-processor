@@ -39,7 +39,7 @@ entries:
       - The factory returns an instance in its initial state.
     evidence: { testId: domain-factories-are-the-only-entry, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: MODEL-002
@@ -55,7 +55,7 @@ entries:
       - Both instances expose the stored state unchanged and throw nothing.
     evidence: { testId: rehydrate-trusts-stored-state, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: MODEL-003
@@ -86,8 +86,8 @@ entries:
       - The operands are unchanged and the result is a new object; the assignment is a type error.
     evidence: { testId: money-and-ledger-entry-are-immutable, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MODEL-005
     priority: required
@@ -360,7 +360,7 @@ entries:
       - Both report version 1; the first has one ledger entry with walletVersion 1.
     evidence: { testId: wallet-opens-at-version-one, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: WALLET-004
@@ -398,7 +398,7 @@ entries:
     requirement: An operation in another currency than the wallet is rejected and persisted.
     contract: wallet.currency-match
     enforcement:
-      - Wallet.assertSameCurrency before any arithmetic; outcome REJECTED CURRENCY_MISMATCH.
+      - Wallet.debit and Wallet.credit refuse a foreign currency before any arithmetic; outcome REJECTED CURRENCY_MISMATCH.
     scenario:
       - Submit a USD BET against a BRL wallet.
     expected:
@@ -483,8 +483,8 @@ entries:
       - The last two succeed; the test touches no port, no repository and no container.
     evidence: { testId: wallet-aggregate-invariants, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-012
     priority: required
@@ -499,8 +499,8 @@ entries:
       - The two entries are DEBIT 40.00 (100.00 to 60.00, walletVersion 4) and CREDIT 10.00 (60.00 to 70.00, walletVersion 5); the refused debit yields no entry.
     evidence: { testId: balance-and-version-move-with-one-entry, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- TX
   - id: TX-001
@@ -698,23 +698,23 @@ entries:
       - The first is created and balanced; the second throws.
     evidence: { testId: ledger-entry-arithmetic-validated, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: LEDGER-004
     priority: required
     requirement: The entry direction follows the kind, and ROLLBACK inverts its reference.
     contract: ledger.direction-by-kind
     enforcement:
-      - WagerTransaction.ledgerDirectionFor(reference).
+      - ledgerDirectionFor(operation) in the domain ledger module, derived from the kind and, for a ROLLBACK, from the kind it reverses.
     scenario:
       - Compute the direction for BET, WIN, REFUND, OPENING, and for ROLLBACK of a BET, a WIN and a REFUND.
     expected:
       - DEBIT, CREDIT, CREDIT, CREDIT, then CREDIT, DEBIT, DEBIT.
     evidence: { testId: ledger-direction-by-kind, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: LEDGER-005
     priority: required
@@ -932,7 +932,7 @@ entries:
     requirement: A ROLLBACK applies the inverse of the referenced transaction.
     contract: rule.rollback.inverse
     enforcement:
-      - ledgerDirectionFor(reference) and equal amount.
+      - ledgerDirectionFor(operation) over the referenced kind, and equal amount.
     scenario:
       - ROLLBACK of a BET 40.00; ROLLBACK of a WIN 65.00; ROLLBACK of a REFUND 40.00.
     expected:

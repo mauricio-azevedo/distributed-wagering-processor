@@ -4,14 +4,14 @@ A wallet and wagering transaction service for game providers. Providers open wal
 
 ## Status
 
-| Area                                        | State                                                                                                                                               |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| System contract, decisions, acceptance plan | Complete; `make check` passing                                                                                                                      |
-| Infrastructure foundation                   | Runs: the NestJS service on Bun, PostgreSQL with both roles, LocalStack with the three queues, the migration step, liveness and readiness endpoints |
-| Domain model                                | `Money`, the `Wallet` aggregate with its immutable ledger entries, and the `WagerTransaction` state machine; messaging and the ORM mapping follow   |
-| Financial behaviour                         | Planned; see the [implementation plan](docs/implementation-plan.md)                                                                                 |
+| Area                                        | State                                                                                                                                                                                           |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| System contract, decisions, acceptance plan | Complete; `make check` passing                                                                                                                                                                  |
+| Infrastructure foundation                   | Runs: the NestJS service on Bun, PostgreSQL with both roles, LocalStack with the three queues, the migration step, liveness and readiness endpoints                                             |
+| Domain model                                | `Money`, the `Wallet` aggregate with its immutable ledger entries, the `WagerTransaction` state machine, the inbox and outbox records and the typed integration events; the ORM mapping follows |
+| Financial behaviour                         | Planned; see the [implementation plan](docs/implementation-plan.md)                                                                                                                             |
 
-The service starts, reports its readiness and applies migrations against the Compose dependencies. The domain layer holds the `Money` value object and the `Wallet` aggregate: a wallet opens at version 1, refuses an uncovered debit, a foreign currency, a foreign owner and a credit past the money bound with the failure code each one carries, and answers every applied operation with the new balance, the next version and the one immutable ledger entry that mirrors them. Beside it, a `WagerTransaction` is born pending with the reference requirement of its kind validated, records every outcome with the balance observed at that moment, and once processed, rejected or failed refuses every further transition and keeps what it recorded. No persistence, HTTP or messaging behaviour exists yet, so nothing writes a wallet or a transaction to PostgreSQL. The contract, the decisions and the acceptance plan fix what the service guarantees, how it is built and how each guarantee is proven, so that implementation proceeds slice by slice with the acceptance plan as its scoreboard.
+The service starts, reports its readiness and applies migrations against the Compose dependencies. The domain layer holds the `Money` value object and the `Wallet` aggregate: a wallet opens at version 1, refuses an uncovered debit, a foreign currency, a foreign owner and a credit past the money bound with the failure code each one carries, and answers every applied operation with the new balance, the next version and the one immutable ledger entry that mirrors them. Beside it, a `WagerTransaction` is born pending with the reference requirement of its kind validated, records every outcome with the balance observed at that moment, and once processed, rejected or failed refuses every further transition and keeps what it recorded. Beside them are the inbox row that makes a redelivery a no-op, the outbox row that carries a committed event with its fixed event id and capped retry backoff, and the four integration events, each fixing its type and version in its class and serializing every amount as a string. No persistence, HTTP or messaging behaviour exists yet, so nothing writes a wallet or a transaction to PostgreSQL and nothing publishes an event. The contract, the decisions and the acceptance plan fix what the service guarantees, how it is built and how each guarantee is proven, so that implementation proceeds slice by slice with the acceptance plan as its scoreboard.
 
 ## Stack
 
@@ -68,7 +68,7 @@ docs/acceptance.yaml         acceptance plan and verification status
 docs/implementation-plan.md  delivery slices
 src/main.ts                  bootstrap: validated environment, NestJS application, shutdown hooks
 src/app.module.ts            composition root
-src/domain/                  framework-free domain model: Money, Wallet, WagerTransaction, WalletLedgerEntry, kinds, failure codes, domain errors
+src/domain/                  framework-free domain model: Money, Wallet, WagerTransaction, WalletLedgerEntry, inbox and outbox records, integration events, kinds, failure codes, domain errors
 src/infrastructure/          configuration, persistence (MikroORM, migrations), messaging (SQS), health
 test/                        unit and integration suites, run by bun test
 compose.yaml, Dockerfile     the stack and the image

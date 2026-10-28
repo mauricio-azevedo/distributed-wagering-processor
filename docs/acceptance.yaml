@@ -30,7 +30,7 @@ entries:
     contract: model.private-constructors
     enforcement:
       - Private or protected constructors on Money, Wallet, WagerTransaction, WalletLedgerEntry, InboxMessage, OutboxMessage.
-      - Factories from, zero, open, create, receive, enqueue validate their inputs.
+      - Factories from, zero, open, create validate their inputs; receive takes the validated message body and enqueue takes the event itself.
     scenario:
       - Compile a call to each constructor from outside the class.
       - Create each object through its factory with valid input.
@@ -39,8 +39,8 @@ entries:
       - The factory returns an instance in its initial state.
     evidence: { testId: domain-factories-are-the-only-entry, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MODEL-002
     priority: required
@@ -65,6 +65,7 @@ entries:
     enforcement:
       - markProcessed, markPendingReference, reject and fail are the only mutators of status.
       - Each transition checks isTerminal() first and throws InvalidTransactionStateError.
+      - markProcessed on an inbox row and markPublished and scheduleRetry on an outbox row are the only mutators of a message record; a completed record throws InvalidMessageStateError.
     scenario:
       - Move a PENDING transaction to PROCESSED, then call reject on it.
     expected:
@@ -2088,14 +2089,14 @@ entries:
     requirement: The inbox identity is the body message id, not the broker receipt id.
     contract: msg.inbox-identity
     enforcement:
-      - InboxMessage.receive(consumerName, body.messageId, payloadHash).
+      - InboxMessage.receive takes consumerName, the body messageId and payloadHash; the broker receipt id is logged, never stored.
     scenario:
       - Send a message; send a producer resend with the same body id (new receipt id).
     expected:
       - The resend is acknowledged as a duplicate; one transaction exists.
     evidence: { testId: inbox-keyed-by-body-message-id, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: MSG-005
@@ -2269,14 +2270,14 @@ entries:
     requirement: The event id is fixed when enqueued and reused on every publication.
     contract: outbox.stable-event-id
     enforcement:
-      - eventId generated in IntegrationEvent construction and used as the primary key.
+      - eventId fixed when the event is recorded, carried into the stored envelope by OutboxMessage.enqueue and used as the primary key.
     scenario:
       - Publish a row, force a republish.
     expected:
       - Both messages carry the same eventId.
     evidence: { testId: stable-event-id, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: OUTBOX-005
@@ -2314,14 +2315,14 @@ entries:
     requirement: A failed publication is retried with capped backoff and never dropped.
     contract: outbox.retry-backoff
     enforcement:
-      - attempts and next_attempt_at per row; alert metric after ten attempts.
+      - OutboxMessage.scheduleRetry increments attempts and sets next_attempt_at to the capped backoff; no transition discards a row; alert metric after ten attempts.
     scenario:
       - Stop LocalStack for ten minutes with rows pending; restart.
     expected:
       - Attempts grow with capped intervals; after restart every row is published.
     evidence: { testId: publisher-backoff-never-drops, layer: integration }
     deliverySlice: outbox-publisher
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: OUTBOX-008
@@ -2373,8 +2374,8 @@ entries:
       - eventType and version come from the class; aggregateId is the wallet id; causationId is the transaction id; every amount is a string.
     evidence: { testId: event-envelope-typing, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-011
     priority: required

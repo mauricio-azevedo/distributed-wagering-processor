@@ -63,3 +63,14 @@ export class InvalidTransactionStateError extends DomainError {}
  * own line, and the only one that covers the resolved service id the schema cannot check.
  */
 export class InvalidWagerTransactionError extends DomainError {}
+
+/**
+ * A transition called on a message record that already completed: an inbox row processed twice, a
+ * published outbox row published or rescheduled again (`model.explicit-transitions`).
+ *
+ * It is a programming error, not a business outcome. A redelivery is absorbed by asking the inbox
+ * row whether it is processed (`msg.redelivery-safe`), and a published outbox row is never claimed
+ * again (`outbox.publish-after-commit`), so a transition reaching a completed row means the caller
+ * skipped the question instead of a duplicate arriving.
+ */
+export class InvalidMessageStateError extends DomainError {}

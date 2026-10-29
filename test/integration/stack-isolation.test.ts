@@ -278,8 +278,21 @@ describe('docker-stack-is-per-checkout', () => {
 describe('stack-addresses-match-the-started-containers', () => {
   const port = (variable: string) => new URL(process.env[variable] ?? '').port;
 
+  /**
+   * What `make` reports for this checkout under the pin the suites are running with. A checkout
+   * whose default ports are already taken on the host exports `STACK_SLOT` to take a block of its
+   * own (`docker/stack.sh`), and the stack that started the containers is then the pinned one, not
+   * the one this directory's position in the worktree list would name. `makeStack` runs `make` on a
+   * bare environment on purpose, so the pin is handed back to it rather than inherited.
+   */
+  const startedStack = () => {
+    const slot = process.env['STACK_SLOT'];
+
+    return makeStack(slot === undefined ? [] : [`STACK_SLOT=${slot}`]);
+  };
+
   test('the database URLs carry this checkout published PostgreSQL port', () => {
-    const expected = reported(makeStack(), 'POSTGRES_PORT');
+    const expected = reported(startedStack(), 'POSTGRES_PORT');
 
     expect({
       DATABASE_URL: port('DATABASE_URL'),
@@ -288,7 +301,7 @@ describe('stack-addresses-match-the-started-containers', () => {
   });
 
   test('the SQS endpoint carries this checkout published LocalStack port', () => {
-    expect(port('SQS_ENDPOINT')).toBe(reported(makeStack(), 'LOCALSTACK_PORT'));
+    expect(port('SQS_ENDPOINT')).toBe(reported(startedStack(), 'LOCALSTACK_PORT'));
   });
 });
 

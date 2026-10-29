@@ -16,10 +16,7 @@ import { ReprocessPendingReference } from '../../src/application/use-cases/repro
 import { systemClock } from '../../src/infrastructure/clock';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event-publisher';
-import {
-  WAGER_TRANSACTIONS_DLQ,
-  WAGER_TRANSACTIONS_QUEUE,
-} from '../../src/infrastructure/messaging/sqs';
+import { wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import { WagerTransactionsConsumer } from '../../src/infrastructure/messaging/wager-transactions.consumer';
 import { jsonLinesLogger } from '../../src/infrastructure/observability/logger';
 import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
@@ -29,6 +26,8 @@ import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
 const env = loadEnv(process.env);
+/** The trio this run addresses: the suites namespace theirs away from the stack. */
+const queues = wagerQueues(env.SQS_QUEUE_PREFIX);
 const migrationEnv = loadMigrationEnv(process.env);
 
 const SERVICE_ENV = {
@@ -106,8 +105,8 @@ beforeAll(async () => {
     region: env.AWS_REGION,
     ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
   });
-  queueUrl = await urlOf(WAGER_TRANSACTIONS_QUEUE);
-  deadLetterQueueUrl = await urlOf(WAGER_TRANSACTIONS_DLQ);
+  queueUrl = await urlOf(queues.input);
+  deadLetterQueueUrl = await urlOf(queues.deadLetter);
 });
 
 afterAll(async () => {
@@ -351,7 +350,10 @@ async function eventCorrelationIds(transactionId: unknown): Promise<string[]> {
 function publisher(): PublishOutbox {
   return new PublishOutbox({
     unitOfWork: new MikroOrmUnitOfWork(runtime.em, SERVICE_ENV.LOCK_TIMEOUT_MS, metrics),
-    publisher: new SqsEventPublisher(sqs, { timeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS }),
+    publisher: new SqsEventPublisher(sqs, {
+      queueName: queues.events,
+      timeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS,
+    }),
     clock: systemClock,
     logger: jsonLinesLogger('outbox-publisher'),
     metrics,

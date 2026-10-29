@@ -91,3 +91,11 @@ Landed in three parts: the observability surface with ADR 0012; the runtime role
 The reviewer documentation closed it: the README setup path from a clean checkout, ARCHITECTURE.md describing what was built with its trade-offs and limitations, the seven demonstrations of [demonstrations.md](demonstrations.md) in `make demo`, and the evidence of the seven entries that had been held open for the crash-recovery drills — TX-001, TX-007, LEDGER-005, LEDGER-007, IDEM-001, IDEM-009 and REF-001.
 
 Exit evidence: `make check` green with every required entry `implemented` and `passing`; the acceptance plan is the release report.
+
+## 10. suite-isolation — The gate and the demonstrations side by side
+
+Scope: `wagering_test` beside `wagering` and a second trio of queues under a prefix, both created by the init scripts the stack already runs; `SQS_QUEUE_PREFIX` as a validated setting composed in one place; `make test` addressing them, per checkout; ADR 0014; the three documents that used to ask for a `make down` between `make demo` and `make check`.
+
+Acceptance: OPS-010. Amended with it: MSG-001 and OPS-006, which now cover both namespaces.
+
+Exit evidence: `make up`, then the whole gate, then `make demo`, with no `make down` anywhere between them; the isolation cases compare what the suites address to what `docker compose config` resolves for the service roles.

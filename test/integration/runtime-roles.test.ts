@@ -9,7 +9,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
-import { WAGER_TRANSACTIONS_QUEUE } from '../../src/infrastructure/messaging/sqs';
+import { wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { EventsQueue } from '../helpers/events-queue';
 import { SERVICE_MAIN, SpawnedProcess, freePort } from '../helpers/spawned-process';
@@ -17,6 +17,8 @@ import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
 const env = loadEnv(process.env);
+/** The trio this run addresses: the suites namespace theirs away from the stack. */
+const queues = wagerQueues(env.SQS_QUEUE_PREFIX);
 const migrationEnv = loadMigrationEnv(process.env);
 
 /**
@@ -66,12 +68,10 @@ beforeAll(async () => {
     region: env.AWS_REGION,
     ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
   });
-  const { QueueUrl } = await sqs.send(
-    new GetQueueUrlCommand({ QueueName: WAGER_TRANSACTIONS_QUEUE }),
-  );
+  const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queues.input }));
 
   if (QueueUrl === undefined) {
-    throw new Error(`the stack has no queue ${WAGER_TRANSACTIONS_QUEUE}`);
+    throw new Error(`the stack has no queue ${queues.input}`);
   }
   queueUrl = QueueUrl;
   events = await EventsQueue.open(env);

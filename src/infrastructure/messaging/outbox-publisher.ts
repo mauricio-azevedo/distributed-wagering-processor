@@ -12,6 +12,7 @@ import { jsonLinesLogger } from '../observability/logger';
 import { uncountedMetrics } from '../observability/metrics';
 import { MikroOrmUnitOfWork } from '../persistence/mikro-orm.unit-of-work';
 import { WorkerLoop, type WorkerProcess } from '../runtime/worker-loop';
+import { wagerQueues } from './sqs';
 import { SqsEventPublisher } from './sqs-event-publisher';
 
 export interface OutboxPublisherOptions {
@@ -94,7 +95,10 @@ export function outboxPublisher(dependencies: OutboxPublisherDependencies): Outb
       unitOfWork: new MikroOrmUnitOfWork(em, env.LOCK_TIMEOUT_MS),
       publisher:
         dependencies.publisher ??
-        new SqsEventPublisher(sqs, { timeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS }),
+        new SqsEventPublisher(sqs, {
+          queueName: wagerQueues(env.SQS_QUEUE_PREFIX).events,
+          timeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS,
+        }),
       clock: dependencies.clock ?? systemClock,
       logger,
       metrics: dependencies.metrics ?? uncountedMetrics,

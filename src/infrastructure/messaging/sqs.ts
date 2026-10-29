@@ -8,6 +8,27 @@ export const WAGER_TRANSACTIONS_QUEUE = 'wager-transactions.fifo';
 export const WAGER_TRANSACTIONS_DLQ = 'wager-transactions-dlq.fifo';
 export const WAGER_INTEGRATION_EVENTS_QUEUE = 'wager-integration-events.fifo';
 
+/** The three queues of `msg.queues`, as this process addresses them. */
+export interface WagerQueues {
+  readonly input: string;
+  readonly deadLetter: string;
+  readonly events: string;
+}
+
+/**
+ * The three names under `SQS_QUEUE_PREFIX` (`ops.suite-isolation`). The names are the transport
+ * contract and the prefix is the namespace of one deployment, so the prefix is applied here, once,
+ * and no component spells a name out: an empty prefix is the contract names unchanged, which is
+ * what a deployment that sets nothing addresses.
+ */
+export function wagerQueues(prefix: string): WagerQueues {
+  return {
+    input: `${prefix}${WAGER_TRANSACTIONS_QUEUE}`,
+    deadLetter: `${prefix}${WAGER_TRANSACTIONS_DLQ}`,
+    events: `${prefix}${WAGER_INTEGRATION_EVENTS_QUEUE}`,
+  };
+}
+
 /** One client per process; credentials come from the SDK's default chain. */
 export function sqsClientProvider(env: Env): Provider {
   return {

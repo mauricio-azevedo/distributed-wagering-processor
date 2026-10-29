@@ -25,11 +25,7 @@ import { SubmitWagerTransaction } from '../../src/application/use-cases/submit-w
 import { systemClock } from '../../src/infrastructure/clock';
 import { loadEnv } from '../../src/infrastructure/config/env';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
-import {
-  WAGER_TRANSACTIONS_DLQ,
-  WAGER_TRANSACTIONS_QUEUE,
-  queueUrlResolver,
-} from '../../src/infrastructure/messaging/sqs';
+import { queueUrlResolver, wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import {
   WAGER_TRANSACTIONS_CONSUMER,
   WagerTransactionsConsumer,
@@ -70,6 +66,8 @@ class SlowToApply extends SubmitWagerTransaction {
 }
 
 const env = loadEnv(process.env);
+/** The trio this run addresses, which the suites namespace away from the stack. */
+const queues = wagerQueues(env.SQS_QUEUE_PREFIX);
 // On stderr, so the lines a case parses off stdout are this helper's own.
 const logger = jsonLinesLogger('sigterm-consumer', process.stderr);
 const orm = await MikroORM.init(ormConfig(env.DATABASE_URL));
@@ -80,8 +78,8 @@ const sqs = new SQSClient({
 
 const consumer = new WagerTransactionsConsumer({
   sqs,
-  queueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_QUEUE),
-  deadLetterQueueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_DLQ),
+  queueUrl: queueUrlResolver(sqs, queues.input),
+  deadLetterQueueUrl: queueUrlResolver(sqs, queues.deadLetter),
   submit: new SlowToApply({
     unitOfWork: new MikroOrmUnitOfWork(orm.em, env.LOCK_TIMEOUT_MS),
     clock: systemClock,

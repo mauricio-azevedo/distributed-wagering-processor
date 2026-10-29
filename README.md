@@ -75,23 +75,23 @@ make up                         # the whole stack: dependencies, migrations, one
 eval "$(make -s stack)"         # export this checkout's project and ports into this shell
 curl -s "http://localhost:$HTTP_PORT/health/ready"   # 200, with one entry per dependency
 make demo                       # the seven demonstrations, against that stack
-make down                       # stop the stack and drop its data
 make check                      # the whole quality gate; CI runs the same target
+make down                       # stop the stack and drop its data
 ```
 
-`make down` between `make demo` and `make check` is not optional: the demonstrations need the `api` and `worker` instances, and the suites drive the same queues themselves and expect no worker competing for them. `make check` starts the dependencies it needs on its own (`make infra`).
+No `make down` is needed between the demonstrations and the gate, in either order or at the same time: the suites address a database and a trio of queues of their own on the same containers, so neither disturbs the other's state (`ops.suite-isolation`, [ADR 0014](docs/decisions/0014-isolating-the-suites-from-the-demonstration-stack.md)). `make check` starts the dependencies it needs on its own (`make infra`).
 
 ## Commands
 
 ```sh
 make                            # list the targets
-make stack                      # this checkout's Compose project, image and published ports
+make stack                      # this checkout's Compose project, image, ports and suite addresses
 make dev                        # start PostgreSQL and LocalStack, apply migrations, run the service with reload
 make up                         # the whole stack in containers: dependencies, migrations, one api on HTTP_PORT and two workers
 make demo                       # start the stack and walk through docs/demonstrations.md
 make down                       # stop the stack and drop its data
 make migrate                    # apply pending migrations as the migrator role
-make test                       # the test suites, against the Compose dependencies
+make test                       # the test suites, against the suites' database and queues
 make check                      # the whole quality gate; CI runs the same target
 make fmt                        # rewrite files with Prettier
 ```
@@ -140,7 +140,7 @@ src/infrastructure/          configuration, HTTP (controllers, DTOs, validation,
 test/                        unit, integration and concurrency suites, run by bun test
 demo/                        walkthrough.ts, the demonstrations make demo drives against the running stack
 compose.yaml, Dockerfile     the stack and the image
-docker/                      PostgreSQL roles and LocalStack queues, applied once at container init, and stack.sh, which names this checkout's stack
+docker/                      PostgreSQL roles and databases and LocalStack queues, applied once at container init, and stack.sh, which names this checkout's stack
 .env.example                 the variables the service, the migration step and the suites read
 Makefile                     stack, check, fmt, fmt-check, lint, typecheck, test, audit, build, dev, infra, migrate, up, down, demo
 .bun-version                 the Bun version CI installs

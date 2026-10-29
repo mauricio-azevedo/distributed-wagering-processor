@@ -6,11 +6,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { AppModule } from '../../src/app.module';
 import { type Env, loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
-import {
-  WAGER_INTEGRATION_EVENTS_QUEUE,
-  WAGER_TRANSACTIONS_DLQ,
-  WAGER_TRANSACTIONS_QUEUE,
-} from '../../src/infrastructure/messaging/sqs';
+import { wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
@@ -151,32 +147,41 @@ describe('queues-bootstrapped', () => {
   const queueUrl = async (QueueName: string) =>
     (await sqs.send(new GetQueueUrlCommand({ QueueName }))).QueueUrl;
 
-  test('the three FIFO queues exist', async () => {
-    for (const name of [
-      WAGER_TRANSACTIONS_QUEUE,
-      WAGER_TRANSACTIONS_DLQ,
-      WAGER_INTEGRATION_EVENTS_QUEUE,
-    ]) {
-      expect(await queueUrl(name)).toEndWith(`/${name}`);
-    }
-  });
+  /**
+   * Both trios LocalStack is bootstrapped with: the names the transport contract fixes, which the
+   * Compose stack addresses, and the namespaced ones the suites address (`ops.suite-isolation`).
+   * Each is a full trio with its own redrive policy, so the two never meet and neither is a
+   * degraded copy of the other.
+   */
+  const trios = [
+    { addressed: 'the stack', queues: wagerQueues('') },
+    { addressed: 'the suites', queues: wagerQueues(env.SQS_QUEUE_PREFIX) },
+  ] as const;
 
-  test('the input queue redrives to the dead-letter queue after five receives', async () => {
-    const { Attributes } = await sqs.send(
-      new GetQueueAttributesCommand({
-        QueueUrl: await queueUrl(WAGER_TRANSACTIONS_QUEUE),
-        AttributeNames: ['FifoQueue', 'RedrivePolicy'],
-      }),
-    );
+  for (const { addressed, queues } of trios) {
+    test(`the three FIFO queues ${addressed} addresses exist`, async () => {
+      for (const name of [queues.input, queues.deadLetter, queues.events]) {
+        expect(await queueUrl(name)).toEndWith(`/${name}`);
+      }
+    });
 
-    expect(Attributes?.FifoQueue).toBe('true');
-    const redrive = JSON.parse(Attributes?.RedrivePolicy ?? '{}') as {
-      deadLetterTargetArn?: string;
-      maxReceiveCount?: string;
-    };
-    expect(redrive.maxReceiveCount).toBe('5');
-    expect(redrive.deadLetterTargetArn).toEndWith(`:${WAGER_TRANSACTIONS_DLQ}`);
-  });
+    test(`the input queue ${addressed} addresses redrives after five receives`, async () => {
+      const { Attributes } = await sqs.send(
+        new GetQueueAttributesCommand({
+          QueueUrl: await queueUrl(queues.input),
+          AttributeNames: ['FifoQueue', 'RedrivePolicy'],
+        }),
+      );
+
+      expect(Attributes?.FifoQueue).toBe('true');
+      const redrive = JSON.parse(Attributes?.RedrivePolicy ?? '{}') as {
+        deadLetterTargetArn?: string;
+        maxReceiveCount?: string;
+      };
+      expect(redrive.maxReceiveCount).toBe('5');
+      expect(redrive.deadLetterTargetArn).toEndWith(`:${queues.deadLetter}`);
+    });
+  }
 });
 
 describe('two-database-roles', () => {

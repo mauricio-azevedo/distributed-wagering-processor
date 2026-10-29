@@ -13,10 +13,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { AppModule } from '../../src/app.module';
 import { InboxPayloadConflictError, ServiceUnavailableError } from '../../src/application/errors';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
-import {
-  WAGER_TRANSACTIONS_DLQ,
-  WAGER_TRANSACTIONS_QUEUE,
-} from '../../src/infrastructure/messaging/sqs';
+import { wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import { MessageContractError } from '../../src/infrastructure/messaging/wager-transaction-message.dto';
 import {
   type DeliveryReport,
@@ -30,6 +27,8 @@ import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
 const env = loadEnv(process.env);
+/** The trio this run addresses: the suites namespace theirs away from the stack. */
+const queues = wagerQueues(env.SQS_QUEUE_PREFIX);
 const migrationEnv = loadMigrationEnv(process.env);
 
 /**
@@ -92,8 +91,8 @@ beforeAll(async () => {
     region: env.AWS_REGION,
     ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
   });
-  queueUrl = await urlOf(WAGER_TRANSACTIONS_QUEUE);
-  deadLetterQueueUrl = await urlOf(WAGER_TRANSACTIONS_DLQ);
+  queueUrl = await urlOf(queues.input);
+  deadLetterQueueUrl = await urlOf(queues.deadLetter);
 });
 
 afterAll(async () => {

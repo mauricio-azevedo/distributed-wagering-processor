@@ -50,11 +50,7 @@ import { loadEnv } from '../../src/infrastructure/config/env';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
 import { outboxPublisher } from '../../src/infrastructure/messaging/outbox-publisher';
 import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event-publisher';
-import {
-  WAGER_TRANSACTIONS_DLQ,
-  WAGER_TRANSACTIONS_QUEUE,
-  queueUrlResolver,
-} from '../../src/infrastructure/messaging/sqs';
+import { queueUrlResolver, wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import {
   WAGER_TRANSACTIONS_CONSUMER,
   WagerTransactionsConsumer,
@@ -134,6 +130,8 @@ const holdingAfterSend = (over: EventPublisher): EventPublisher => ({
 });
 
 const env = loadEnv(process.env);
+/** The trio this run addresses, which the suites namespace away from the stack. */
+const queues = wagerQueues(env.SQS_QUEUE_PREFIX);
 // On stderr, so the lines a drill parses off stdout are this helper's protocol alone.
 const logger = jsonLinesLogger('recovery-instance', process.stderr);
 const orm = await MikroORM.init(ormConfig(env.DATABASE_URL));
@@ -149,8 +147,8 @@ const unitOfWork = new MikroOrmUnitOfWork(orm.em, env.LOCK_TIMEOUT_MS, metrics);
 
 const consumer = new WagerTransactionsConsumer({
   sqs,
-  queueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_QUEUE),
-  deadLetterQueueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_DLQ),
+  queueUrl: queueUrlResolver(sqs, queues.input),
+  deadLetterQueueUrl: queueUrlResolver(sqs, queues.deadLetter),
   submit: new HoldsAfterCommit({
     unitOfWork,
     clock: systemClock,
@@ -175,7 +173,10 @@ const publisher = outboxPublisher({
   env,
   sqs,
   publisher: holdingAfterSend(
-    new SqsEventPublisher(sqs, { timeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS }),
+    new SqsEventPublisher(sqs, {
+      queueName: queues.events,
+      timeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS,
+    }),
   ),
   logger,
   metrics,

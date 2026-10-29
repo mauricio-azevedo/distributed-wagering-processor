@@ -2,9 +2,10 @@ import { GetQueueUrlCommand, SendMessageCommand, type SQSClient } from '@aws-sdk
 
 import type { EventPublisher } from '../../application/ports/event-publisher';
 import type { OutboxMessage } from '../../domain/outbox-message';
-import { WAGER_INTEGRATION_EVENTS_QUEUE } from './sqs';
 
 export interface SqsEventPublisherOptions {
+  /** The events queue this deployment addresses, from `wagerQueues` (`outbox.destination`). */
+  readonly queueName: string;
   /**
    * ADR 0005's bounded publish attempt. It is what keeps one cycle's hold on its database
    * connection finite when the broker neither answers nor refuses, so it belongs to the adapter
@@ -67,12 +68,12 @@ export class SqsEventPublisher implements EventPublisher {
 
   private async lookUpQueueUrl(): Promise<string> {
     const { QueueUrl } = await this.sqs.send(
-      new GetQueueUrlCommand({ QueueName: WAGER_INTEGRATION_EVENTS_QUEUE }),
+      new GetQueueUrlCommand({ QueueName: this.options.queueName }),
       { abortSignal: AbortSignal.timeout(this.options.timeoutMs) },
     );
 
     if (QueueUrl === undefined) {
-      throw new Error(`SQS reported no URL for ${WAGER_INTEGRATION_EVENTS_QUEUE}`);
+      throw new Error(`SQS reported no URL for ${this.options.queueName}`);
     }
 
     return QueueUrl;

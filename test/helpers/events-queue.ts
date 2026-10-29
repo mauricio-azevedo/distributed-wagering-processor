@@ -7,7 +7,7 @@ import {
 
 import type { IntegrationEventEnvelope } from '../../src/domain/integration-events';
 import type { Env } from '../../src/infrastructure/config/env';
-import { WAGER_INTEGRATION_EVENTS_QUEUE } from '../../src/infrastructure/messaging/sqs';
+import { wagerQueues } from '../../src/infrastructure/messaging/sqs';
 
 /** One message as it reached the queue: the envelope, and the two FIFO parameters it was sent with. */
 export interface DeliveredEvent {
@@ -44,12 +44,11 @@ export class EventsQueue {
       region: env.AWS_REGION,
       ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
     });
-    const { QueueUrl } = await sqs.send(
-      new GetQueueUrlCommand({ QueueName: WAGER_INTEGRATION_EVENTS_QUEUE }),
-    );
+    const name = wagerQueues(env.SQS_QUEUE_PREFIX).events;
+    const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: name }));
 
     if (QueueUrl === undefined) {
-      throw new Error(`LocalStack reported no URL for ${WAGER_INTEGRATION_EVENTS_QUEUE}`);
+      throw new Error(`LocalStack reported no URL for ${name}`);
     }
 
     return new EventsQueue(sqs, QueueUrl);

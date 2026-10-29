@@ -22,6 +22,7 @@ const DEFAULTS = {
   SQS_VISIBILITY_TIMEOUT_SECONDS: 30,
   SQS_RETRY_BACKOFF_BASE_SECONDS: 2,
   SQS_RETRY_BACKOFF_MAX_SECONDS: 300,
+  SQS_QUEUE_PREFIX: '',
 };
 
 describe('environment-schema', () => {
@@ -127,6 +128,24 @@ describe('environment-schema', () => {
     expect(() => loadEnv({ ...complete, PENDING_REFERENCE_SWEEP_INTERVAL_MS: '0' })).toThrow(
       /PENDING_REFERENCE_SWEEP_INTERVAL_MS/,
     );
+  });
+
+  /**
+   * `ops.suite-isolation`: the namespace the three queue names are addressed under. The default is
+   * empty, so a deployment that says nothing addresses the names the transport contract fixes, and
+   * anything SQS would refuse in a queue name is refused here instead, at startup.
+   */
+  test('the queue prefix defaults to empty, is read, and is refused by name', () => {
+    expect(loadEnv({ ...complete, SQS_QUEUE_PREFIX: 'test-' })).toEqual({
+      ...complete,
+      ...DEFAULTS,
+      SQS_QUEUE_PREFIX: 'test-',
+    });
+    expect(loadEnv(complete).SQS_QUEUE_PREFIX).toBe('');
+
+    for (const refused of ['test.', 'test/', 'a b', 'x'.repeat(33)]) {
+      expect(() => loadEnv({ ...complete, SQS_QUEUE_PREFIX: refused })).toThrow(/SQS_QUEUE_PREFIX/);
+    }
   });
 
   test('the migration step needs only the migrator URL', () => {

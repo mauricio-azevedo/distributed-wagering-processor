@@ -2111,13 +2111,13 @@ entries:
   - id: MSG-001
     priority: required
     requirement: The input, dead-letter and events queues exist with the documented names.
-    contract: [msg.queues, ops.compose]
+    contract: [msg.queues, ops.compose, ops.suite-isolation]
     enforcement:
-      - LocalStack bootstrap script in Docker Compose creates the three FIFO queues and the redrive policy.
+      - LocalStack bootstrap script in Docker Compose creates the three FIFO queues and the redrive policy, and creates the same trio a second time under the suites' prefix so that one LocalStack serves the stack and the gate.
     scenario:
-      - Start the stack; list queues.
+      - Start the stack; resolve each queue of both trios by name and read the input queue's attributes.
     expected:
-      - wager-transactions.fifo, wager-transactions-dlq.fifo and wager-integration-events.fifo exist; the redrive policy points at the dead-letter queue with maxReceiveCount 5.
+      - wager-transactions.fifo, wager-transactions-dlq.fifo and wager-integration-events.fifo exist, and so does each one under the suites' prefix; each input queue's redrive policy points at the dead-letter queue of its own trio with maxReceiveCount 5.
     evidence: { testId: queues-bootstrapped, layer: integration }
     deliverySlice: sqs-inbox-dlq
     implementationStatus: implemented
@@ -2822,7 +2822,7 @@ entries:
     requirement: Docker Compose starts the full stack used by the integration suites.
     contract: ops.compose
     enforcement:
-      - compose.yaml declares PostgreSQL, LocalStack with the three queues, the migration step, one api and two worker replicas, all three service containers from one image and one environment; make up brings it and make infra brings the dependencies the suites run against.
+      - compose.yaml declares PostgreSQL with two databases, LocalStack with two trios of the three queues, the migration step, one api and two worker replicas, all three service containers from one image and one environment; make up brings it and make infra brings the dependencies the suites run against.
     scenario:
       - Resolve the stack with docker compose config, which is what Compose itself will run, and read the topology off it; every integration suite then runs against the dependencies of that same file.
     expected:
@@ -2876,6 +2876,23 @@ entries:
     deliverySlice: http-observability-shutdown
     implementationStatus: deferred
     verificationStatus: not-run
+
+  - id: OPS-010
+    priority: required
+    requirement: The suites and the demonstration stack run at the same time on one set of containers.
+    contract: [ops.suite-isolation, ops.compose]
+    enforcement:
+      - A wagering_test database beside wagering, created by the same init script with the same two roles and the same default privileges; a second trio of queues under a prefix; SQS_QUEUE_PREFIX as a validated setting that defaults to empty, composed in one place by wagerQueues and read by the consumer, the publisher and the readiness probe; make test passing the suites that database and that prefix, built from the port this checkout publishes (ADR 0014).
+    scenario:
+      - Compare the database and the queue names the suites address to the ones docker compose config resolves for the api, worker and migrate services.
+      - Parse an environment with no prefix set, and with one SQS would refuse in a queue name.
+      - Run make up, then the whole gate, then the demonstrations, with no make down anywhere between them.
+    expected:
+      - The suites address one database, and it is none of the ones the stack's services write to; none of the three queue names they address is one the stack's roles poll; a deployment that sets no prefix addresses exactly the three contract names, and an unusable prefix stops the process at startup; the gate passes with one api and two worker instances healthy, and the demonstrations pass afterwards against the data still in the stack's database.
+    evidence: { testId: suites-are-isolated-from-the-stack, layer: integration }
+    deliverySlice: suite-isolation
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- AUTH
   - id: AUTH-001

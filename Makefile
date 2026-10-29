@@ -5,13 +5,12 @@ BUN ?= bun
 
 # One Compose stack per checkout, so two worktrees run the gate at the same time and stopping one
 # leaves the other up. docker/stack.sh names the stack, numbers it and picks the three ports of its
-# slot: the main worktree starts at slot 0, hence the project name and the ports a single clone
-# always had, every linked worktree starts at the next slot, and a slot with a port already in use
-# is skipped for the next free one, which the script announces. STACK_SLOT pins a slot and is taken
-# as given. Compose reads the project, the image and the ports from the environment; .env builds the
-# service URLs from the same ports, so the addresses the suites read always reach the containers
-# these variables started. `make stack` reports them, and any of them can be overridden from the
-# environment or the command line.
+# slot: the main worktree takes slot 0, hence the project name and the ports a single clone always
+# had, and every linked worktree takes its position in `git worktree list`. STACK_SLOT pins a slot
+# and is taken as given. Compose reads the project, the image and the ports from the environment;
+# .env builds the service URLs from the same ports, so the addresses the suites read always reach
+# the containers these variables started. `make stack` reports them, and any of them can be
+# overridden from the environment or the command line.
 STACK := $(shell STACK_SLOT='$(STACK_SLOT)' docker/stack.sh)
 ifneq ($(words $(STACK)),5)
 $(error docker/stack.sh could not name this checkout's stack; its reason is above)
@@ -51,8 +50,6 @@ TEST_QUEUE_PREFIX ?= test-
 
 # Printed where a reader is already stuck, so the command that explains a failure arrives with the
 # failure instead of in a document. One sentence and one command, in that order, everywhere.
-next = { printf '%s\nNext: %s\n' '$(1)' '$(2)' >&2; exit 1; }
-
 # The prerequisites of anything run from the host, as the files they produce: `make` installs them
 # once and then leaves them alone. Neither one overwrites what is there — an existing .env is a
 # configuration someone chose.
@@ -112,15 +109,13 @@ dev: .env migrate ## Run the service from source with reload, against the Compos
 	$(BUN) --watch run src/main.ts
 
 infra: ## Start PostgreSQL and LocalStack and wait until both are healthy
-	@docker compose up --detach --wait postgres localstack \
-	  || $(call next,PostgreSQL or LocalStack did not come up.,make logs SERVICES="postgres localstack")
+	@docker compose up --detach --wait postgres localstack
 
 migrate: node_modules .env infra ## Apply pending migrations as the migrator role
 	$(BUN) run src/infrastructure/persistence/migrate.ts
 
 up: ## Start the whole stack: dependencies, migrations and the service
-	@docker compose up --build --detach --wait \
-	  || $(call next,The stack did not reach readiness.,make logs)
+	@docker compose up --build --detach --wait
 
 down: ## Stop the stack and drop its data
 	docker compose down --volumes

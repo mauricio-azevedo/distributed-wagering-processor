@@ -2907,18 +2907,16 @@ entries:
 
   - id: OPS-011
     priority: required
-    requirement: A checkout publishes a slot whose ports are free and says which slot it took.
+    requirement: Every checkout of the repository publishes a slot of its own, derived the same way every time.
     contract: [ops.compose, ops.suite-isolation]
     enforcement:
-      - docker/stack.sh names the Compose project, then takes the first slot from its own position in git worktree list whose three ports are all free, stepping by the number of worktrees so that two checkouts searching at once cannot choose one slot. A port published by a container of this checkout's own stack counts as free, so a second make up keeps the slot the first one chose. A move is announced on stderr in one line naming the slot and the base URL; an explicit STACK_SLOT is used as given, with its ports in use and unannounced. Nothing is remembered, so a checkout returns to its own slot once those ports are free. The Makefile reads the project, the slot and the three ports from that one line.
+      - docker/stack.sh names the Compose project and takes the slot from the checkout's own position in git worktree list — the main worktree slot 0, hence the ports a single clone always had — so the answer depends on nothing but the worktree list and two checkouts cannot land on one slot. Nothing looks at what the host already publishes: a port in use fails docker compose with Compose's own message, and an explicit STACK_SLOT, used as given, is how a checkout is moved off it. The Makefile reads the project, the slot and the three ports from that one line.
     scenario:
-      - Run the script for a fixture repository with a port of its slot held by a listener, by a container labelled as its own Compose project, and by a container labelled as another project.
-      - Run it with all three ports held and STACK_SLOT set to that slot.
-      - Read the slots of a repository with three checkouts, and what make exports for each slot.
+      - Read the slots and project names of a fixture repository with three checkouts, and what make exports for each slot.
+      - Run the script for a linked worktree with STACK_SLOT set to a slot that is not the one its position derives.
     expected:
-      - A held port moves the checkout to the next slot of its own series, announced in one line with the slot and the base URL; a port its own stack publishes moves it nowhere; releasing the port brings the same answer back as before.
-      - The pinned slot is answered unchanged and nothing is printed.
       - No two checkouts of one repository can land on the same slot; slot 0 publishes 3000, 5433 and 4566, every slot publishes a fixed port below the ephemeral range, and no two slots share one.
+      - The pinned slot replaces the derived one, with the same project name and the block of ports that slot publishes.
     evidence: { testId: docker-stack-is-per-checkout, layer: integration }
     deliverySlice: reader-experience
     implementationStatus: implemented
@@ -2931,9 +2929,9 @@ entries:
     enforcement:
       - make demo depends on the dependencies and on .env as files it produces: bun install --frozen-lockfile when node_modules is older than package.json or bun.lock, and a copy of .env.example when .env is missing, which is never overwritten. It is also the default target, and make help lists the rest. A dependency that does not come up and a stack that does not reach readiness each end with the command that shows why.
     scenario:
-      - Clone the repository into an empty directory on a host already publishing 3000, 5433 and 4566, and run make.
+      - Clone the repository into an empty directory and run make.
     expected:
-      - The dependencies are installed, .env is created from .env.example, the stack is built and started on a free slot the run names, and the eight demonstrations pass; an .env that already exists is left as it is.
+      - The dependencies are installed, .env is created from .env.example, the stack is built and started on 3000, 5433 and 4566, and the eight demonstrations pass; an .env that already exists is left as it is.
     evidence: { testId: first-run-from-a-clean-clone, layer: manual }
     deliverySlice: reader-experience
     implementationStatus: implemented

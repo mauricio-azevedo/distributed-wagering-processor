@@ -1,255 +1,941 @@
 # Architecture
 
-How the service is built to honour the [system contract](docs/system-contract.md). Consequential decisions have their own records in [docs/decisions](docs/decisions/README.md); this document describes the current design, the smaller decisions, the database enforcement design and how the system behaves when things fail.
+A wallet and wagering transaction service for game providers.
 
-## 1. Purpose and scope
+This document explains the current design, database guarantees, failure recovery, and verification. The [system contract](docs/system-contract.md) defines the required behaviour. [Architecture decision records](docs/decisions/README.md) explain the consequential decisions.
 
-A wallet and wagering transaction service for game providers. Providers open wallets for players and submit `BET`, `WIN`, `LOSS`, `REFUND` and `ROLLBACK` operations over HTTP or through a queue. The service keeps one materialized balance per wallet, an immutable ledger of every balance change, persistent idempotency for every operation, and publishes integration events through a transactional outbox. Providers settle in BRL; the model is currency-aware and rejects currency conflicts.
+**Implementation status:** Every required entry in [docs/acceptance.yaml](docs/acceptance.yaml) is `implemented` and `passing`. `make check` runs the full verification suite. [Verification and delivery status](#13-verification-and-delivery-status) lists the optional extensions this version leaves out.
+
+## Contents
+
+1. [Service overview](#1-service-overview)
+2. [Design principles](#2-design-principles)
+3. [Components and boundaries](#3-components-and-boundaries)
+4. [Runtime and local stack](#4-runtime-and-local-stack)
+5. [Money and domain model](#5-money-and-domain-model)
+6. [Transaction processing](#6-transaction-processing)
+7. [Wallets and read operations](#7-wallets-and-read-operations)
+8. [Messaging](#8-messaging)
+9. [Database enforcement](#9-database-enforcement)
+10. [Transport and authentication](#10-transport-and-authentication)
+11. [Operations](#11-operations)
+12. [Failure recovery](#12-failure-recovery)
+13. [Verification and delivery status](#13-verification-and-delivery-status)
+14. [Decisions and limits](#14-decisions-and-limits)
+
+---
+
+## 1. Service overview
+
+Providers open player wallets and submit `BET`, `WIN`, `LOSS`, `REFUND`, and `ROLLBACK` operations over HTTP or a queue.
+
+The service maintains:
+
+- One materialized balance per wallet.
+- An immutable ledger of every balance change.
+- Persistent idempotency for every operation.
+- A transactional outbox for integration events.
+
+Providers settle in BRL. The model supports currencies and rejects currency conflicts; other currencies are not operated in this version.
+
+### System flow
+
+| Path               | Route                                                                     | Responsibility                                                                               |
+| ------------------ | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| HTTP               | Providers → API instances                                                 | Wallets, `POST /wagering/transactions`, transaction reads, ledger reads, and reconciliation. |
+| Queue input        | Providers → `wager-transactions.fifo` → worker consumer                   | Submit the same wagering commands as HTTP.                                                   |
+| Dead letters       | Input queue or consumer → `wager-transactions-dlq.fifo`                   | Retain permanent failures and messages that exhaust their receives.                          |
+| Reference recovery | Worker scheduler → PostgreSQL                                             | Retry transactions waiting for a reference.                                                  |
+| Event publication  | Worker publisher → `wager-integration-events.fifo` → downstream consumers | Publish committed integration events.                                                        |
+
+Both entry points call the same submission use case. Every financial change commits in one PostgreSQL transaction. Queue acknowledgements and event publication act only on committed financial state.
+
+PostgreSQL stores `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox_messages`, `outbox_messages`, and `pending_reference_schedule`.
+
+---
 
 ## 2. Design principles
 
-1. **The simplest design that satisfies the guarantees wins.** When two designs are equally simple, the one that costs less to change later wins.
-2. **Guarantees live in the schema.** Uniqueness, immutability, non-negativity and the balance-to-ledger link are enforced by constraints, triggers and privileges, not only by code. Code states the rules; the database makes violations impossible to commit.
-3. **The domain is framework-free.** Entities and value objects know nothing about NestJS, MikroORM, HTTP or SQS. Ports are defined in the application layer; adapters implement them in the infrastructure layer.
-4. **Every instance is stateless.** Any instance of any role can handle any request, message or outbox row; coordination happens in PostgreSQL.
-5. **No network I/O inside the financial transaction.** The transaction locks a wallet row; publication, acknowledgement and anything that waits on another system happen after commit.
-6. **Transport contracts are documents.** `docs/openapi.yaml` and `docs/asyncapi.yaml` define every request, response, message and event; DTOs and message classes implement them with validation. Documentation defines behaviour.
-7. **Tests first, against real dependencies.** Domain and use cases are driven by unit tests; adapters are tested against PostgreSQL and LocalStack in containers; concurrency is tested with real parallelism and several processes. `make check` runs everything and is the only definition of green, locally and in CI (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+1. **Choose the simplest design that meets the guarantees.** If two designs are equally simple, choose the one that costs less to change.
+2. **Enforce guarantees in the schema.** Constraints, triggers, and privileges enforce uniqueness, immutability, non-negative balances, and the balance-to-ledger link. Code expresses the rules; PostgreSQL prevents invalid commits.
+3. **Keep the domain independent.** Entities and value objects do not depend on NestJS, MikroORM, HTTP, or SQS. The application defines ports; infrastructure implements them.
+4. **Keep instances stateless.** Any instance of a role can handle any work assigned to that role. PostgreSQL coordinates requests, messages, and outbox claims.
+5. **Keep network I/O outside financial transactions.** A financial transaction holds a wallet lock. Publish events, acknowledge messages, and wait on other systems after it commits.
+6. **Define transport behaviour in documents.** `docs/openapi.yaml` and `docs/asyncapi.yaml` define requests, responses, messages, and events. Validated DTOs and message classes implement them.
+7. **Test first, with real dependencies.** Use unit tests for the domain and use cases, PostgreSQL and LocalStack containers for adapters, and real parallel processes for concurrency. `make check` is the only definition of green, locally and in CI. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## 3. System context
+---
 
-```
-                HTTP (POST /wagering/transactions, wallets, ledger, reconciliation)
- providers ───────────────────────────────────────────────────────────► api instances ─────┐
-                                                                                            │
- providers ──► wager-transactions.fifo ──► worker instances: queue consumer ────────────────┤
-                       │                                                                    ▼
-                       └──► wager-transactions-dlq.fifo (permanent failures, exhausted receives)   PostgreSQL
-                                                                                            ▲   wallets · wager_transactions · wallet_ledger_entries
- worker instances: pending-reference scheduler ─────────────────────────────────────────────┤   inbox_messages · outbox_messages · pending_reference_schedule
-                                                                                            │
- worker instances: outbox publisher ──► wager-integration-events.fifo ──► downstream consumers
-```
+## 3. Components and boundaries
 
-Both entry points call the same use case. Every financial change is one PostgreSQL transaction; the queue and the publisher only ever act on committed state.
+Dependencies point inward: **infrastructure → application → domain**. The domain has no dependencies on the other layers.
 
-## 4. Layering
+### Layer responsibilities
 
-Dependencies point inwards: infrastructure depends on application, application depends on domain, the domain depends on nothing.
+| Layer          | Owns                                                                                                          | Must not depend on                                           |
+| -------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| Domain         | Money, aggregates, records, events, operation identity, transitions, and business failure codes.              | Frameworks, ORM, transport, or a clock.                      |
+| Application    | Use cases, ports, commands, results, request errors, and the SHA-256 primitive used by domain identity rules. | NestJS, MikroORM, SQS, or HTTP.                              |
+| Infrastructure | Controllers, validation, persistence, messaging, runtime, configuration, logging, metrics, and health.        | No additional restriction; this layer wires the application. |
 
-| Layer          | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Must not know about               |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| Domain         | `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage`, `IntegrationEvent` and its subclasses, operation identity (`canonicalJson`, `payloadHashOf`, `classifyReservationConflict`), the identity of the internal opening credit (`openingCreditSubmission`), domain errors (`InvalidTransactionStateError`, `CurrencyMismatchError`, ...), the failure code and error code enumerations.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Frameworks, ORM, transport, clock |
-| Application    | Use cases (`OpenWallet`, `GetWallet`, `PageWalletLedger`, `SubmitWagerTransaction`, `GetWagerTransaction`, `ReprocessPendingReference`, `ReconcileWallet`, `PublishOutbox`, `ObserveOutboxBacklog`), the financial step both wagering use cases record outcomes through (`ApplyWagerOperation`), ports (`WalletRepository`, `WagerTransactionRepository`, `LedgerRepository`, `InboxRepository`, `OutboxRepository`, `UnitOfWork`, `Clock`, `IdGenerator`, `EventPublisher`, `ProviderIdentityPort`, `Logger`, `Metrics`), the request-level errors a use case answers with (`WalletAlreadyExistsError`, `WalletNotFoundError`, `TransactionNotFoundError`, `IdempotencyPayloadMismatchError`, `ExternalTransactionAlreadyBoundError`, `ServiceUnavailableError`) and the one delivery refusal that has no caller to answer (`InboxPayloadConflictError`), the `sha256Hex` primitive the domain asks for, DTO-free command and result types. | NestJS, MikroORM, SQS, HTTP       |
-| Infrastructure | NestJS modules and controllers, DTOs with validation, the row classes with their `EntitySchema` mappings, mappers and repositories, the unit of work, the SQS consumer and publisher, the schedulers, the runtime (`WorkerLoop`, `WorkerRuntime`, the signal handler and the HTTP drain), configuration, logging, metrics, health.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Nothing; it wires everything      |
+### Domain inventory
 
-Use cases receive plain commands and return plain results; controllers and consumers translate transport into commands and results into responses or acknowledgements. The `UnitOfWork` port opens the financial transaction and exposes the repositories bound to it, so a use case never sees a connection.
+| Area                      | Types and functions                                                                                                             |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Money and financial state | `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`.                                                                     |
+| Messaging                 | `InboxMessage`, `OutboxMessage`, `IntegrationEvent`, and its subclasses.                                                        |
+| Operation identity        | `canonicalJson`, `payloadHashOf`, `classifyReservationConflict`, `openingCreditSubmission`.                                     |
+| Errors                    | Domain errors such as `InvalidTransactionStateError` and `CurrencyMismatchError`; the failure-code and error-code enumerations. |
 
-## 5. Runtime topology
+### Application inventory
 
-- One container image. `APP_ROLE=api` serves HTTP; `APP_ROLE=worker` runs the queue consumer, the outbox publisher and the pending-reference scheduler and serves the health routes alone; `APP_ROLE=all` runs everything (local development). Roles share code, configuration and the database, and `api` is the default, so a process that was told nothing serves traffic and claims no financial work (ADR 0013).
-- Every role stops by draining: one signal handler closes the application within `SHUTDOWN_GRACE_PERIOD_MS` and exits `0`, or exits `75` when the drain needs longer than that. The container's own stop grace period is set above it, so the process is what decides it is done.
-- Any number of instances per role. The concurrency suites run at least three processes against one database and one queue.
-- Two PostgreSQL roles: `wagering_migrator` owns the schema and runs migrations at deploy time; `wagering_app` is the runtime role with no DDL and no `UPDATE` or `DELETE` on the ledger.
-- Docker Compose brings PostgreSQL, LocalStack with the queues, a migration step, one `api` and two `worker` instances.
-- The suites run beside that stack rather than instead of it: PostgreSQL holds `wagering_test` beside `wagering` and LocalStack holds a second trio of the queues under a prefix, so `make check` and `make demo` run at the same time without either touching the other's rows or messages. `SQS_QUEUE_PREFIX` is the one setting that makes it possible, empty by default so a deployment addresses the names the transport contract fixes (ADR 0014).
-- One Compose stack per checkout: `docker/stack.sh` names it, picks its slot and prints the three ports of that slot, the `Makefile` exports the project, the image and those ports, and `.env` builds the service URLs from them. Slot 0 publishes `3000`, `5433` and `4566`; every other slot gets a block of ten from `24000`, so two checkouts run the gate at the same time and `make down` in one leaves the other up. A checkout starts at its own position in `git worktree list` and takes the first slot from there whose three ports are all free — stepping by the number of worktrees, so two of them searching at once cannot choose one slot, and counting a port its own stack publishes as its own, so starting a stack twice keeps it where it is. A move is announced in one line; `STACK_SLOT` pins a slot and is used as given.
+| Area                    | Types and functions                                                                                                                                                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Wallet use cases        | `OpenWallet`, `GetWallet`, `PageWalletLedger`, `ReconcileWallet`.                                                                                                                    |
+| Transaction use cases   | `SubmitWagerTransaction`, `GetWagerTransaction`, `ReprocessPendingReference`.                                                                                                        |
+| Shared financial step   | `ApplyWagerOperation`, used by submission and pending-reference recovery.                                                                                                            |
+| Outbox use cases        | `PublishOutbox`, `ObserveOutboxBacklog`.                                                                                                                                             |
+| Persistence ports       | `WalletRepository`, `WagerTransactionRepository`, `LedgerRepository`, `InboxRepository`, `OutboxRepository`, `UnitOfWork`.                                                           |
+| Other ports             | `Clock`, `IdGenerator`, `EventPublisher`, `ProviderIdentityPort`, `Logger`, `Metrics`.                                                                                               |
+| Request errors          | `WalletAlreadyExistsError`, `WalletNotFoundError`, `TransactionNotFoundError`, `IdempotencyPayloadMismatchError`, `ExternalTransactionAlreadyBoundError`, `ServiceUnavailableError`. |
+| Delivery error          | `InboxPayloadConflictError`: a delivery refusal with no synchronous caller to answer.                                                                                                |
+| Plain types and hashing | DTO-free commands and results; `sha256Hex`.                                                                                                                                          |
 
-## 6. Decisions
+Infrastructure contains NestJS modules and controllers, validated DTOs, row classes and `EntitySchema` mappings, mappers, repositories, the unit of work, SQS consumers and publishers, schedulers, `WorkerLoop`, `WorkerRuntime`, signal handling, and HTTP draining.
 
-Each decision is `accepted`, and each one shipped as recorded: no ADR was superseded, deprecated or amended during implementation. Verification is tracked per acceptance id in [docs/acceptance.yaml](docs/acceptance.yaml), where every required entry is now `implemented` and `passing`.
+### Transaction boundary
 
-### Recorded in ADRs
-
-- [ADR 0001](docs/decisions/0001-money-representation-and-persistence.md) Money: `bigint` minor units in the domain, `NUMERIC(20,2)` in PostgreSQL, strings in between, no rounding path, one bound shared by inputs, arithmetic and storage.
-- [ADR 0002](docs/decisions/0002-wallet-concurrency-strategy.md) Concurrency: pessimistic row lock on the wallet with `FOR NO KEY UPDATE`, version guard, check constraint, fixed lock order.
-- [ADR 0003](docs/decisions/0003-database-enforcement-of-financial-consistency.md) Schema enforcement: uniqueness, checks, ledger and transaction immutability triggers, two roles, deferred balance-to-ledger triggers on both tables.
-- [ADR 0004](docs/decisions/0004-persistent-idempotency-and-replay.md) Idempotency: provider-scoped keys, bound external ids, canonical payload hash, replay rebuilt from persisted facts.
-- [ADR 0005](docs/decisions/0005-outbox-publication-protocol.md) Outbox: `FOR UPDATE SKIP LOCKED` claims inside one publisher transaction, bounded publish attempt, backoff without loss.
-- [ADR 0006](docs/decisions/0006-wallet-operation-outcomes.md) Wallet operations: a refusal a provider can cause is a returned failure code, not an exception; an applied operation returns the new wallet with its ledger entry instead of mutating.
-- [ADR 0007](docs/decisions/0007-wager-transaction-state-machine.md) Transaction outcomes: named transitions change the row in place, one transition table defines both the legal moves and terminality, and a transition on a terminal transaction throws.
-- [ADR 0008](docs/decisions/0008-persistence-model-for-the-domain-mapping.md) Persistence mapping: row classes mapped by `EntitySchema` and translated by mappers, because an ORM that owns its instances cannot own frozen aggregates or private transitions.
-- [ADR 0009](docs/decisions/0009-reference-resolution-and-reversal-eligibility.md) References: resolved by provider ids under the wallet lock, eligibility decided in the domain over the resolved pair, and the reversed-once rule read from the index predicate under that same lock rather than learned from its violation.
-- [ADR 0010](docs/decisions/0010-queue-delivery-identity-and-the-inbox-claim.md) Queue delivery identity: the inbox row is claimed by an insert as the first statement of the delivery's financial transaction and completed by the same commit, its hash covers the message's `data`, and the consumer reaches the one use case through a second method over the shared financial body.
-- [ADR 0012](docs/decisions/0012-structured-logs-and-operational-metrics.md) Logs and metrics: JSON lines behind the `Logger` port with the correlation id bound per unit of work in an `AsyncLocalStorage`, redaction in that one adapter, and the metric names and their labels spelled in the `Metrics` port as a mapped type so a name outside the contract does not compile.
-- [ADR 0013](docs/decisions/0013-runtime-roles-and-the-shutdown-protocol.md) Runtime roles and shutdown: `APP_ROLE` selects the controllers and whether the worker processes start, one signal handler bounds every drain by the grace period, the HTTP drain releases the connections nobody is using, and one `WorkerLoop` gives the three background processes the same stop.
-- [ADR 0014](docs/decisions/0014-isolating-the-suites-from-the-demonstration-stack.md) Suite isolation: the gate and the demonstrations share the containers and nothing else — a database and a trio of queues each, with the queue prefix as the only setting it takes.
-- [ADR 0015](docs/decisions/0015-measuring-the-service-under-load.md) Measuring under load: a scenario of this repository's own on an overlay that adds three `api` instances and changes nothing else, counting completed unique operations apart from replays and persisted rejections, reading the counters and gauges the service already exports, and draining before it reconciles every wallet it touched.
-- [ADR 0011](docs/decisions/0011-pending-reference-recovery.md) Pending references: one schedule row claimed per attempt with `FOR UPDATE SKIP LOCKED`, the attempt reusing the financial step a submission takes, the window consulted only after an attempt that ran, and `FAILED` reached only from a failure the service positively recognises as permanent.
+- Use cases receive plain commands and return plain results.
+- Controllers and consumers translate transport payloads into commands, then results into responses or acknowledgements.
+- `UnitOfWork` opens a transaction and supplies repositories bound to it. Use cases never receive a database connection.
+- The five persistence ports are available inside `UnitOfWork.transactional`. It commits when the operation resolves and rolls back when it rejects.
+- Each unit of work forks its own `EntityManager`, preventing one operation from reusing another operation's loaded rows.
 
 ### Persistence with MikroORM
 
-MikroORM is the ORM. The transaction boundary is visible in the use case through the `UnitOfWork` port (`em.transactional` under it), and the wallet lock is one explicit `SELECT ... FOR NO KEY UPDATE` in the wallet repository (the ORM's `LockMode.PESSIMISTIC_WRITE` emits `FOR UPDATE`, which ADR 0002 shows deadlocks against the reservation's foreign key). The ORM maps one row class per table with `EntitySchema`, and mappers translate between a row and its aggregate (ADR 0008), so domain classes carry no decorator and keep the immutability and the private transitions of ADRs 0006 and 0007. A custom `MoneyType` keeps a `NUMERIC(20,2)` column exact as a decimal string in both directions; the mapper pairs it with the currency column of the row and hands both to `Money.from`, so an amount is parsed only by the domain. Repositories write when they are called rather than at the commit, so nothing reorders the statements of an operation behind the lock order, and each unit of work forks its own `EntityManager`, so no operation serves another the rows it loaded. Migrations are MikroORM migration classes with `up` and `down`, applied by `src/infrastructure/persistence/migrate.ts` as the migrator role (the Compose `migrate` service and `make migrate` run the same script); the ORM never creates the database (`ensureDatabase` off) because neither role may, and the migration snapshot is off because the migrations are written by hand.
+| Concern           | Implementation                                                                                                                                                                                 |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Transaction       | `UnitOfWork` uses `em.transactional`. The boundary remains visible in the use case.                                                                                                            |
+| Wallet lock       | The repository issues `SELECT ... FOR NO KEY UPDATE` explicitly. `LockMode.PESSIMISTIC_WRITE` emits `FOR UPDATE`, which deadlocks against the reservation's foreign key (ADR 0002).            |
+| Mapping           | One row class per table, mapped with `EntitySchema`. Mappers translate rows and aggregates (ADR 0008). Domain classes have no decorators and retain frozen state and private transitions.      |
+| Money             | A custom `MoneyType` reads and writes `NUMERIC(20,2)` as exact decimal strings. Mappers pass each string and its currency to `Money.from`; only the domain parses amounts.                     |
+| Write timing      | Repositories write when called. They do not defer writes until commit, so the ORM cannot reorder statements around the lock order.                                                             |
+| Migrations        | Handwritten MikroORM classes with `up` and `down`. `src/infrastructure/persistence/migrate.ts` runs them as the migrator role; Compose's `migrate` service and `make migrate` use that script. |
+| Database creation | `ensureDatabase` is off. Neither database role may create a database. Migration snapshots are also off because migrations are handwritten.                                                     |
 
-### Authentication: deferred, with an explicit extension point
+---
 
-This version authenticates no HTTP caller: providers reach the service inside the platform's network boundary. The application layer defines `ProviderIdentityPort` (resolve the authenticated provider for a request) and the HTTP layer applies a guard that currently admits every request and binds no identity. The intended design when the boundary changes: an external OpenID Connect provider (Keycloak) issues client-credentials tokens, one client per provider, with a `providerId` claim; the guard validates the token and the port returns the claim; the use case rejects any payload whose `providerId` differs from the authenticated one. Health and metrics stay open. The queue carries no credentials and is treated as an internal channel; the `providerId` inside a message is still subject to every domain rule.
+## 4. Runtime and local stack
 
-### Identifiers, cursors and hashing
+### One image, three roles
 
-- Ids minted by the service are UUIDv7 (`Bun.randomUUIDv7`), chosen for index locality. They identify; they never order anything, because UUIDv7 is not monotonic across instances. Ordering uses `walletVersion` (ledger) or `occurred_at, id` (outbox).
-- The ledger cursor is `base64url("v1:" + walletVersion)`: opaque to clients, stable under appends, versioned for future changes. It is encoded and decoded in the HTTP adapter alone — the use case takes a wallet version and answers with one — so nothing inside the service parses a cursor into a query, and its form can change behind the `v1` prefix with no stored value to migrate. The decoder is strict in both directions, re-encoding what it read and refusing anything that does not reproduce the value it came from, because base64 decoding is lenient and a tolerant reader would answer a crafted value with a page from a position nothing issued.
-- `payloadHash` is SHA-256 over RFC 8785 canonical JSON of the validated business fields; the implementation is tested against fixed vectors so every instance hashes identically. The split follows the layering rather than the rule: the domain states which fields are hashed and in exactly which bytes (`canonicalJson`, held to the RFC's own vectors, property names ordered by UTF-16 code unit), and the application hands it `sha256Hex` over `node:crypto`, because the domain imports no runtime module and a digest is a pure function with nothing to adapt. The amount passes through the domain money parser on its way in, so one spelling per value is a property of the hash and not of whichever validator ran first.
+| Setting           | Runs                                                               | HTTP surface                                                  |
+| ----------------- | ------------------------------------------------------------------ | ------------------------------------------------------------- |
+| `APP_ROLE=api`    | API only. This is the default.                                     | Application routes, documentation, and operational endpoints. |
+| `APP_ROLE=worker` | Queue consumer, outbox publisher, and pending-reference scheduler. | Health routes only.                                           |
+| `APP_ROLE=all`    | API and all worker processes, for local development.               | The API surface.                                              |
 
-### Configuration, observability and shutdown
+Roles share code, configuration, and PostgreSQL. A process with no role setting serves traffic and claims no financial work (ADR 0013).
 
-- Configuration is read from environment variables and validated at startup with a zod schema; the process exits on an invalid value, naming the variable, before it listens. The service schema has no migrator credentials: the migration step reads its own variable.
-- Logging: JSON lines on the process sink behind the `Logger` port, one line per record — `time`, `level`, `component`, `event`, the bound identity, the caller's fields. The correlation id and, on the queue, the message id are bound per unit of work in an `AsyncLocalStorage` the adapter merges into every line, so no financial method takes a logging argument; redaction of bodies, amounts and balances happens in that one adapter, and the reconciliation divergence record is a method of its own, which is what makes the exception auditable (ADR 0012).
-- Metrics: `prom-client` on a registry of the instance's own, exposed at `/metrics`. The names and their label vocabularies are the operational contract and are spelled in the `Metrics` port as a mapped type, so a name or a label outside the contract does not compile (`obs.metrics`); every documented metric is declared at startup, so an idle instance already exposes each with its type. The two outbox gauges are measured from the table on every scrape rather than written by a publisher cycle, so the backlog is answered by an instance that runs no publisher (`outbox.lag-metrics`).
-- Health: `@nestjs/terminus`; readiness runs a PostgreSQL probe (`SELECT 1` through the pool, as the runtime role) and an SQS probe (`GetQueueUrl` for the input queue, so the queue must exist); liveness runs none. The response is Terminus's: `status` plus one `details` entry per probe.
-- Shutdown: one handler per process on `SIGTERM` and `SIGINT`, closing the application — the hooks `enableShutdownHooks` would run — against `SHUTDOWN_GRACE_PERIOD_MS` (ADR 0013). The HTTP server stops accepting and drains the requests in flight while the connections nobody is using are released, so a caller's keep-alive pool cannot hold the drain open, and a request that arrives meanwhile is refused `503` with `Connection: close`. `WorkerRuntime` drains the three loops of the role in parallel, each resolving once the cycle in flight has committed or rolled back; the consumer also abandons the receive in flight and hands back the messages of its batch it had not reached. A drain that does not finish inside the period exits `75` and loses nothing: what it did not finish never committed, so a claim is released with the connection and a message is redelivered.
+Run any number of instances per role. Concurrency suites use at least three processes against one database and one queue.
 
-### Contract-first transport
+### Database roles
 
-`docs/openapi.yaml` (OpenAPI 3.1) and `docs/asyncapi.yaml` (AsyncAPI 3.0) are the authoritative transport contracts: paths, parameters, headers, status codes, bodies, pagination, queues, messages, event envelopes and delivery semantics. They cite the rules of the system contract they realise and carry no business rule of their own. Request and response DTOs, message and event classes implement them with validation in the adapters; a shape change is made in the contract first, then in the code. The documents define the operation's shape twice, once per transport, so each stands alone; the code implements it once, in `src/infrastructure/transport`, and the HTTP body schema and the message's `data` are that object with the rules applied — a provider therefore cannot find an operation the queue admits and a request refuses (`msg.same-use-case`). The `api` role serves `docs/openapi.yaml` unchanged at `/docs-json` and renders it at `/docs`. Nothing is generated in either direction; the acceptance plan carries the tests that hold the code to the documents (MODEL-006, API-011, API-012).
+| Role                | Access                                                                                                                                                      |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wagering_migrator` | Owns the schema and runs deployment migrations.                                                                                                             |
+| `wagering_app`      | Runs the service. No DDL; no ledger `UPDATE` or `DELETE`. The full privilege restrictions are listed under [database enforcement](#9-database-enforcement). |
 
-### Request validation and problem details
+### Compose stack and suite isolation
 
-Validation is zod at the edge, the same library the environment loader uses. One pipe per request part parses it against the schema that implements its contract shape and reports every violation at once as a JSON Pointer whose first segment names the part (`/body/initialBalance/amount`, `/path/walletId`), so a provider fixes one payload instead of one member per round trip. Unknown members are violations: the schemas are strict objects. The money patterns are exported from the domain rather than restated, so a request the validator admits is one `Money.from` can parse and a malformed amount is a `400` naming the member instead of a parse error with no path.
+Docker Compose starts PostgreSQL, LocalStack and its queues, a migration step, one `api`, and two `worker` instances.
 
-One exception filter turns refusals into RFC 9457 problem details, over a complete table of status and title per `ErrorCode`; a use case names the code and never a status, and a code added later therefore cannot reach a caller unmapped. It catches the violations a pipe reported, the conflicts and absences a use case raised, and the body the framework itself could not parse — and nothing else, because an error it does not recognise is a defect or an unavailable dependency rather than a refusal of the request; the transient case reaches a caller as `503 SERVICE_UNAVAILABLE` with `Retry-After` (API-006). The correlation id is bound on first need rather than only in route middleware, since the body parser refuses a malformed payload before any route runs and that problem has to carry one too; the first caller fixes the id and writes the header, so the header and the body of one response can never disagree.
+Tests share those containers with demonstrations, but use separate data:
 
-## 7. Database enforcement design
+| Resource | Demonstration stack            | Test suites                  |
+| -------- | ------------------------------ | ---------------------------- |
+| Database | `wagering`                     | `wagering_test`              |
+| Queues   | The three contract queue names | A second trio under a prefix |
 
-| Guarantee                                    | Mechanism                                                                                                                                             | Evidence   |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| One wallet per player and currency           | `UNIQUE (player_id, currency)` on `wallets`                                                                                                           | SCHEMA-001 |
-| Balance never negative                       | `CHECK (balance >= 0)` on `wallets`                                                                                                                   | SCHEMA-002 |
-| Version starts at 1                          | `CHECK (version >= 1)` on `wallets`                                                                                                                   | SCHEMA-003 |
-| One row per provider transaction             | `UNIQUE (provider_id, external_transaction_id)` on `wager_transactions`                                                                               | SCHEMA-004 |
-| One row per provider idempotency key         | `UNIQUE (provider_id, idempotency_key)` on `wager_transactions`                                                                                       | SCHEMA-005 |
-| Closed vocabularies and the reference matrix | One `CHECK` per vocabulary column (kind, status, failure code, direction, event type) plus `CHECK` on kind versus `reference_external_transaction_id` | SCHEMA-006 |
-| Terminal consistency                         | `CHECK` tying `status` to `processed_at` and `failure_code`                                                                                           | SCHEMA-007 |
-| Terminal outcomes frozen                     | `BEFORE UPDATE OR DELETE` trigger on `wager_transactions`: no update of a terminal row, no delete of any row                                          | SCHEMA-024 |
-| Transaction identity and amount frozen       | The same trigger compares the frozen columns of both row images with `IS DISTINCT FROM`                                                               | SCHEMA-025 |
-| Positive amounts                             | `CHECK (amount > 0)` on `wallet_ledger_entries`; on `wager_transactions`, `amount >= 0` and `> 0` unless `kind = 'LOSS'`                              | SCHEMA-008 |
-| One ledger entry per transaction             | `UNIQUE (transaction_id)` on `wallet_ledger_entries`                                                                                                  | SCHEMA-009 |
-| Ledger sequence                              | `UNIQUE (wallet_id, wallet_version)` on `wallet_ledger_entries`                                                                                       | SCHEMA-010 |
-| Balanced entries                             | `CHECK` on `balance_before`, `amount`, `direction`, `balance_after`; `CHECK (balance_after >= 0)`                                                     | SCHEMA-011 |
-| Entry currency equals wallet currency        | Composite `FOREIGN KEY (wallet_id, currency) REFERENCES wallets (id, currency)`                                                                       | SCHEMA-012 |
-| Ledger immutable                             | `BEFORE UPDATE OR DELETE` trigger raising on `wallet_ledger_entries`                                                                                  | SCHEMA-013 |
-| Ledger immutable even without the trigger    | `wagering_app` holds only `SELECT, INSERT` on the ledger, no `DELETE` on any table, nothing on the migration log and no DDL                           | SCHEMA-014 |
-| One reversal per transaction                 | Partial `UNIQUE (reference_transaction_id) WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'`                                              | SCHEMA-015 |
-| One opening credit per wallet                | Partial `UNIQUE (wallet_id) WHERE kind = 'OPENING'`                                                                                                   | SCHEMA-016 |
-| Wallet mirrors its ledger head at commit     | Deferred constraint trigger on `wallets` comparing the row with the entry of greatest `wallet_version`                                                | SCHEMA-017 |
-| Every entry is mirrored or continued         | Deferred constraint trigger on `wallet_ledger_entries`: an entry with no successor must be mirrored by the wallet row                                 | SCHEMA-021 |
-| Ledger chain continuous, no gaps             | The same trigger checks the predecessor and successor links (`wallet_version` minus or plus one, matching balances)                                   | SCHEMA-022 |
-| Balance equals the ledger sum                | Implied by the chain, the arithmetic check and immutability; asserted over direct-SQL sequences                                                       | SCHEMA-023 |
-| Inbox identity                               | Primary key `(consumer_name, message_id)` on `inbox_messages`                                                                                         | SCHEMA-018 |
-| Stable event identity, efficient claims      | Primary key `event_id` on `outbox_messages`; index on `(published_at, next_attempt_at, occurred_at)` for pending rows                                 | SCHEMA-019 |
-| Exact money columns                          | `NUMERIC(20,2)` everywhere money is stored; the domain bound equals its capacity; round-trip test through the ORM mapping                             | SCHEMA-020 |
-| No monetary column admits `NaN`              | A `<> 'NaN'::numeric` check of its own beside the range check of each monetary column                                                                 | SCHEMA-026 |
+`SQS_QUEUE_PREFIX` selects the queue namespace. It defaults to empty so deployments use the names fixed by the transport contract. `make check` and `make demo` can run together without touching each other's rows or messages (ADR 0014).
 
-Tables: `wallets`, `wager_transactions` (with `observed_balance`), `wallet_ledger_entries`, `inbox_messages`, `outbox_messages`, `pending_reference_schedule` (`transaction_id` primary key and foreign key, `attempts`, `next_attempt_at`, `expires_at`).
+### One stack per checkout
 
-Nothing is ever deleted from a claim list, because the runtime role holds no `DELETE` on any table. A schedule row is retired by the status of the transaction it belongs to: the claim joins `wager_transactions` and takes only rows that are still `PENDING_REFERENCE`, so a transaction that reached its outcome is invisible to every later sweep and its schedule row stays as the audit of how many attempts it took (ADR 0011).
+`docker/stack.sh` names the stack, derives its slot, and prints its three ports. The `Makefile` exports the project, image, and ports; `.env` builds the service URLs from them.
 
-A money column is `NUMERIC(20,2)` with the currency of its row beside it, which is what lets the composite key of `wallet_ledger_entries` tie an entry's currency to its wallet's. `wager_transactions` carries two: `currency` for the submitted amount and `observed_balance_currency` for the balance the outcome observed, because a `CURRENCY_MISMATCH` rejection is exactly the case where the two differ and one shared column would relabel one of them (`tx.observed-balance`).
+| Slot        | Published ports                    |
+| ----------- | ---------------------------------- |
+| `0`         | `3000`, `5433`, `4566`.            |
+| Other slots | A block of ten ports from `24000`. |
 
-## 8. Failure windows
+- The slot is the checkout's position in `git worktree list`. It is derived directly, without scanning host ports, so checkouts do not select the same slot.
+- `STACK_SLOT` pins a slot and is used as supplied.
+- An occupied port makes `docker compose` fail with its own error.
+- Two checkouts can run the gate at once. `make down` in one leaves the other running.
 
-| Window                                                   | Durable state                                                   | Recovery owner                                                                                                                                                                                                         | Duplicate behaviour                                                                                        | Evidence                  |
-| -------------------------------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------- |
-| Crash before the financial commit                        | Nothing                                                         | Caller resends with the same key; the queue redelivers                                                                                                                                                                 | None: nothing was recorded                                                                                 | OUTBOX-001                |
-| After commit, before the response reaches the caller     | Transaction, wallet, ledger, outbox rows                        | Caller resends with the same key; the reservation of the key committed with the financial effect, so the resend replays the stored outcome                                                                             | None: the resend is a replay, with the balance the outcome observed                                        | API-013                   |
-| After commit, before the queue acknowledgement           | Transaction, wallet, ledger, inbox row, outbox rows             | The redelivered message hits the inbox and is acknowledged                                                                                                                                                             | None: the inbox absorbs it, `wager_duplicates_detected_total` increments                                   | MSG-006                   |
-| After commit, before publication                         | Outbox rows pending                                             | Any publisher instance claims and publishes                                                                                                                                                                            | None                                                                                                       | OUTBOX-005                |
-| After a publisher claim, before publication              | Outbox rows pending, locks released by PostgreSQL on disconnect | The next publisher claims the rows                                                                                                                                                                                     | None                                                                                                       | OUTBOX-005                |
-| After publication, before `published_at` is committed    | Outbox rows still pending                                       | The next publisher republishes                                                                                                                                                                                         | Same `eventId`, one more copy per crash; consumers deduplicate; FIFO deduplication id helps                | OUTBOX-006                |
-| PostgreSQL unavailable                                   | Unchanged                                                       | HTTP answers `503` with `Retry-After`; consumers return each message with a growing visibility backoff until the redrive policy dead-letters it; publishers back off; readiness fails                                  | None                                                                                                       | API-006, MSG-008, OBS-004 |
-| SQS unavailable                                          | Financial state keeps committing; outbox backlog grows          | Publishers retry with backoff; consumers back off on receive errors; readiness fails; `wager_outbox_lag_seconds` rises                                                                                                 | None                                                                                                       | OUTBOX-007, OUTBOX-008    |
-| `SIGTERM`                                                | Whatever committed                                              | HTTP drains; consumer finishes the message in flight or hands back what it held; publisher finishes its batch; scheduler stops claiming and finishes or releases its attempt; a drain past the grace period exits `75` | None: nothing the drain left unfinished had committed, so a message is redelivered and a claim is released | MSG-010, OPS-007          |
-| Scheduler crash while reprocessing pending references    | Pending rows unchanged, claims released                         | The next scheduler run picks due rows                                                                                                                                                                                  | None: a row is claimed by one worker at a time                                                             | REF-002                   |
-| Transient failure while reprocessing a pending reference | Transaction unchanged; schedule row due again after backoff     | The next scheduler run retries; no limit                                                                                                                                                                               | None                                                                                                       | REF-006                   |
-| Permanent infrastructure error while reprocessing        | Transaction `FAILED` with `PROCESSING_FAILED`                   | Operations, with the transaction id; replays answer `500`                                                                                                                                                              | None                                                                                                       | TX-009, REF-006           |
-| Pending reference never resolved                         | Transaction `PENDING_REFERENCE` until expiry                    | Scheduler rejects it with `REFERENCE_NOT_FOUND` and emits the event                                                                                                                                                    | None                                                                                                       | REF-004                   |
+---
 
-Each row of that table has a suite of its own, and each of those suites opens one window with the rest of the system quiet. The two windows that produce a duplicate are also opened together, in one run of the service, by `test/concurrency/crash-recovery.test.ts`: three worker instances, a `SIGKILL` on the one that has committed a delivery and not acknowledged its message, a `SIGKILL` on the one whose publication reached the broker and whose commit never happened, and no step after that but the ordinary recovery of the surviving and restarted instances (MSG-006, MSG-011, OUTBOX-005, OUTBOX-006, REF-002, REF-005, CONC-005, RECON-004).
+## 5. Money and domain model
 
-Both kills are taken at a barrier and never at a moment the suite picked: the instance announces that it has reached the point, the drill asserts the durable state the kill is meant to interrupt and only then kills it, and a barrier no instance reached fails the run rather than passing it — a window that never opened must not read as a window that was survived. What the drill asserts of the worker window is the state this table names, the committed inbox row included: inbox completion commits with the money (ADR 0010), so what the window lacks is the acknowledgement and not the row. That is also what makes the redelivery absorbable, and the drill ends on every wallet it touched, rebuilt from its own ledger in SQL.
+### Money
 
-## 9. Trade-offs and limitations
+| Boundary                       | Representation                                                                    |
+| ------------------------------ | --------------------------------------------------------------------------------- |
+| Domain                         | `bigint` minor units.                                                             |
+| PostgreSQL                     | `NUMERIC(20,2)`, with a currency column beside each amount.                       |
+| Between layers and on the wire | Exact decimal strings. Integration events serialize money through `Money.toJSON`. |
 
-- The publisher holds a database connection while talking to the broker (bounded by batch size and timeout). Leases would free the connection at the price of lease tuning and a reaper; see ADR 0005.
-- Events are not ordered across publisher instances; consumers order by `walletVersion` or `occurredAt`.
-- Event publication, not financial processing, is this stack's throughput ceiling. Each processed operation commits one or two integration events in the same transaction, and the load experiment measured the publishers moving roughly 500–570 outbox rows per second against the ~2,200 per second that ~1,200 operations per second produce: the backlog peaked above 84,000 rows and the oldest unpublished row reached minutes of age before both gauges returned to zero once load stopped. It costs no correctness — a row is published at least once whatever the backlog (ADR 0005) — and it is visible in exactly the metric an operator alerts on (`outbox.lag-metrics`). The levers are the publisher's batch and poll interval and the number of `worker` instances, none of which this version tunes ([docs/load-experiment.md](docs/load-experiment.md)).
-- Reversal chains stop at one level: a `REFUND` can be rolled back, but a `ROLLBACK` cannot be reversed and a refunded bet cannot be refunded again after the refund was rolled back. One reversal per transaction, positive `LOSS` amounts and the binding of a provider transaction id to its first key are deliberate tightenings, listed with their compatibility consequences in the system contract (section 20.2).
-- The wallet lock is an explicit SQL statement in the repository rather than an ORM lock mode (ADR 0002).
-- Throughput on one wallet is bounded by the duration of its financial transaction (ADR 0002). The concurrency suite asserts nothing about it, and no figure in it is a latency target: what it shows for `conc.parallel-wallets` is that an operation on one wallet does not wait for an operation on another, observed by holding one transaction open while the other commits rather than by comparing how long two loads took. What that bound costs is measured instead: with half the traffic aimed at four of sixty wallets, those four answered with about twice the median and eleven to thirteen times the 99th percentile of the rest, and `wager_lock_conflicts_total` stayed at zero because nothing waited out the three-second ceiling ([docs/load-experiment.md](docs/load-experiment.md)).
-- Balances are bounded by the money column; a credit past `999999999999999999.99` is rejected with `BALANCE_LIMIT_EXCEEDED` (ADR 0001).
-- A `FAILED` transaction replays as `500` with the outcome body; a provider's generic retry policy may resend it until it reads the body, harmlessly.
-- A transaction that reaches `FAILED` emits no event in this version; it is visible through the read endpoints and metrics.
-- Pending references are resolved by polling with backoff, not by the arrival of the referenced transaction; worst-case latency after arrival is one backoff step (at most five minutes).
-- Reconciliation is on demand and per wallet: `POST /wallets/{walletId}/reconciliation` is the only way to ask for it, and no role sweeps every wallet on a schedule. The invariant is held by the schema at commit and asserted by every suite that moves money (`recon.final-invariant`), so the endpoint is an operator's tool for a wallet under suspicion rather than the system's own watchdog. A deployment that wants continuous assurance schedules calls against it; a role that did the sweep itself would have to decide what to do about a divergence it found, and this version deliberately leaves that decision to an operator (`recon.divergence-handling`).
-- The reads that name no provider are not scoped to one. The guard of AUTH-001 enforces that a caller may only act as the provider its payload or path names, which covers every submission and the provider lookup; `GET /wallets/{walletId}`, `GET /wallets/{walletId}/ledger` and `GET /wagering/transactions/{transactionId}` name none, so a caller holding one of those ids reads it whoever minted it. That is deliberate for the provider lookup's sibling — a transaction is one read model (`tx.identity`) — and it is the gap an authenticated deployment has to close, by scoping those three to the caller or by keeping them operator-only. PostgreSQL offers no help here: the runtime role sees every row and there is no row-level security.
-- Providers settle in BRL; other currencies are modelled but not operated.
-- Authentication is deferred; the extension point exists, the identity provider integration does not. An authentication failure therefore has no status and no code in this version: the guard is on the path and the implementation bound to it admits every request, so the `401`, the `403` and the codes that describe them arrive with the identity provider (#29) instead of sitting in the contract unreachable. What a test implementation of the port refuses with today is the framework's own `403`.
-- A malformed `X-Correlation-Id` is replaced with a generated one rather than refused as a `400`, so a response always carries an id an operator can search for. The conformance sweep of API-001 settled that as the contract's one exception to strict input rather than closing it: the header names a request for an operator and decides nothing about the money, and a financial operation must not fail over its own label. The response carries the id that was used.
-- A request that matches no operation of `docs/openapi.yaml` — an unknown path, a method a path does not serve — is answered by the framework with its own body rather than with problem details. `ErrorCode` is a closed set of refusals a provider acts on (`failure.request-errors`) and none of its codes describes a path that is not an operation; adding one would publish an identifier for a situation no provider can do anything about but read the document. What keeps the surface honest instead is the inventory of API-011, which compares the routes the application registers with the operations of the document in both directions, so a route that is not in the contract fails the gate rather than growing a body of its own.
+`Money` uses strict two-decimal parsing and has no rounding path. Inputs, arithmetic, and storage share the bound in ADR 0001. The maximum balance is `999999999999999999.99`; a credit above it is rejected with `BALANCE_LIMIT_EXCEEDED`.
 
-## 10. What is built
+### Wallet and ledger entry
 
-Everything sections 1 to 9 describe is implemented and verified: every required entry of
-[docs/acceptance.yaml](docs/acceptance.yaml) is `implemented` and `passing`, naming the suite that
-carries it, and `make check` runs all of them. Of the three `optional` entries, the load-test report
-(OPS-008) was built afterwards as an extension: `bun run test:load` drives three `api` instances and
-the two workers and [docs/load-experiment.md](docs/load-experiment.md) is its report. Double-entry
-bookkeeping (LEDGER-010) and OpenTelemetry tracing (OPS-009) are extensions this version
-deliberately does not build, each recorded with what building it would add.
-[docs/demonstrations.md](docs/demonstrations.md) walks the same guarantees against a running stack.
+`Wallet` opens at version 1, with or without an `OPENING` credit. It refuses:
 
-What follows is that implementation layer by layer, in the order it was built, because each layer
-is what the next one stands on. Nothing below is planned; where this version stops, section 9 says
-so.
+- A debit the balance cannot cover.
+- A different currency.
+- A different owner.
+- A credit beyond the money bound.
 
-The infrastructure foundation runs: the NestJS application on Bun with validated configuration, PostgreSQL with both roles, LocalStack with the three queues and the dead-letter redrive, the migration step and the two health endpoints, proven by the integration suite in `make check`. Compose starts one `api` and two `worker` instances from that one image (section 5).
+Each refusal returns its failure code. An applied operation returns a new wallet and its single `WalletLedgerEntry`; it does not mutate the existing wallet (ADR 0006). A refusal returns no wallet to write, so the balance, version, and ledger stay unchanged.
 
-The domain layer holds `Money` (`bigint` minor units, strict two-decimal parsing, no rounding path, the shared bound of ADR 0001) and, on top of it, the `Wallet` aggregate with `WalletLedgerEntry`. The wallet opens at version 1 with or without its `OPENING` credit, refuses an uncovered debit, a foreign currency, a foreign owner and a credit past the bound with the failure code each one carries, and answers an applied operation with the new state and the single entry that mirrors it (ADR 0006). The entry derives its direction from the kind, inverts it for a `ROLLBACK`, and exists only when its own arithmetic balances. Both are framework-free and driven by unit tests with no database, clock or port.
+The entry derives its direction from the operation kind. For `ROLLBACK`, it reverses the target kind's direction. An entry can exist only if its arithmetic balances.
 
-Beside them stands `WagerTransaction`, the audit log of a submission and the carrier of the outcome every replay returns. It is born `PENDING` with the reference requirement of its kind validated, and reaches `PROCESSED`, `PENDING_REFERENCE`, `REJECTED` or `FAILED` only through `markProcessed`, `markPendingReference`, `reject` and `fail`. One transition table defines both the legal moves and terminality; every outcome records the balance observed with it; `PROCESSING_FAILED` is the code `fail` alone owns; a terminal transaction refuses every transition and keeps its status, failure code, processed time and observed balance (ADR 0007). The trigger that re-enforces the same guarantee whatever issues the write now stands beside it (SCHEMA-024, SCHEMA-025).
+Both types are framework-free and unit-tested without a database, clock, or port.
 
-Beside them the domain holds the records the messaging layer commits with a financial change and the facts it announces. `InboxMessage` takes its `(consumer_name, message_id)` identity from the message body, so a producer resend is the same row whatever receipt id it arrives with, and it completes through `markProcessed` in the transaction that recorded the outcome. `OutboxMessage` is built from the event itself: it stores the envelope it was enqueued with, so every publication of the row is the same message, and `scheduleRetry` counts a failed publication and schedules the next attempt with the capped backoff of ADR 0005, with no state in which a row stops being retried. `IntegrationEvent` and its four subclasses fix `eventType` and `version` in the class, read `aggregateId` and `causationId` off the fact they record instead of taking them from the call site, and serialize every amount through `Money.toJSON`.
+### Wager transaction
 
-The domain now reaches PostgreSQL. The first migration creates the six tables with their columns and primary keys; one row class per table carries them, and the mappers translate a row into the aggregate its factory would have produced and back (ADR 0008). An amount crosses as the exact decimal string of a `NUMERIC(20,2)` column and is rebuilt by the domain parser with the currency column of its row, so the bound round-trips to the cent. The five persistence ports live in the application layer and are reachable only inside `UnitOfWork.transactional`, which forks an entity manager per operation, commits when the operation resolves and rolls back when it rejects.
+`WagerTransaction` is the submission audit record and the source of every replayed outcome.
 
-The schema now carries every guarantee a single row or a single table can decide. Five migrations after the one that creates the tables add the unique keys, including the two partial ones that admit a single processed reversal per target and a single opening credit per wallet; one check per vocabulary, range, consistency rule and arithmetic rule, with each monetary column closed to `NaN` by a check of its own; the foreign keys, among them the composite `(wallet_id, currency)` that ties an entry's currency to its wallet's; the trigger that refuses every update and delete of a ledger entry for every role and the one that freezes a terminal transaction row and the identity, context, kind, amount and currency of every transaction row, both raising SQLSTATE 23000 so a refusal by a trigger classifies like a refusal by a constraint; and the per-table privileges that leave `wagering_app` with `select` and `insert` on the ledger, no `delete` anywhere, nothing at all on the migration log and no DDL. Each migration is reversible, proven by taking the schema down to nothing and putting it back with the catalogue of columns, constraints, indexes, triggers, functions and grants unchanged.
+| State or action        | Rule                                                                                               |
+| ---------------------- | -------------------------------------------------------------------------------------------------- |
+| Creation               | Starts `PENDING`; validates the reference requirement for its kind.                                |
+| `markProcessed`        | Moves to `PROCESSED`.                                                                              |
+| `markPendingReference` | Moves to `PENDING_REFERENCE`.                                                                      |
+| `reject`               | Moves to `REJECTED`.                                                                               |
+| `fail`                 | Moves to `FAILED`. Only this transition uses `PROCESSING_FAILED`.                                  |
+| Every outcome          | Records the balance observed at that outcome.                                                      |
+| Terminal state         | Refuses every transition and preserves status, failure code, processed time, and observed balance. |
 
-A seventh migration ties a balance to the ledger that explains it, with the two constraint triggers of ADR 0003, deferred to commit. A wallet row mirrors the head of its ledger, the entry with the greatest `wallet_version`, or carries version 1 and balance `0.00` with no ledger at all; every appended entry continues its predecessor, is continued by its successor, and, having none, is the head the wallet row has to mirror. With the arithmetic check of each entry, the unique `(wallet_id, wallet_version)` and the immutability of the ledger beside them, a wallet's ledger is one contiguous chain from `0.00` to its head, so a balance change without its entry, an entry without its balance change, an entry squeezed between two others and a version gap are all impossible to commit, whatever issued the write (SCHEMA-017, SCHEMA-021 to SCHEMA-023, WALLET-005). Deferring is what makes the pair usable: inside one transaction the two halves of a change may be written in either order, and several moves of one wallet are judged on the state the transaction ends in. What the pair is not is a defence against a non-finite amount, because `NaN = NaN` holds and `NaN` propagates through addition, so a `NaN` chain satisfies both triggers and the per-row exclusion of each monetary column is the only thing that refuses it (SCHEMA-026).
+One transition table defines legal transitions and terminality (ADR 0007). Database triggers enforce the same restrictions for every writer (SCHEMA-024, SCHEMA-025).
 
-Operation identity now stands on top of both. The domain canonicalises exactly the business fields of a submission into RFC 8785 JSON and digests them into the `payloadHash` the row stores, so the same operation submitted through either entry point, in any field order, inside any envelope, is one hash; a submission's canonical bytes and the fixed vectors of the transport contract's own examples are what hold that in place. `WagerTransaction.matchesPayload` and `classifyReservationConflict` turn a key that is already taken into a replay, a payload mismatch or a bound provider transaction id, with nothing but the stored row and the submitted hash. Underneath, `WagerTransactionRepository.reserve` claims both unique keys with one `INSERT ... ON CONFLICT DO NOTHING` — the statement a financial transaction starts with, so the keys decide the race and the reservation commits exactly when the financial effect does — and reads back the row that holds the submitted key, which is what tells the two conflicts apart. Copies of one operation arriving together, and one arriving after the process that reserved it has exited, both end at one row and one replay decision taken from the database alone.
+### Messaging records
 
-On top of it the service now has its first behaviour. `OpenWallet` opens a wallet in the currency of its initial balance and commits, in one transaction, the wallet row, the `OPENING` transaction already `PROCESSED` under the reserved `system` provider, the `CREDIT` entry that mirrors the balance at `walletVersion` 1 and the outbox rows for the processed and balance-changed events; an initial balance of `0.00` commits the wallet alone, because a ledger entry records a movement and there is none. The aggregate decides the state before the transaction opens, so a balance and the entry that explains it are produced together or not at all, and a failure anywhere inside leaves no row in any table. A duplicate is nothing the use case looks for: the unique key on `(player_id, currency)` is the only check, which is why two instances opening the same wallet at the same moment end at one wallet and one `409`, and the repository is where that violation becomes `WalletAlreadyExistsError`. Beside it `GetWallet` reads one wallet and refuses an unknown id, so the absence is a use-case decision rather than a controller reading a `null`. `POST /wallets` and `GET /wallets/{walletId}` answer them, the clock and the id mint are ports so a test can name every timestamp and every row id an operation wrote, and every refusal of a request leaves as RFC 9457 problem details carrying its `ErrorCode` and the correlation id of the response header.
+| Type                                   | Responsibility                                                                                                                                                                                   |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `InboxMessage`                         | Uses `(consumer_name, message_id)` from the message body, independent of receipt ID. `markProcessed` completes it in the same transaction as the financial outcome.                              |
+| `OutboxMessage`                        | Stores the event's original envelope. Every publication of the row sends the same message. `scheduleRetry` counts failures and sets the capped backoff from ADR 0005; no state abandons retries. |
+| `IntegrationEvent` and four subclasses | Fix `eventType` and `version` in each class. Derive `aggregateId` and `causationId` from the recorded fact, rather than call-site arguments. Serialize amounts through `Money.toJSON`.           |
 
-`ReconcileWallet` closes the slice by proving the balance it produced. The stored balance is a materialized value and the ledger is the source of truth, so the report compares the two: credits minus debits summed by the database over `NUMERIC(20,2)` in one aggregate, the `balanceAfter` of the entry at the wallet's own version, and the signed `difference` that is the only place the service serializes a negative amount. `UnitOfWork.snapshot` is the boundary it runs in — `REPEATABLE READ` and `READ ONLY`, with no lock — which is two guarantees rather than a setting: the wallet row and its ledger are read from one committed state, so a balance change committed mid-report can neither be counted twice nor be missed by one side of the comparison, and `recon.divergence-handling`'s "never corrects a balance" is enforced by PostgreSQL instead of promised by the code. It reports and never repairs, because a service that quietly corrected a balance would destroy the only evidence of the defect that caused the divergence; a divergence is `consistent: false`, an error record carrying the wallet, the difference and the entries it was taken over, and the `wager_reconciliation_divergence_total` counter, through the `Logger` and `Metrics` ports, so the record is the same wherever reconciliation is invoked from. Stored data the domain cannot rebuild into money is the one case that produces no report: a `NaN` balance would satisfy every equality underneath this one, in SQL as in the schema, and the rehydration parser on both sides of the comparison is what refuses it (RECON-005). `POST /wallets/{walletId}/reconciliation` answers `200` either way, because a divergence is an answer about the wallet and not a refusal of the request. The same comparison, written independently in SQL, is the sweep every suite that moves money ends with (RECON-004).
+### Service IDs and ordering
 
-`SubmitWagerTransaction` is the financial core, and the one path both entry points take. Its transaction follows the order ADR 0002 fixes and nothing else: the reservation inserts the transaction row first, so the two unique keys of the submission decide the race and the key is committed by the same transaction as the money; the wallet row is then locked with `SELECT ... FOR NO KEY UPDATE`, the one statement the repository spells out because the ORM's lock mode would emit `FOR UPDATE` and deadlock against the `KEY SHARE` the reservation's foreign key holds; the aggregate decides; and the outcome, the balance under the version the lock read, the entry and the outbox rows are written and committed together. A reservation that loses is a replay or one of the two `409`s, taken from the stored row and the submitted hash alone, and it never reaches the wallet lock, so fifty copies of a bet cost one acquisition. A refusal the wallet decides comes back as a failure code the use case persists as a `REJECTED` row with the balance it observed and a single rejected event (ADR 0006), which is why "balance, ledger and version are unchanged" needs no assertion to be true: a refusal hands back no wallet to write. A submission for a wallet that does not exist cannot be written at all — the foreign key of the reservation is what says so, and the repository turns that one violation into `WalletNotFoundError` (`404`), because a `SELECT` before the insert would answer for the moment it ran and would displace the reservation from the head of the transaction.
+Service IDs are UUIDv7, generated with `Bun.randomUUIDv7` for index locality. They identify records; they do not establish order across instances because UUIDv7 is not monotonic across instances.
 
-Around it, every financial transaction opens with `SET LOCAL lock_timeout` from `LOCK_TIMEOUT_MS`, so a wallet is waited for with a ceiling, and the unit of work is the one place a database failure becomes the transient refusal of `api.transient-failure`: a closed list of SQLSTATE classes — lock timeout, serialization failure, deadlock, cancelled statement, unreachable or shutting-down server — becomes `ServiceUnavailableError`, answered as `503` with `Retry-After`, and everything else travels as what it is, so a defect never reaches a provider as a dependency to wait for. The classification wraps the commit as well, which is the point: a connection lost after `COMMIT` was sent is indistinguishable from one lost before, and both answer `503`. The resend settles it without a mechanism of its own, because the reservation committed with the effect — it replays the stored outcome if the commit landed and applies the operation once if it did not. `POST /wagering/transactions` answers all of it: one body across `200`, `202`, `422` and `500`, with the status read off the recorded outcome.
+- Order ledger entries by `walletVersion`.
+- Order outbox records by occurrence time and ID (`occurred_at, id`). The publisher's claim query uses `(occurred_at, event_id)`.
 
-The other four kinds now take that same path, and what separates them from a `BET` is the transaction they name. A reference is resolved on `(providerId, referenceExternalTransactionId)` after the wallet is locked (ADR 0009), which is an order the correctness depends on: a reference has to share the wallet, so every reversal of one target queues behind one lock and the read sees every reversal that committed rather than one another instance is still about to write. `WagerTransaction.refuseReference` then decides the whole eligibility matrix from the two transactions alone — the kind first, so a target nothing may reverse is refused for what it is and not for the context it happens to carry; then the context, currency included, so no amount is ever compared across currencies; then the status; then the amount a reversal has to match — and `movement` answers with the direction its kind applies, which for a `ROLLBACK` is the inverse of the kind it reverses. The one rule that is not about the pair is a question about other rows, whether a processed `REFUND` or `ROLLBACK` already reverses the target: it is counted with the predicate of the partial unique index, under that same lock, because letting the index raise its violation would abort the transaction that was about to persist the `REFERENCE_ALREADY_REVERSED` rejection the contract promises. A `LOSS` is answered with no movement at all — the owner and the currency are still checked, and nothing else is written, so balance, version and ledger stand still by construction rather than by assertion — and a credit that would cross `money.bound` is the persisted rejection ADR 0001 planned for. Two instances refunding one bet, each in a process of its own, end at one credit and one `422`; every suite that moves money still reconciles the wallets it touched against their ledgers.
+---
 
-A reference that has not arrived, or has not reached an outcome, parks the transaction as `PENDING_REFERENCE` with the balance it observed and answers `202` with `Location`, and the recovery of that transaction now stands beside it (ADR 0011). Parking commits the row, its place in the claim list — `pending_reference_schedule`, carrying the attempts, the next one a second away and the window an hour away, both counted from the receipt — and the one `WagerTransactionPendingReference` that announces the wait. `ReprocessPendingReference` is the sweep: it claims the oldest due transaction with `SELECT ... FOR UPDATE SKIP LOCKED`, one row per database transaction, locks its wallet and attempts it through `ApplyWagerOperation`, the financial step extracted from the submission so that a scheduled attempt and a first arrival record outcomes through one code path. A reference that has arrived is therefore applied under every rule of ADR 0009, a reference rule that refuses it produces the same `REJECTED` row it would have produced on arrival, and a reference still missing is recorded pending again, counted, and spaced by `min(1s × 2^attempts, 5m)` with no event. The window is consulted only after an attempt that ran and found nothing, which is what makes the first attempt after it closes the end of the transaction: `REJECTED` with `REFERENCE_NOT_FOUND` and its event, unless the reference did arrive, in which case nothing is missing to reject it for. The claim is the lock, so a worker killed mid-attempt releases it with its connection and the row is due again, unchanged, for whoever sweeps next, and several workers never pick the same row — proven by a worker holding a claim in a process of its own while another skips it, and by three worker processes draining one backlog with exactly one attempt recorded per transaction. A failure is classified instead of retried blindly: the transient refusal the unit of work already raises, and anything nobody classified, change nothing on the transaction and only reschedule the attempt with the window left exactly where it was, while an `ApplicationError` of any other kind or a `DomainError` — an unknown wallet, stored state the domain cannot rebuild — marks the transaction `FAILED` with `PROCESSING_FAILED`, logged, emitting nothing and replaying as `500`. The driver is the `worker` role: `PendingReferenceScheduler` sweeps on `PENDING_REFERENCE_SWEEP_INTERVAL_MS` and, on `SIGTERM`, stops claiming between attempts and finishes the one it holds — or exits with it uncommitted, which leaves the row due at once for another instance, since the claim never outlives its transaction (ADR 0013).
+## 6. Transaction processing
 
-`PublishOutbox` relays what a committed operation left behind. One cycle is one transaction: it claims at most `OUTBOX_BATCH_SIZE` due rows with `SELECT ... FOR UPDATE SKIP LOCKED` ordered by `(occurred_at, event_id)`, sends each row's stored envelope to `wager-integration-events.fifo` under `OUTBOX_PUBLISH_TIMEOUT_MS` with the wallet as `MessageGroupId` and the event id as `MessageDeduplicationId`, writes `published_at` on what the broker took and the capped backoff on what it refused, and commits. The claim is the only coordination there is: concurrent publishers receive disjoint batches by construction, a publisher that dies hands its rows back when PostgreSQL closes its connection, and the predicate `published_at is null` can match no uncommitted row, so "publish only after commit" is the database's property rather than the publisher's good behaviour. Sending before the commit that records the send is deliberate: the reverse order turns a crash in that window into a lost event, this order turns it into one more copy of the same message, which a consumer deduplicating by `eventId` absorbs. Nothing deletes or abandons a row; from the tenth attempt the publisher writes `outbox.publication-stalled` at error level while the retries continue, and the backlog metrics that raise the alert condition are the two gauges measured on every scrape (OUTBOX-008). `OutboxPublisher` is the loop around it: the next cycle starts at once after one that claimed anything, a cycle that found nothing waits `OUTBOX_POLL_INTERVAL_MS`, a cycle that failed is logged and followed by another, and `stop` resolves only after the batch in flight has committed or rolled back. The `worker` role starts that loop on boot and drains it on `SIGTERM`, so a publication that was sent is always recorded before the process exits; beside the deployment it runs in its own suites — two processes draining five thousand rows with claims that add up to exactly the backlog, a publisher `SIGKILL`ed while holding a batch whose rows the next instance publishes, a lost commit republishing the identical message for a reference consumer that applies it once, and an unreachable broker counting capped attempts without losing a row.
+### Operation identity and replay
 
-The queue is now the second entry point, and it is not a second implementation. `WagerTransactionsConsumer` validates a message against `WagerTransactionRequested`, builds the very command the controller builds and calls the same `SubmitWagerTransaction` instance the composition root hands the controller; what it adds is a delivery identity. `deliver` claims the inbox row for `(consumer_name, message_id)` with an `INSERT ... ON CONFLICT DO NOTHING` as the first statement of the transaction, before the reservation, so the delivery is decided by the primary key rather than by a look-then-write two deliveries would both pass, and completes that row last in the same transaction (ADR 0010). A row already there with the same content hash is a redelivery: nothing is written, the duplicate is counted and the message is deleted; with another hash it is a reused message id, which rejects the transaction and therefore leaves the first delivery's effects untouched. The hash it compares is taken over the message's `data`, so the idempotency key is inside it and the envelope stamps are not. The message is deleted only after the commit returned, which is why a worker killed in between — proven with a real process that exits after committing — costs one redelivery and no second effect, and why the same operation arriving over HTTP first is replayed on the queue and applied once. The correlation id travels from the message, or from its `messageId` when it carries none, into every event the operation produced.
+Every operation has provider-scoped idempotency keys and an external transaction ID bound to its first key (ADR 0004).
 
-What is done about a delivery is decided by its class, and the class is decided before anything is done (`msg.classification`). A business outcome, whatever it was, is terminal for the message and is acknowledged. A transient failure — an unreachable database, a lock wait, a serialization failure, and any error no rule classifies, so that a defect surfaces as a retry rather than as a message acknowledged as if it had been applied — is handed back with `ChangeMessageVisibility` set to a wait that doubles per receive and stops at `SQS_RETRY_BACKOFF_MAX_SECONDS`; the receive count is the broker's, so nothing is remembered between deliveries and the queue's redrive policy, not this consumer, is what ends the sequence after five receives. A permanent failure — a body that fails validation, a reused message id, an unknown wallet — is forwarded to `wager-transactions-dlq.fifo` with its body, group and deduplication id unchanged and only then deleted, so no refusal of that send can delete the message: the forward precedes the delete, and a message the broker would not take stays where the redrive policy will dead-letter it. Every broker call that acts on a message is on that footing — a refused call leaves the message in the queue, is reported as what it was, and does not fail the rest of the batch — which is why the report of a delivery names the state of the message and not the intention behind it. A failed `ReceiveMessage` is the one call with no message to retain and no delivery to report, so it is answered a level up: it leaves `poll` as an error, `WorkerLoop` logs it as `wager.poll-failed` and counts the cycle as one that found nothing, and the consumer receives again after the idle interval. A broker that stays unreachable fails the next receive in the same way, which is the backoff that path needs and the only one it has; nothing was taken from the queue, so nothing is at stake while it retries. The receive a drain aborts is not that case — it answers with no messages instead of an error, because the drain is what asked for it. None of it depends on the two broker features the contract calls optimizations: with a reversal delivered before the operation it reverses the reversal is parked, and with a duplicate the broker did not filter the inbox row is what absorbs it.
+`payloadHash` is SHA-256 over RFC 8785 canonical JSON of the validated business fields. The same operation hashes identically across HTTP and queue submissions, field orders, and envelopes.
 
-The concurrency claim is now proven rather than asserted. Three instances, each a process of its own with its own heap, entity manager and connection pool, are armed with the operations of a scenario and then released on an instant they agree on, and PostgreSQL is the only thing they share; a race between promises in one runtime would prove nothing, because one event loop never interleaves two transactions. Two bets of `80.00` reaching a wallet holding `100.00` end, twenty rounds running, with one `PROCESSED`, one `REJECTED INSUFFICIENT_BALANCE`, balance `20.00`, one `DEBIT` beside the opening credit, and retries of both that replay instead of debiting again. Fifty copies of one bet end at one debit and forty-nine replays, all of them carrying the transaction id of the single copy that applied — and the one that applied runs in one instance while the others replay it, which is the multi-instance guarantee stated as an observation. Two hundred wallets taking twenty bets each all apply, every wallet ending at its own twenty debits and nothing else's, and that the wallet is the unit of concurrency is observed rather than timed: one wallet's bet is stopped between its last statement and its commit, and another wallet's bet is applied and committed while it waits — from another process, where a lock wider than the row would stop it, and from the same instance, where an application mutex would — so the case fails when parallelism narrows and never because a runner was busy. A mixed load of bets, duplicates and both reversal kinds naming the same targets leaves PostgreSQL's own `deadlocks` counter untouched, which is stronger than the absence of an error: a deadlock something retried would leave every outcome looking correct. And reconciliation runs continuously against a wallet three instances are betting on, every report consistent and the load no more expensive than the same load unobserved, because the report takes no lock.
+| Responsibility                             | Owner                                                                                                                           |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| Select business fields and canonical bytes | Domain functions `canonicalJson` and `payloadHashOf`. Property names sort by UTF-16 code unit, as RFC 8785 requires.            |
+| Normalize money                            | The domain money parser ensures one spelling per value before hashing. The result does not depend on which validator ran first. |
+| Compute the digest                         | Application function `sha256Hex`, using `node:crypto`. The domain imports no runtime module; a pure digest needs no adapter.    |
+| Verify identical results                   | Fixed vectors, including RFC vectors and the transport contracts' examples.                                                     |
 
-Two of those rules are not about a load, so they are not proven by one. The version guard is shown doing the work it exists for: two sessions that both read a wallet without locking it and both write the balance they computed, where one update matches no row and the balance it carried is refused instead of overwriting the other's. And the lock mode is shown against its own alternative — ten pairs of submissions that reserve and then ask for the wallet, serializing with consecutive versions through the repository's `FOR NO KEY UPDATE` and deadlocking with SQLSTATE `40P01` in every pair through the `FOR UPDATE` that ADR 0002 rejected, which is the paragraph of that ADR turned into a control. A lock wait past `LOCK_TIMEOUT_MS` is counted as `wager_lock_conflicts_total` in the unit of work, where it is classified, so a request answered `503` and a message left for a later receive raise the same counter instead of each entry point counting what the other does not. What no race test could show is that no second writer exists, so three rules are checked over the source inside the gate: no advisory lock and no table lock anywhere; every row lock one of the three reviewed ones in its reviewed mode, the wallet's, the outbox claim's and the scheduler's; and the wallet repository as the one writer of the table, its lock taken by the two operation paths alone and its guarded update issued from the one step they share.
+`WagerTransactionRepository.reserve` claims both unique keys with one `INSERT ... ON CONFLICT DO NOTHING`. It then reads the row holding the submitted key.
 
-The service now answers for what it recorded. `GetWagerTransaction` reads one transaction by the service id or by the provider identity of `tx.identity`, one use case because it is one read model: a transaction is not a different thing for having been reached by the id its provider minted. What the provider path cannot do is take a service id — the lookup it builds has no place for one — so no provider reaches another's row by guessing one, and `system` is accepted there precisely so the internal `OPENING` credits are readable, their `externalTransactionId` being the wallet id. `PageWalletLedger` pages a wallet's ledger in ascending `walletVersion`, the only ordering key it has: the cursor names the last version returned, so entries committed while a caller holds it land beyond it and every entry appears on exactly one page. An offset could promise neither — it shifts under every append, and it pays for depth by scanning what it skips — while this is a range scan of the unique `(wallet_id, wallet_version)` index the chain triggers already require, so the hundredth page costs what the first one does. Whether another page exists is answered by reading one entry past the page, which is what makes `nextCursor` null exactly on the last page instead of whenever a page came back short, and means every cursor the service issues has an entry behind it. Both reads run in the read-only snapshot, so they take no lock, cannot write, and paging a hot wallet costs its processing nothing; the wallet row is read before its entries because without it an unknown id and a wallet opened at `0.00` would both answer with an empty page, and a caller could not tell a typo from a ledger with nothing in it yet. `GET /wagering/transactions/{transactionId}`, `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` and `GET /wallets/{walletId}/ledger` answer them: the full transaction view with its conditional members present exactly when the row carries them, and the page as `items` plus `nextCursor`, with `limit` bounded by the adapter as `VALIDATION_FAILED` at `/query/limit` and a cursor the service did not issue refused as `INVALID_CURSOR` rather than silently restarting from the first page, which a caller could not tell from a cursor that worked.
+`WagerTransaction.matchesPayload` and `classifyReservationConflict` use only that stored row and the submitted hash to return one of three results:
 
-The operational surface is now the one an operator debugging a duplicate debit needs. Every line the service writes is a JSON record carrying the identity fields it knows, and the correlation id is bound once per unit of work — by the HTTP middleware before any handler runs, so a payload the body parser refuses carries one too, and by the consumer for the whole handling of one message — rather than threaded through the use cases, which is what keeps a transport identity out of every financial signature. Work that outlives its arrival carries that arrival's id and not a fresh one: a publication reads it off the stored envelope, and an attempt at a parked transaction off the `correlation_id` the claim row recorded when the transaction was parked, which is the column this slice added and the reason a recovery an hour later is still searchable under the request that caused it. No line carries an amount, a balance or a body, because the adapter every line passes through redacts both a field named for money and any value shaped like one; the reconciliation divergence record reaches the sink through a method of its own, so the single documented exception is a type and a grep rather than a convention (ADR 0012). The metrics are raised by the paths that own them — the submission use case counting recorded outcomes and replays, the inbox claim counting absorbed redeliveries and reused message ids, the consumer counting a visibility the broker accepted and a dead-letter forward it completed, the publisher and the scheduler counting their own backoffs, the unit of work counting a lock wait, reconciliation counting a divergence — and `GET /metrics` renders them after measuring the outbox backlog, which is what makes `wager_outbox_pending` and `wager_outbox_lag_seconds` answerable on an instance whose publisher is stopped. What the suites assert is the output itself: the lines are captured off the sink the running service writes to, so "every line is JSON with the identity fields" and "no line carries the amount" are statements about the service and not about a logger a test passed in.
+| Conflict result                              | Behaviour                                                        |
+| -------------------------------------------- | ---------------------------------------------------------------- |
+| Same operation                               | Replay the persisted outcome, including the balance it observed. |
+| Same key, different payload                  | Refuse with an idempotency payload conflict (`409`).             |
+| External transaction ID bound to another key | Refuse with an external-ID conflict (`409`).                     |
 
-The service is deployable: one image runs as `api`, `worker` or `all`, Compose starts one `api` and two `worker` instances against PostgreSQL and LocalStack, and every role drains on `SIGTERM` within its grace period (ADR 0013).
+The reservation commits with the financial effect. Concurrent copies, and copies received after the reserving process exits, resolve from the database alone.
 
-The HTTP surface is now held to its own document rather than described by it. The service serves `docs/openapi.yaml` byte for byte at `/docs-json` and renders that same route at `/docs`, and three comparisons in the gate keep the two from drifting: the routes the application registers against the operations of the document, in both directions, so a route outside the contract and an operation without a route each fail; every response of every operation, every event the outbox holds and every example the documents carry, against the schema the document declares for it, with a walk over each payload that refuses a numeric amount wherever it appears; and the code enumerations in the domain, in the status mapping of the adapter, in both transport contracts and in the two tables of the system contract, which have to be one set with a caller action per row. The status classes got the same treatment: a matrix of every operation against the four situations a request is refused in — malformed, unknown, conflicting, transient — exercised against the running service, with the transient column driven by a second instance whose database is not there, and with `422` held to what it means by the one case that produces it and the reconciliation that deliberately does not. The sweep confirmed the surface instead of correcting it, which is the outcome a conformance check wants and not the one it assumes.
+### Submission sequence
 
-Authentication is deferred and the extension point is on the path. `ProviderIdentityPort` is an application port, the HTTP guard asks it who the caller is, and the implementation this version binds answers nobody, so every request is admitted. A deployment that authenticates binds another implementation at the composition root and changes nothing else: the suite proves it by building the same application twice, once with the shipped binding and once with one that identifies its caller, and showing that a payload naming another provider is then refused before any wallet is read while the same payload naming the identified provider is applied. The operator's three endpoints and the two documentation routes carry an exemption declared on the route itself, so a route added later is covered unless it says otherwise, and the queue never meets the guard at all — a message naming a wallet of another player is still rejected with `WALLET_PLAYER_MISMATCH`, which is what makes the queue an internal channel rather than a trusted payload.
+Both entry points use `SubmitWagerTransaction`. The financial transaction follows this order (ADR 0002):
 
-Last, a kill loses nothing, and that is shown rather than argued. A drill runs three worker instances and kills them where recovery is hardest: one that has committed a delivery and not yet acknowledged its message, and one whose publication reached the broker while the commit that would record it never happened. Both kills are `SIGKILL`, and both are taken at a barrier — the instance says it has reached the point, the drill asserts the state the kill is about to interrupt, and a barrier no instance reached fails the run instead of passing it. After that nothing is driven: the survivors and the restarted instances absorb the redelivery, republish the row the dead publisher had sent under the same event id, and apply the reversal that was parked waiting for an operation that arrived during the kills. What it costs is duplicates and nothing else — one debit, one entry, one application of each event by a consumer deduplicating by event id, every transaction terminal, and every wallet the drill touched equal to the balance rebuilt from its own ledger in SQL. The duplicates are sent with deduplication ids the broker has never seen, so what absorbs them is the database and not a window in the broker.
+1. **Set the lock timeout.** Run `SET LOCAL lock_timeout` using `LOCK_TIMEOUT_MS`.
+2. **Reserve the transaction.** Insert the transaction row so its unique keys decide the race. For queue delivery, claim the inbox row before this reservation.
+3. **Lock the wallet.** Issue `SELECT ... FOR NO KEY UPDATE`.
+4. **Decide the outcome.** Resolve any reference and apply the domain rules.
+5. **Write the result.** Persist the outcome, the balance guarded by the version read under the lock, the ledger entry, and the outbox rows.
+6. **Commit together.** Queue delivery also completes its inbox row in this commit.
 
-The order the work was done in is in [docs/implementation-plan.md](docs/implementation-plan.md), which is now a record rather than a plan; the scoreboard it names is [docs/acceptance.yaml](docs/acceptance.yaml).
+The reservation's foreign key holds `KEY SHARE`. `FOR NO KEY UPDATE` is compatible with that lock; `FOR UPDATE` can deadlock against it.
+
+A losing reservation returns a replay or one of the two `409` conflicts before taking the wallet lock. Fifty copies of one bet therefore require one wallet-lock acquisition.
+
+| Situation                      | Recorded result                                                                                                        |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| Wallet applies the operation   | New wallet state, ledger movement, outcome, and events commit together.                                                |
+| Wallet refuses a business rule | A `REJECTED` transaction with the observed balance and one rejected event. No balance, ledger, or version change.      |
+| Wallet does not exist          | The reservation's foreign key prevents insertion. The repository maps that violation to `WalletNotFoundError` (`404`). |
+
+There is no wallet lookup before reservation: it would describe an earlier moment and move the reservation away from the start of the financial work.
+
+### Database failures and uncertain commits
+
+The unit of work maps a closed list of database failures to `ServiceUnavailableError`:
+
+- Lock timeout.
+- Serialization failure.
+- Deadlock.
+- Cancelled statement.
+- Unreachable or shutting-down server.
+
+HTTP returns `503 SERVICE_UNAVAILABLE` with `Retry-After` (`api.transient-failure`). Other errors retain their classification, so a defect is not presented as a dependency to wait for.
+
+Classification includes commit. If the connection disappears after `COMMIT` is sent, the service cannot know whether the commit landed and returns `503`. Resending with the same key resolves either case: replay if it committed; apply once if it did not.
+
+`POST /wagering/transactions` uses one outcome body for `200`, `202`, `422`, and `500`. The recorded outcome determines the status.
+
+### References, reversals, and `LOSS`
+
+After locking the wallet, resolve a reference by `(providerId, referenceExternalTransactionId)` (ADR 0009). A reference must share the wallet, so reversals of one target serialize behind that wallet's lock. Each lookup sees reversals that have already committed.
+
+`WagerTransaction.refuseReference` checks eligibility in this order:
+
+1. **Kind:** refuse a target that cannot be reversed, regardless of its context.
+2. **Context, including currency:** never compare amounts across currencies.
+3. **Status.**
+4. **Amount:** a reversal must match the required target amount.
+
+`movement` supplies the operation's direction. A `ROLLBACK` uses the inverse direction of the target kind.
+
+Before applying a reversal, count processed `REFUND` or `ROLLBACK` rows using the partial unique index's predicate under the same wallet lock. This permits a persisted `REFERENCE_ALREADY_REVERSED` rejection. Waiting for the unique index to fail would abort the transaction that must record that rejection.
+
+| Case                              | Behaviour                                                                                         |
+| --------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Two instances refund one bet      | One credit and one `422`.                                                                         |
+| `LOSS`                            | Check owner and currency, but produce no movement. Balance, version, and ledger remain unchanged. |
+| Credit exceeds `money.bound`      | Persist the rejection specified by ADR 0001.                                                      |
+| Reference missing or not terminal | Park as `PENDING_REFERENCE`.                                                                      |
+
+### Pending-reference recovery
+
+Parking a transaction commits:
+
+- `PENDING_REFERENCE` and its observed balance.
+- A `pending_reference_schedule` row containing attempts, next attempt, expiry, and the original correlation ID.
+- An initial attempt time one second after receipt and an expiry one hour after receipt.
+- One `WagerTransactionPendingReference` event.
+
+The submission returns `202` with `Location`.
+
+`ReprocessPendingReference` handles one oldest due row per database transaction:
+
+1. Claim it with `SELECT ... FOR UPDATE SKIP LOCKED`.
+2. Lock its wallet.
+3. Run `ApplyWagerOperation`, the same financial step used by submission.
+4. Record the result and commit.
+
+| Attempt result                               | Action                                                                                                                                                            |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Reference arrived and is eligible            | Apply it under all reference rules.                                                                                                                               |
+| Reference arrived but is ineligible          | Persist the same `REJECTED` outcome as an initial submission.                                                                                                     |
+| Reference still missing, window open         | Keep it pending, increment attempts, and schedule `min(1s × 2^attempts, 5m)`. Emit no new pending event.                                                          |
+| Reference still missing, window expired      | Reject with `REFERENCE_NOT_FOUND` and emit the rejection event.                                                                                                   |
+| Transient or unclassified error              | Leave the transaction unchanged. Reschedule with backoff and keep the original expiry. Transient retries have no limit.                                           |
+| Other `ApplicationError`, or a `DomainError` | Mark `FAILED` with `PROCESSING_FAILED`, log it, emit no event, and replay as `500`. Examples include an unknown wallet or stored state the domain cannot rebuild. |
+
+Check expiry **after an attempt runs and finds the reference missing**. A reference that arrived before an overdue attempt can still be applied; expiry alone does not reject it.
+
+The row lock is the claim. A crash releases it with the connection and leaves the uncommitted attempt unchanged and due. Other workers skip locked rows. Tests cover a held claim in a separate process and three processes draining one backlog with one attempt per transaction.
+
+`PendingReferenceScheduler` runs in the `worker` role on `PENDING_REFERENCE_SWEEP_INTERVAL_MS`. During shutdown it stops claiming between attempts and finishes its current attempt, or exits without committing it so another instance can retry immediately (ADRs 0011 and 0013).
+
+---
+
+## 7. Wallets and read operations
+
+### Endpoints
+
+| Endpoint                                                                    | Use case                                    |
+| --------------------------------------------------------------------------- | ------------------------------------------- |
+| `POST /wallets`                                                             | `OpenWallet`                                |
+| `GET /wallets/{walletId}`                                                   | `GetWallet`                                 |
+| `GET /wagering/transactions/{transactionId}`                                | `GetWagerTransaction`, by service ID        |
+| `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` | `GetWagerTransaction`, by provider identity |
+| `GET /wallets/{walletId}/ledger`                                            | `PageWalletLedger`                          |
+| `POST /wallets/{walletId}/reconciliation`                                   | `ReconcileWallet`                           |
+
+### Open a wallet
+
+`OpenWallet` creates a wallet in the initial balance's currency. The aggregate prepares the state before the database transaction opens, producing the balance and its explaining entry together.
+
+| Initial balance     | Commit                                                                                                                                                            |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Greater than `0.00` | Wallet; a `PROCESSED` `OPENING` transaction under reserved provider `system`; a `CREDIT` entry at `walletVersion` 1; processed and balance-changed outbox events. |
+| `0.00`              | Wallet only. There is no movement to record.                                                                                                                      |
+
+A failure anywhere rolls back all rows. The unique `(player_id, currency)` key detects duplicate wallets; there is no preliminary duplicate lookup. Concurrent opens produce one wallet and one `409`, mapped by the repository to `WalletAlreadyExistsError`.
+
+`GetWallet` returns a wallet or raises `WalletNotFoundError`; the use case, rather than the controller, decides what absence means. `Clock` and `IdGenerator` are ports so tests can fix every timestamp and row ID.
+
+Request refusals use RFC 9457 problem details with an `ErrorCode` and the same correlation ID as the response header.
+
+### Read a transaction
+
+`GetWagerTransaction` exposes one read model through two identities (`tx.identity`): service ID or provider ID plus external transaction ID.
+
+- The provider lookup has no service-ID field. It cannot use a guessed service ID to reach another provider's row.
+- Provider `system` is accepted so callers can read internal `OPENING` credits. Their `externalTransactionId` is the wallet ID.
+- The result is the full transaction view. Conditional members appear exactly when the stored row contains them.
+
+The separate service-ID route is not provider-scoped. Its access limitation is documented under [authentication and read access](#authentication-and-read-access).
+
+### Page a wallet's ledger
+
+`PageWalletLedger` reads entries in ascending `walletVersion` and returns `items` plus `nextCursor`.
+
+| Rule                                                | Reason                                                                                       |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| The cursor names the last returned version.         | Appended entries fall after it; each entry appears on exactly one page.                      |
+| Use the unique `(wallet_id, wallet_version)` index. | A range scan avoids offset scanning. Page depth does not add skipped-row work.               |
+| Read one entry beyond the page.                     | `nextCursor` is `null` exactly on the last page; every issued cursor points to a real entry. |
+| Read the wallet before its entries.                 | An unknown wallet must differ from a wallet opened at `0.00` with an empty ledger.           |
+| Use a read-only snapshot.                           | Reads take no wallet lock and cannot write or block financial processing with that lock.     |
+
+Offset pagination adds skipped-row cost and does not provide the same append-stable boundary. The hundredth cursor page uses the same indexed access pattern as the first.
+
+The HTTP adapter owns the cursor format: `base64url("v1:" + walletVersion)`. Clients treat it as opaque. The use case receives and returns a wallet version, so no internal query parses a cursor. The `v1` prefix allows future format changes without migrating stored values.
+
+The decoder re-encodes the decoded value and requires an exact match. This prevents lenient base64 decoding from accepting a crafted position the service never issued.
+
+- Invalid or out-of-bounds `limit`: `VALIDATION_FAILED` at `/query/limit`.
+- A cursor the service did not issue: `INVALID_CURSOR`. It never silently restarts at page one.
+
+Transaction lookup and ledger paging both use the read-only snapshot.
+
+### Reconcile a wallet
+
+The ledger is the source of truth; the stored balance is materialized. `ReconcileWallet` compares:
+
+1. The stored wallet balance.
+2. Credits minus debits, summed in one database aggregate over `NUMERIC(20,2)`.
+3. The `balanceAfter` of the ledger entry at the wallet's own version.
+4. The signed `difference` between the compared balances.
+
+`difference` is the only place the service serializes a negative amount.
+
+`UnitOfWork.snapshot` uses `REPEATABLE READ` and `READ ONLY`, without locks. The wallet and ledger come from one committed state, even if another transaction commits during the report. PostgreSQL also prevents reconciliation from changing a balance.
+
+| Result                                | Response and operational effect                                                                                                                    |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Consistent                            | `200` with the report.                                                                                                                             |
+| Divergent                             | `200` with `consistent: false`; an error log with wallet, difference, and the entries examined; increment `wager_reconciliation_divergence_total`. |
+| Stored data cannot be parsed as money | No report. The domain parser rehydrates both sides of the comparison and rejects unparseable money, including `NaN` (RECON-005).                   |
+
+A divergence describes the wallet; it is not a refused request, so it does not return `422`. Logging and metrics pass through the application ports and behave the same wherever reconciliation is invoked.
+
+Reconciliation reports and never repairs. Automatic correction would destroy evidence of the defect. It is available only through `POST /wallets/{walletId}/reconciliation`; no role schedules a sweep of all wallets. Deployments that need continuous checks schedule calls and leave divergence handling to operators (`recon.divergence-handling`).
+
+Every suite that moves money ends with an independent SQL comparison of each touched wallet and its ledger (RECON-004, `recon.final-invariant`).
+
+---
+
+## 8. Messaging
+
+### Queue delivery and inbox identity
+
+`WagerTransactionsConsumer` validates `WagerTransactionRequested`, builds the same command as the controller, and calls the same `SubmitWagerTransaction` instance supplied by the composition root. Queue delivery adds identity and acknowledgement handling, not another financial implementation.
+
+The use case's `deliver` method wraps the shared financial body:
+
+1. Claim `(consumer_name, message_id)` with `INSERT ... ON CONFLICT DO NOTHING` as the first delivery statement, before transaction reservation.
+2. Compare an existing row's content hash, if the claim conflicts.
+3. Run the shared financial work.
+4. Complete the inbox row last, in the same commit as the outcome.
+5. Delete the queue message only after commit returns.
+
+| Inbox result                      | Action                                                                            |
+| --------------------------------- | --------------------------------------------------------------------------------- |
+| New identity                      | Process and complete it with the financial transaction.                           |
+| Existing identity, same hash      | Count a redelivery, write nothing, and delete the message.                        |
+| Existing identity, different hash | Raise `InboxPayloadConflictError`. The first delivery's effects remain unchanged. |
+
+The primary key decides concurrent claims; there is no look-then-write race (ADR 0010). The hash covers message `data`, including the idempotency key, and excludes envelope timestamps.
+
+A worker killed after commit and before delete costs one redelivery and no second financial effect. An operation first submitted over HTTP is replayed when it arrives on the queue. The correlation ID comes from the message, falling back to its `messageId`, and is carried into every event it produces.
+
+### Classify before acting
+
+Delivery classification precedes any acknowledgement, retry, or forwarding (`msg.classification`).
+
+| Delivery class                    | Includes                                                                                | Action                                                                                                                      |
+| --------------------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Business outcome                  | Any recorded business outcome.                                                          | Acknowledge; the message is complete.                                                                                       |
+| Transient or unclassified failure | Unreachable database, lock wait, serialization failure, or an error no rule classifies. | Use `ChangeMessageVisibility` to retry. Unknown errors remain retryable so a defect cannot be acknowledged as applied work. |
+| Permanent failure                 | Invalid body, reused message ID, or unknown wallet.                                     | Forward to `wager-transactions-dlq.fifo`, then delete from the input queue.                                                 |
+
+Retry delay doubles per receive and is capped by `SQS_RETRY_BACKOFF_MAX_SECONDS`. The broker's receive count drives it; the consumer stores no retry state. The queue's redrive policy ends retries after five receives.
+
+Dead-letter forwarding preserves the body, group, and deduplication ID. Forwarding must succeed before deletion. If the broker refuses the forward, the message remains for the redrive policy to dead-letter.
+
+Every message-level broker call follows the same rule: a refusal retains the message, reports the actual result, and does not fail the rest of the batch. Delivery reports describe the resulting message state, not the intended action.
+
+### Receive failures and shutdown
+
+- A failed `ReceiveMessage` has no message to retain and no delivery result. `poll` raises the error; `WorkerLoop` logs `wager.poll-failed`, treats the cycle as empty, and waits the idle interval before receiving again.
+- Continued receive failures follow that same idle delay. No message has been taken, so this path needs no message-level retry state.
+- A receive aborted by shutdown returns no messages and no error.
+- During shutdown, the consumer abandons the receive in flight and returns any messages in its batch that it has not started.
+
+FIFO ordering and broker deduplication are optimizations, not correctness requirements. A reversal arriving before its target is parked. A duplicate the broker lets through is absorbed by the inbox.
+
+### Outbox publication
+
+`PublishOutbox` publishes events left by committed operations (ADR 0005). Its database transaction is separate from the financial transaction.
+
+One publication cycle:
+
+1. Claim up to `OUTBOX_BATCH_SIZE` due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, ordered by `(occurred_at, event_id)`.
+2. Send each stored envelope to `wager-integration-events.fifo`, bounded by `OUTBOX_PUBLISH_TIMEOUT_MS`.
+3. Use the wallet as `MessageGroupId` and the event ID as `MessageDeduplicationId`.
+4. Set `published_at` for accepted sends. Record capped retry backoff for refused sends.
+5. Commit.
+
+| Property                                    | Guarantee                                                                                                                                                              |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Concurrent publishers                       | Row locks give them disjoint batches.                                                                                                                                  |
+| Publisher crash                             | PostgreSQL releases the locks when its connection closes; another publisher can claim the rows.                                                                        |
+| Financial commit boundary                   | A claim for `published_at is null` cannot see an uncommitted inserted row. Events are published only after the financial commit.                                       |
+| Crash after send, before publication commit | The row stays pending and is sent again with the same `eventId` and envelope. Consumers deduplicate by `eventId`.                                                      |
+| Continued broker failure                    | Rows are never deleted or abandoned. Retries continue indefinitely.                                                                                                    |
+| Stalled publication                         | From the tenth attempt, log `outbox.publication-stalled` at error level while continuing retries. Scrape-time backlog gauges provide the alert condition (OUTBOX-008). |
+
+Sending before recording publication can produce another copy after a crash. Recording publication before sending could lose an event, so that order is rejected.
+
+The publisher holds a database connection while sending. Batch size and timeout bound the hold. Leases would release the connection sooner but require lease tuning and a reaper.
+
+### Publisher loop
+
+`OutboxPublisher` starts with the `worker` role.
+
+| Cycle result   | Next step                                                          |
+| -------------- | ------------------------------------------------------------------ |
+| Claimed work   | Start the next cycle immediately.                                  |
+| No work        | Wait `OUTBOX_POLL_INTERVAL_MS`.                                    |
+| Cycle failed   | Log the failure and run another cycle.                             |
+| Stop requested | Resolve `stop` only after the current batch commits or rolls back. |
+
+A successful drain records sent publications before exit. Tests cover two processes draining 5,000 rows with exactly that many claims, a publisher killed while holding a batch, identical-message republication after a lost commit, a reference consumer applying that event once, and capped retry attempts against an unreachable broker without losing rows.
+
+---
+
+## 9. Database enforcement
+
+### Tables and money columns
+
+| Table                        | Notable data                                                                                                    |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `wallets`                    | Materialized balance, currency, and version.                                                                    |
+| `wager_transactions`         | Submission identity, state, and `observed_balance`.                                                             |
+| `wallet_ledger_entries`      | Immutable movements and their wallet versions.                                                                  |
+| `inbox_messages`             | Delivery claims and completion.                                                                                 |
+| `outbox_messages`            | Stable event envelopes and publication attempts.                                                                |
+| `pending_reference_schedule` | `transaction_id` as primary and foreign key; `attempts`, `next_attempt_at`, `expires_at`, and `correlation_id`. |
+
+Every money column uses `NUMERIC(20,2)` with a currency column beside it. The composite ledger foreign key binds the entry's currency to the wallet's currency.
+
+`wager_transactions` needs two currency fields:
+
+- `currency` describes the submitted amount.
+- `observed_balance_currency` describes the balance observed at the outcome.
+
+A `CURRENCY_MISMATCH` rejection can carry different currencies. Sharing one column would mislabel either the amount or the balance (`tx.observed-balance`).
+
+### Wallet and transaction constraints
+
+| Guarantee                                | Mechanism                                                                                                                                    | Evidence   |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| One wallet per player and currency       | `UNIQUE (player_id, currency)` on `wallets`.                                                                                                 | SCHEMA-001 |
+| Non-negative wallet balance              | `CHECK (balance >= 0)`.                                                                                                                      | SCHEMA-002 |
+| Wallet version starts at 1               | `CHECK (version >= 1)`.                                                                                                                      | SCHEMA-003 |
+| One row per provider transaction         | `UNIQUE (provider_id, external_transaction_id)`.                                                                                             | SCHEMA-004 |
+| One row per provider idempotency key     | `UNIQUE (provider_id, idempotency_key)`.                                                                                                     | SCHEMA-005 |
+| Closed vocabularies and valid references | One `CHECK` per kind, status, failure-code, direction, and event-type column; a `CHECK` relates kind to `reference_external_transaction_id`. | SCHEMA-006 |
+| Consistent terminal fields               | A `CHECK` ties `status` to `processed_at` and `failure_code`.                                                                                | SCHEMA-007 |
+| Frozen terminal outcome                  | A `BEFORE UPDATE OR DELETE` trigger prevents updates to terminal transactions and deletion of any transaction.                               | SCHEMA-024 |
+| Frozen transaction identity and amount   | The same trigger compares frozen columns with `IS DISTINCT FROM`. Identity, context, kind, amount, and currency cannot change.               | SCHEMA-025 |
+| Valid amount ranges                      | Ledger: `CHECK (amount > 0)`. Transactions: `amount >= 0`, and `amount > 0` unless `kind = 'LOSS'`.                                          | SCHEMA-008 |
+| One processed reversal per target        | Partial `UNIQUE (reference_transaction_id) WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'`.                                    | SCHEMA-015 |
+| One opening credit per wallet            | Partial `UNIQUE (wallet_id) WHERE kind = 'OPENING'`.                                                                                         | SCHEMA-016 |
+
+### Ledger constraints and privileges
+
+| Guarantee                                | Mechanism                                                                                                                     | Evidence   |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| One entry per transaction                | `UNIQUE (transaction_id)`.                                                                                                    | SCHEMA-009 |
+| Unique wallet sequence                   | `UNIQUE (wallet_id, wallet_version)`.                                                                                         | SCHEMA-010 |
+| Balanced, non-negative entries           | Arithmetic `CHECK` over `balance_before`, `amount`, `direction`, and `balance_after`; `CHECK (balance_after >= 0)`.           | SCHEMA-011 |
+| Entry currency matches wallet            | Composite `FOREIGN KEY (wallet_id, currency) REFERENCES wallets (id, currency)`.                                              | SCHEMA-012 |
+| Immutable ledger                         | `BEFORE UPDATE OR DELETE` trigger rejects every change for every role.                                                        | SCHEMA-013 |
+| Privileges also protect the ledger       | `wagering_app` has only `SELECT, INSERT` on the ledger, no `DELETE` on any table, no access to the migration log, and no DDL. | SCHEMA-014 |
+| Wallet mirrors its ledger head at commit | Deferred constraint trigger on `wallets`, comparing it with the greatest `wallet_version`.                                    | SCHEMA-017 |
+| Every entry is mirrored or continued     | Deferred constraint trigger on `wallet_ledger_entries`: an entry without a successor must be mirrored by the wallet.          | SCHEMA-021 |
+| Continuous chain, no version gaps        | The same trigger checks predecessor and successor versions, minus or plus one, with matching balances.                        | SCHEMA-022 |
+| Wallet balance equals the ledger sum     | Follows from continuity, arithmetic, and immutability; direct-SQL sequences assert it.                                        | SCHEMA-023 |
+
+### Messaging and money constraints
+
+| Guarantee                                  | Mechanism                                                                                    | Evidence   |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------- | ---------- |
+| Inbox identity                             | Primary key `(consumer_name, message_id)`.                                                   | SCHEMA-018 |
+| Stable event identity and efficient claims | Primary key `event_id`; pending-row index on `(published_at, next_attempt_at, occurred_at)`. | SCHEMA-019 |
+| Exact money                                | `NUMERIC(20,2)` for all money, matching the domain bound; ORM round-trip test.               | SCHEMA-020 |
+| No monetary `NaN`                          | A separate `<> 'NaN'::numeric` check beside each money column's range check.                 | SCHEMA-026 |
+
+### Balance-to-ledger link
+
+Two deferred constraint triggers enforce the final state at commit (ADR 0003):
+
+1. A wallet mirrors its ledger head: the entry with the greatest `wallet_version`. A wallet without entries must have version 1 and balance `0.00`.
+2. Each entry links to its predecessor and successor, if present. An entry without a successor is the head and must match the wallet.
+
+Together with entry arithmetic, unique `(wallet_id, wallet_version)`, and ledger immutability, this creates one continuous chain from `0.00` to the wallet balance.
+
+The database refuses commits containing:
+
+- A balance change without its entry.
+- An entry without its balance change.
+- An entry inserted between existing entries.
+- A version gap.
+
+The triggers are deferred so a transaction can write the wallet and entry in either order and can make several movements before its final state is checked (SCHEMA-017, SCHEMA-021–SCHEMA-023, WALLET-005).
+
+`NaN` needs its own checks. In PostgreSQL, `NaN = NaN`, and addition propagates it, so a `NaN` chain can satisfy both link triggers. Only the per-column exclusion prevents that commit (SCHEMA-026). The reconciliation parser also rejects unparseable money rather than reporting it as consistent.
+
+### Claim retention
+
+The runtime role cannot delete from any table. Claim lists retain their rows.
+
+A pending-reference claim joins `wager_transactions` and selects only `PENDING_REFERENCE` transactions. Once a transaction reaches an outcome, later sweeps ignore its schedule row. The retained row records its attempt count (ADR 0011).
+
+### Migration verification
+
+| Migration stage      | Adds                                                                                                                                                      |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| First migration      | Six tables, columns, and primary keys.                                                                                                                    |
+| Next five migrations | Unique keys and partial indexes; vocabulary, range, consistency, arithmetic, and `NaN` checks; foreign keys; immutability triggers; per-table privileges. |
+| Seventh migration    | The deferred balance-to-ledger constraint triggers.                                                                                                       |
+
+Ledger and transaction immutability triggers raise SQLSTATE `23000`, so trigger refusals classify like constraint refusals.
+
+Every migration is reversible. Tests remove the schema, rebuild it, and compare the catalogue of columns, constraints, indexes, triggers, functions, and grants. Money mapping also round-trips the maximum value to the cent.
+
+---
+
+## 10. Transport and authentication
+
+### Authoritative contracts
+
+| Document             | Version      | Defines                                                       |
+| -------------------- | ------------ | ------------------------------------------------------------- |
+| `docs/openapi.yaml`  | OpenAPI 3.1  | Paths, parameters, headers, statuses, bodies, and pagination. |
+| `docs/asyncapi.yaml` | AsyncAPI 3.0 | Queues, messages, event envelopes, and delivery semantics.    |
+
+Both documents cite the system-contract rules they implement and add no independent business rules. Each describes its transport's operation shape in full.
+
+Change the contract first, then update DTOs, message classes, event classes, and adapter validation. Shared transport code in `src/infrastructure/transport` implements the operation shape once: the HTTP body and message `data` apply the same rules (`msg.same-use-case`).
+
+The `api` role serves `docs/openapi.yaml` byte for byte at `/docs-json` and renders that route at `/docs`. Neither contract nor code is generated from the other. Acceptance tests enforce conformance (MODEL-006, API-011, API-012).
+
+### Request validation
+
+Zod validates requests at the edge and configuration at startup.
+
+| Rule                           | Behaviour                                                                                              |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| One pipe per request part      | Parse each part against its contract schema.                                                           |
+| Report all violations together | Providers can fix the payload in one round trip.                                                       |
+| Use JSON Pointers              | The first segment names the part, for example `/body/initialBalance/amount` or `/path/walletId`.       |
+| Reject unknown members         | All object schemas are strict.                                                                         |
+| Reuse domain money patterns    | Any accepted amount is parseable by `Money.from`. Malformed amounts return `400` with the member path. |
+
+### Problem details and correlation IDs
+
+One exception filter converts recognized request refusals into RFC 9457 problem details. A complete table maps each `ErrorCode` to its HTTP status and title. Use cases name codes, never statuses; new codes cannot reach callers without a mapping.
+
+The filter handles validation violations, use-case conflicts and missing resources, and bodies the framework cannot parse. Unknown errors remain defects or dependency failures rather than being treated as request refusals. Classified transient failures return `503 SERVICE_UNAVAILABLE` with `Retry-After` (API-006).
+
+The correlation ID is bound on first need, early enough for malformed bodies rejected before route handling. The first binding fixes the ID and writes the response header, so the body and header cannot disagree.
+
+Two deliberate exceptions apply:
+
+| Input                              | Behaviour                                                                    | Reason                                                                                                                                                                                                    |
+| ---------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Malformed `X-Correlation-Id`       | Generate a replacement and return the ID actually used. Do not return `400`. | An operational label must not prevent a financial operation. API-001 treats this as the sole strict-input exception.                                                                                      |
+| Unknown path or unsupported method | Return the framework's own body, not problem details.                        | `ErrorCode` is the closed set of actionable request refusals (`failure.request-errors`); it has no code for a request outside the documented operations. API-011 prevents undocumented registered routes. |
+
+### Authentication and read access
+
+**Current behaviour:** HTTP callers are not authenticated. Providers access the service inside the platform's network boundary. The HTTP guard calls `ProviderIdentityPort`, but the shipped binding returns no identity and admits every request.
+
+**Planned identity integration:** An external OpenID Connect provider, Keycloak, issues client-credentials tokens with one client per provider and a `providerId` claim. The guard validates the token; the port returns the claim; the use case rejects payloads naming another provider.
+
+The application already supports replacing the port binding at the composition root. Tests build the same application with both bindings and verify that an identified caller's mismatched provider is refused before any wallet read, while a matching submission applies.
+
+| Boundary                             | Behaviour                                                                                                                                                                                                                           |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Guard coverage                       | New routes are covered unless they declare an exemption.                                                                                                                                                                            |
+| Operational and documentation routes | The three operator endpoints and two documentation routes declare exemptions. Health and metrics remain open.                                                                                                                       |
+| Queue                                | No credentials and no HTTP guard. Every domain rule still applies; a wallet owned by another player is rejected with `WALLET_PLAYER_MISMATCH`.                                                                                      |
+| Authentication status and codes      | No authentication-failure status or code is published in this version. `401`, `403`, and their codes arrive with the identity-provider integration (#29). A test identity binding currently refuses with the framework's own `403`. |
+
+AUTH-001 limits an identified caller to the provider named in a payload or path. This covers submissions and provider transaction lookup. These three reads name no provider and are not scoped to one:
+
+- `GET /wallets/{walletId}`
+- `GET /wallets/{walletId}/ledger`
+- `GET /wagering/transactions/{transactionId}`
+
+A caller with one of those IDs can read the row regardless of who created it. An authenticated deployment must scope these reads to the caller or restrict them to operators. The runtime PostgreSQL role sees every row; there is no row-level security.
+
+---
+
+## 11. Operations
+
+### Startup configuration
+
+Read environment variables and validate them with a zod schema before listening. An invalid value exits the process and names the variable.
+
+The service schema contains no migrator credentials. The migration step reads its own variable.
+
+### Structured logs
+
+Every service log is one JSON line written through the `Logger` port to the process sink (ADR 0012).
+
+| Field group    | Contents                                                                   |
+| -------------- | -------------------------------------------------------------------------- |
+| Record         | `time`, `level`, `component`, `event`.                                     |
+| Bound identity | Correlation ID and other known identity fields; message ID for queue work. |
+| Event fields   | The caller's permitted fields.                                             |
+
+`AsyncLocalStorage` binds identity per unit of work. The adapter merges it into every line, so financial methods need no logging argument. HTTP binds it before handlers and early enough for body-parser failures; the consumer binds it for the full handling of one message.
+
+Work that continues later keeps its original correlation ID:
+
+- Publication reads it from the stored event envelope.
+- Pending-reference recovery reads `correlation_id` from the schedule claim row.
+
+The single logging adapter redacts bodies, amounts, and balances, both by field name and by money-shaped values. Reconciliation divergence is the one documented exception and uses a dedicated logger method, making it enforceable by type and auditable in source searches.
+
+Suites capture the running service's actual sink and assert JSON structure, identity fields, and redaction. They do not test only an injected logger.
+
+### Metrics
+
+`prom-client` exposes an instance-local registry at `GET /metrics`. All documented metrics are declared at startup, including their types, so an idle instance exposes them.
+
+Metric names and allowed labels are part of the operational contract. The `Metrics` port declares them as a mapped type; an unknown name or label fails compilation (`obs.metrics`).
+
+| Owner                   | Records                                                                                                                         |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Submission use case     | Recorded outcomes and replays.                                                                                                  |
+| Inbox claim             | Absorbed redeliveries and reused message IDs.                                                                                   |
+| Consumer                | Visibility changes accepted by the broker and completed dead-letter forwards.                                                   |
+| Publisher and scheduler | Their retry backoffs.                                                                                                           |
+| Unit of work            | Lock waits, including `wager_lock_conflicts_total` when `LOCK_TIMEOUT_MS` is exceeded. HTTP and queue paths share this counter. |
+| Reconciliation          | Divergences through `wager_reconciliation_divergence_total`.                                                                    |
+
+Every scrape measures `wager_outbox_pending` and `wager_outbox_lag_seconds` from the outbox table through `ObserveOutboxBacklog`. They remain accurate on an instance with no running publisher (`outbox.lag-metrics`).
+
+### Health
+
+Health uses `@nestjs/terminus`.
+
+| Probe     | Checks                                                                                                               |
+| --------- | -------------------------------------------------------------------------------------------------------------------- |
+| Liveness  | No dependency checks.                                                                                                |
+| Readiness | PostgreSQL `SELECT 1` through the pool as the runtime role; SQS `GetQueueUrl` for the input queue, which must exist. |
+
+Responses use Terminus's shape: `status` and one `details` entry per probe.
+
+### Shutdown
+
+One signal handler per process handles `SIGTERM` and `SIGINT`. It closes the application, including the hooks that `enableShutdownHooks` would run, within `SHUTDOWN_GRACE_PERIOD_MS` (ADR 0013).
+
+| Component       | Drain behaviour                                                                                                                                                                                       |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| HTTP            | Stop accepting work, drain requests in flight, and release idle connections so keep-alive pools cannot hold shutdown open. Requests arriving during the drain receive `503` with `Connection: close`. |
+| Consumer        | Abort the receive in flight, finish or return the current message, and return batch messages not yet started.                                                                                         |
+| Publisher       | Finish the batch, committing or rolling back.                                                                                                                                                         |
+| Scheduler       | Stop claiming between attempts; finish or release the current attempt.                                                                                                                                |
+| `WorkerRuntime` | Drain all three background loops in parallel. Shared `WorkerLoop` behaviour resolves each stop only when its current cycle commits or rolls back.                                                     |
+
+A completed drain exits `0`. A drain that exceeds the grace period exits `75`. Unfinished financial work has not committed, so messages can redeliver and connection-held claims release. The container's stop grace period is longer than the application's, leaving the process to decide when it is done.
+
+---
+
+## 12. Failure recovery
+
+Each failure window has its own suite, opened with the rest of the system quiet. The combined crash drill also opens both duplicate-producing windows in one running system; see [crash recovery verification](#crash-recovery-verification).
+
+### Financial commit and delivery
+
+| Failure window                                  | Durable state                                            | Recovery and duplicate behaviour                                                                                                        | Evidence   |
+| ----------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| Crash before financial commit                   | Nothing from the operation.                              | Caller resends with the same key or the queue redelivers. No duplicate effect.                                                          | OUTBOX-001 |
+| Commit succeeded; response did not reach caller | Transaction, wallet, ledger, and outbox rows.            | Resend with the same key. The committed reservation replays the stored outcome and its observed balance. No duplicate effect.           | API-013    |
+| Commit succeeded; queue acknowledgement did not | Transaction, wallet, ledger, inbox row, and outbox rows. | Inbox absorbs the redelivery and the consumer acknowledges it. Increment `wager_duplicates_detected_total`; no second financial effect. | MSG-006    |
+
+### Outbox publication
+
+| Failure window                                                     | Durable state                                          | Recovery and duplicate behaviour                                                                                                                    | Evidence   |
+| ------------------------------------------------------------------ | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| Financial commit succeeded; publication not started                | Pending outbox rows.                                   | Any publisher claims and publishes. No duplicate from this window.                                                                                  | OUTBOX-005 |
+| Publisher claimed rows but did not publish                         | Pending rows; PostgreSQL releases locks on disconnect. | The next publisher claims them. No duplicate from this window.                                                                                      | OUTBOX-005 |
+| Broker accepted publication; `published_at` commit did not succeed | Outbox rows still pending.                             | Republish the same `eventId`. Each crash can add one copy; consumers deduplicate. FIFO deduplication IDs help but are not required for correctness. | OUTBOX-006 |
+
+### Dependencies and shutdown
+
+| Failure                | Durable state                                     | Recovery and duplicate behaviour                                                                                                                                                                                                                                   | Evidence                  |
+| ---------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------- |
+| PostgreSQL unavailable | Unchanged.                                        | HTTP returns `503` with `Retry-After`. Consumers increase message visibility backoff until redrive dead-letters exhausted receives. Publishers back off; readiness fails. No duplicate effect.                                                                     | API-006, MSG-008, OBS-004 |
+| SQS unavailable        | Financial commits continue; outbox backlog grows. | Publishers retry with backoff. Consumers delay after receive errors. Readiness fails and `wager_outbox_lag_seconds` rises. No financial duplicate.                                                                                                                 | OUTBOX-007, OUTBOX-008    |
+| `SIGTERM`              | Whatever already committed.                       | HTTP drains; consumer finishes or returns held messages; publisher finishes its batch; scheduler finishes or releases its attempt. Exceeding the grace period exits `75`. Uncommitted work redelivers or releases its claim, without a duplicate financial effect. | MSG-010, OPS-007          |
+
+### Pending references
+
+| Failure                                                | Durable state                                      | Recovery and duplicate behaviour                                                                                    | Evidence        |
+| ------------------------------------------------------ | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | --------------- |
+| Scheduler crashes during an attempt                    | Pending state unchanged; claim released.           | Next scheduler takes the due row. Only one worker claims a row at a time.                                           | REF-002         |
+| Transient reprocessing failure                         | Transaction unchanged; schedule due after backoff. | Retry without a retry limit. No duplicate effect.                                                                   | REF-006         |
+| Positively classified permanent infrastructure failure | `FAILED` with `PROCESSING_FAILED`.                 | Operations investigates using the transaction ID. Replays return `500`; no duplicate effect.                        | TX-009, REF-006 |
+| Reference never resolves                               | `PENDING_REFERENCE` until the expiry check.        | After an attempt still finds it missing, reject with `REFERENCE_NOT_FOUND` and emit the event. No duplicate effect. | REF-004         |
+
+---
+
+## 13. Verification and delivery status
+
+### Shipped scope
+
+All required entries in [docs/acceptance.yaml](docs/acceptance.yaml) are `implemented` and `passing`, with the responsible suite named for each entry. `make check` runs them all.
+
+The foundation is verified by integration tests: NestJS on Bun, startup configuration validation, PostgreSQL with both roles, LocalStack with three queues and dead-letter redrive, migrations, and both health endpoints. Compose runs one API and two workers from one image.
+
+[docs/demonstrations.md](docs/demonstrations.md) demonstrates the same guarantees against a running stack. [docs/implementation-plan.md](docs/implementation-plan.md) records the build order; it is now an implementation record, not future work.
+
+Three entries marked `optional` are deliberately unimplemented. The acceptance file records what each would add.
+
+| Optional extension       | Acceptance ID |
+| ------------------------ | ------------- |
+| Double-entry bookkeeping | LEDGER-010    |
+| Load-test report         | OPS-008       |
+| OpenTelemetry tracing    | OPS-009       |
+
+### Concurrency verification
+
+Three separate processes run with independent heaps, entity managers, and connection pools. The scenario arms them, then releases them at an agreed instant. PostgreSQL coordinates them; promise races inside one runtime do not establish the multi-instance guarantee.
+
+| Scenario                                                              | Observed result                                                                                                                                                                                                                  |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Two `80.00` bets against `100.00`, repeated for 20 rounds             | One `PROCESSED`; one `REJECTED INSUFFICIENT_BALANCE`; balance `20.00`; one `DEBIT` alongside the opening credit. Retrying either outcome replays it without another debit.                                                       |
+| Fifty copies of one bet                                               | One debit and 49 replays, all with the applied transaction's ID. One instance applies it while other instances replay it.                                                                                                        |
+| 200 wallets, 20 bets each                                             | Every bet applies; each wallet has exactly its own 20 debits.                                                                                                                                                                    |
+| Hold one wallet's bet before commit; submit to another wallet         | The second wallet commits while the first waits, from both another process and the same instance. This detects a lock broader than one row and an application mutex, without relying on runner timing (`conc.parallel-wallets`). |
+| Mixed bets, duplicates, refunds, and rollbacks against shared targets | PostgreSQL's `deadlocks` counter stays unchanged. This also detects deadlocks that a retry might otherwise hide.                                                                                                                 |
+| Continuous reconciliation while three instances bet on one wallet     | Every report is consistent. The tested load shows no extra cost compared with the unobserved load; reconciliation takes no wallet lock.                                                                                          |
+
+These tests do not establish a throughput or latency target for one wallet. Its financial transaction duration bounds its throughput.
+
+### Version and lock controls
+
+| Control       | Verification                                                                                                                                                                                    |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Version guard | Two sessions read a wallet without locking, then submit their computed balances. One update matches no row and is refused instead of overwriting the other.                                     |
+| Lock mode     | Ten pairs reserve, then request the wallet. `FOR NO KEY UPDATE` serializes them with consecutive versions. The rejected `FOR UPDATE` alternative deadlocks in every pair with SQLSTATE `40P01`. |
+| Lock timeout  | The unit of work classifies waits beyond `LOCK_TIMEOUT_MS` and increments `wager_lock_conflicts_total` for both HTTP and queue work.                                                            |
+
+Source checks enforce what a race test cannot prove:
+
+1. No advisory locks or table locks anywhere.
+2. Every row lock is one of the three reviewed locks, in its reviewed mode: wallet, outbox claim, or scheduler claim.
+3. The wallet repository is the table's only writer. Only the two wagering operation paths take its lock, and their shared financial step issues its guarded update.
+
+### Contract conformance
+
+The gate compares implementation and documentation in three ways:
+
+| Check                              | Failure condition                                                                                                                                            |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Route inventory in both directions | A registered route has no documented operation, or a documented operation has no route.                                                                      |
+| Payload schemas                    | Any operation response, outbox event, or document example violates its declared schema. A recursive walk also rejects numeric amounts anywhere in a payload. |
+| Code enumerations                  | Domain codes, adapter status mappings, both transport contracts, and both system-contract tables differ. Every code must include a caller action.            |
+
+The running-service status matrix covers each operation's malformed, unknown, conflicting, and transient refusals. A second instance with an unavailable database drives the transient cases. The suite checks `422` against the business rejection that produces it and reconciliation, which deliberately returns `200` for divergence.
+
+The conformance sweep confirmed the existing surface without changing it. Other suites verify that `/docs-json` serves the authoritative file unchanged, that logs satisfy the actual output contract, and that replacing `ProviderIdentityPort` enforces the provider boundary.
+
+### Crash recovery verification
+
+`test/concurrency/crash-recovery.test.ts` runs three workers and uses `SIGKILL` at two barriers:
+
+1. **Delivery committed, acknowledgement pending.** The drill verifies the committed financial state and completed inbox row before killing the worker. The missing action is acknowledgement; inbox completion already committed with the money (ADR 0010).
+2. **Publication accepted, publication commit pending.** The drill verifies that the broker received the event before killing the publisher whose database commit has not recorded it.
+
+Workers announce each barrier. The drill checks the durable state, then kills the process. An unreached barrier fails the run, so a window that never opened cannot count as a survived crash.
+
+Recovery then uses only surviving and restarted instances. No manual recovery step drives it. They:
+
+- Absorb the queue redelivery.
+- Republish the pending outbox row with the same event ID.
+- Apply a parked reversal whose referenced operation arrived during the kills.
+
+The final assertions require one debit, one entry for that debit, one downstream application per event after `eventId` deduplication, terminal states for every transaction, and every touched wallet matching its balance rebuilt from its own ledger in SQL.
+
+Duplicates use deduplication IDs the broker has never seen. The database and downstream event-ID deduplication therefore absorb them, independently of the broker's deduplication window.
+
+Evidence: MSG-006, MSG-011, OUTBOX-005, OUTBOX-006, REF-002, REF-005, CONC-005, RECON-004.
+
+---
+
+## 14. Decisions and limits
+
+### Accepted architecture decisions
+
+Every ADR is `accepted` and shipped as recorded. None was superseded, deprecated, or amended during implementation. [docs/acceptance.yaml](docs/acceptance.yaml) tracks verification by acceptance ID.
+
+| ADR                                                                                                | Decision                                                                                                                                                                                          |
+| -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [0001 — Money](docs/decisions/0001-money-representation-and-persistence.md)                        | `bigint` minor units, `NUMERIC(20,2)` storage, exact strings between layers, no rounding, and one bound for inputs, arithmetic, and storage.                                                      |
+| [0002 — Concurrency](docs/decisions/0002-wallet-concurrency-strategy.md)                           | Pessimistic `FOR NO KEY UPDATE` wallet lock, version guard, check constraint, and fixed lock order.                                                                                               |
+| [0003 — Schema enforcement](docs/decisions/0003-database-enforcement-of-financial-consistency.md)  | Unique keys, checks, ledger and transaction immutability triggers, two database roles, and deferred balance-to-ledger triggers on both tables.                                                    |
+| [0004 — Idempotency](docs/decisions/0004-persistent-idempotency-and-replay.md)                     | Provider-scoped keys, bound external IDs, canonical payload hash, and replay reconstructed from persisted facts.                                                                                  |
+| [0005 — Outbox](docs/decisions/0005-outbox-publication-protocol.md)                                | `FOR UPDATE SKIP LOCKED` claims within one publisher transaction, bounded sends, and retry backoff without loss.                                                                                  |
+| [0006 — Wallet outcomes](docs/decisions/0006-wallet-operation-outcomes.md)                         | Provider-caused business refusals return failure codes. Applied operations return a new wallet and ledger entry.                                                                                  |
+| [0007 — Transaction states](docs/decisions/0007-wager-transaction-state-machine.md)                | Named transitions update the transaction in place. One table defines transitions and terminality; terminal transitions throw.                                                                     |
+| [0008 — Persistence mapping](docs/decisions/0008-persistence-model-for-the-domain-mapping.md)      | `EntitySchema` row classes and mappers keep ORM-owned instances separate from frozen aggregates and private transitions.                                                                          |
+| [0009 — References](docs/decisions/0009-reference-resolution-and-reversal-eligibility.md)          | Resolve provider references under the wallet lock, decide pair eligibility in the domain, and query the reversal-index predicate before applying.                                                 |
+| [0010 — Inbox identity](docs/decisions/0010-queue-delivery-identity-and-the-inbox-claim.md)        | Insert the inbox claim first and complete it with the financial commit. Hash message `data`. A second submission method wraps the shared financial body.                                          |
+| [0011 — Pending references](docs/decisions/0011-pending-reference-recovery.md)                     | Claim one schedule row per attempt with `FOR UPDATE SKIP LOCKED`, reuse the submission financial step, check expiry after an attempt, and fail only on positively identified permanent failures.  |
+| [0012 — Logs and metrics](docs/decisions/0012-structured-logs-and-operational-metrics.md)          | JSON lines through `Logger`, unit-of-work identity in `AsyncLocalStorage`, one redaction adapter, and typed metric names and labels in `Metrics`.                                                 |
+| [0013 — Runtime and shutdown](docs/decisions/0013-runtime-roles-and-the-shutdown-protocol.md)      | `APP_ROLE` selects controllers and background processes. One signal handler bounds draining; HTTP releases idle connections; `WorkerLoop` gives all background processes the same stop behaviour. |
+| [0014 — Suite isolation](docs/decisions/0014-isolating-the-suites-from-the-demonstration-stack.md) | Tests and demonstrations share containers but each use their own database and queue trio. A queue prefix provides the queue isolation.                                                            |
+
+### Deliberate limits
+
+| Area                          | Limit or trade-off                                                                                                                                                                                                                                               |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Publisher connections         | A publication transaction holds a connection during broker I/O, bounded by batch size and timeout. Leases would add tuning and a reaper (ADR 0005).                                                                                                              |
+| Event order                   | Publisher instances do not establish global event order. Consumers order by `walletVersion` or `occurredAt`.                                                                                                                                                     |
+| Reversal depth                | A `REFUND` can be rolled back. A `ROLLBACK` cannot be reversed. A refunded bet cannot be refunded again after its refund is rolled back.                                                                                                                         |
+| Compatibility                 | One reversal per transaction, positive `LOSS` amounts, and binding a provider transaction ID to its first key are deliberate tightenings. System contract section 20.2 records their compatibility consequences.                                                 |
+| Wallet concurrency            | An explicit repository SQL lock is required; the ORM lock mode is unsuitable. One wallet's throughput is bounded by its financial transaction duration. Concurrency evidence establishes independent wallets, not a latency target (ADR 0002).                   |
+| Money and currency            | Maximum balance is `999999999999999999.99`; excess credits return `BALANCE_LIMIT_EXCEEDED`. BRL is the only operated settlement currency.                                                                                                                        |
+| Failed transactions           | Replays return `500` with the outcome body. A generic provider retry policy may keep resending until it reads that body; retries are harmless. `FAILED` emits no event in this version and remains visible through reads and metrics.                            |
+| Reference latency             | Recovery polls with backoff instead of being triggered by target arrival. After arrival, the worst-case wait is one backoff step, at most five minutes.                                                                                                          |
+| Reconciliation                | Per-wallet, on demand, report-only. The schema enforces the invariant at commit; every money-moving suite checks it. A deployment must schedule calls if it wants continuous assurance and decide how operators handle divergence.                               |
+| Authentication and read scope | Identity-provider integration is deferred. An authenticated deployment must also scope the three provider-free reads or reserve them for operators; PostgreSQL has no row-level security. See [authentication and read access](#authentication-and-read-access). |
+| Input and error boundaries    | Malformed correlation IDs are replaced. Paths or methods outside the documented operations use framework errors. See [problem details and correlation IDs](#problem-details-and-correlation-ids).                                                                |

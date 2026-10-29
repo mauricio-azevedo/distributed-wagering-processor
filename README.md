@@ -33,8 +33,6 @@ The [walkthrough](demo/walkthrough.ts) places bets, retries them, handles revers
 
 The stack stays running afterward. Open the [API reference](http://localhost:3000/docs) to explore it.
 
-If port `3000` is occupied, `make` selects another port. `make stack` shows the `HTTP_PORT` to use instead.
-
 ## How it works
 
 ```mermaid
@@ -51,13 +49,13 @@ Financial changes and outgoing events are saved together. Queue messages are ack
 
 ## The operations
 
-| Operation | Balance effect | Reference |
-| --- | --- | --- |
-| `BET` | Debit the stake | None |
-| `WIN` | Credit the winnings | Optional `BET` |
-| `LOSS` | Record the result without moving money | Optional `BET` |
-| `REFUND` | Return the stake | Required `BET` |
-| `ROLLBACK` | Undo the referenced movement | Required `BET`, `WIN`, or `REFUND` |
+| Operation  | Balance effect                         | Reference                          |
+| ---------- | -------------------------------------- | ---------------------------------- |
+| `BET`      | Debit the stake                        | None                               |
+| `WIN`      | Credit the winnings                    | Optional `BET`                     |
+| `LOSS`     | Record the result without moving money | Optional `BET`                     |
+| `REFUND`   | Return the stake                       | Required `BET`                     |
+| `ROLLBACK` | Undo the referenced movement           | Required `BET`, `WIN`, or `REFUND` |
 
 There is one wallet per player and currency. A positive starting balance creates an internal `OPENING` credit with a ledger entry.
 
@@ -67,16 +65,16 @@ Rejections leave the balance and ledger unchanged, including when a reversal wou
 
 ## Why retries and races are safe
 
-| Guarantee | How it works | Proof |
-| --- | --- | --- |
-| Exact money | Amounts are strings such as `"25.00"`, with exactly two decimal places. The domain uses `bigint` minor units; PostgreSQL uses `NUMERIC(20,2)`. Nothing is rounded. | [Exact arithmetic](test/unit/money.test.ts#L75) |
-| Concurrent bets | PostgreSQL serializes balance changes and checks the wallet version. Two simultaneous bets of **80.00 BRL** against **100.00 BRL** produce one debit, one rejection, and a final balance of **20.00 BRL**. | [Competing bets](test/concurrency/wallet-contention.test.ts#L500) |
-| Independent wallets | Locks belong to individual wallets. Holding one wallet does not stop another from committing. | [Independent wallets](test/concurrency/wallet-contention.test.ts#L884) |
-| One commit | Outcomes, balance movements, ledger entries, events, and queue inbox records commit together. PostgreSQL also enforces ledger immutability and balance consistency. | [Atomic writes](test/integration/bet-atomicity.test.ts#L265); [immutable ledger](test/integration/schema.test.ts#L738); [ledger consistency](test/integration/wallet-ledger-chain.test.ts#L306) |
-| Persistent idempotency | The same provider key and business payload return the stored outcome. Terminal replays keep the original observed balance. Changing the payload under that key returns `409`. | [Replay after restart](test/integration/bet-submission.test.ts#L995); [50 copies, one debit](test/concurrency/wallet-contention.test.ts#L564) |
-| Late references | An operation waits as `PENDING_REFERENCE`, without moving money. HTTP returns `202` and a `Location` URL to check progress. Workers retry with exponential backoff, capped at five minutes. After a one-hour window, the next attempt rejects any still-unresolved reference with `REFERENCE_NOT_FOUND`. | [Rollback before bet](test/integration/pending-reference.test.ts#L464) |
-| Worker recovery | Messages are acknowledged only after commit. If a worker dies before acknowledgment, the persistent inbox absorbs redelivery. | [Crash before acknowledgment](test/integration/queue-submission.test.ts#L753) |
-| Event recovery | Committed events wait in the outbox. Publishers claim separate rows, and crashes release their claims. Delivery is at least once, with no global ordering. Consumers deduplicate by `eventId` and order balance changes by `walletVersion`. | [Concurrent publishers](test/concurrency/outbox-publishers.test.ts#L228); [claim recovery](test/concurrency/outbox-publishers.test.ts#L265); [worker and publisher crash recovery](test/concurrency/crash-recovery.test.ts#L419) |
+| Guarantee              | How it works                                                                                                                                                                                                                                                                                             | Proof                                                                                                                                                                                                                            |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact money            | Amounts are strings such as `"25.00"`, with exactly two decimal places. The domain uses `bigint` minor units; PostgreSQL uses `NUMERIC(20,2)`. Nothing is rounded.                                                                                                                                       | [Exact arithmetic](test/unit/money.test.ts#L75)                                                                                                                                                                                  |
+| Concurrent bets        | PostgreSQL serializes balance changes and checks the wallet version. Two simultaneous bets of **80.00 BRL** against **100.00 BRL** produce one debit, one rejection, and a final balance of **20.00 BRL**.                                                                                               | [Competing bets](test/concurrency/wallet-contention.test.ts#L500)                                                                                                                                                                |
+| Independent wallets    | Locks belong to individual wallets. Holding one wallet does not stop another from committing.                                                                                                                                                                                                            | [Independent wallets](test/concurrency/wallet-contention.test.ts#L884)                                                                                                                                                           |
+| One commit             | Outcomes, balance movements, ledger entries, events, and queue inbox records commit together. PostgreSQL also enforces ledger immutability and balance consistency.                                                                                                                                      | [Atomic writes](test/integration/bet-atomicity.test.ts#L265); [immutable ledger](test/integration/schema.test.ts#L738); [ledger consistency](test/integration/wallet-ledger-chain.test.ts#L306)                                  |
+| Persistent idempotency | The same provider key and business payload return the stored outcome. Terminal replays keep the original observed balance. Changing the payload under that key returns `409`.                                                                                                                            | [Replay after restart](test/integration/bet-submission.test.ts#L995); [50 copies, one debit](test/concurrency/wallet-contention.test.ts#L564)                                                                                    |
+| Late references        | An operation waits as `PENDING_REFERENCE`, without moving money. HTTP returns `202` and a `Location` URL to check progress. Workers retry with exponential backoff, capped at five minutes. After a one-hour window, the next attempt rejects any still-unresolved reference with `REFERENCE_NOT_FOUND`. | [Rollback before bet](test/integration/pending-reference.test.ts#L464)                                                                                                                                                           |
+| Worker recovery        | Messages are acknowledged only after commit. If a worker dies before acknowledgment, the persistent inbox absorbs redelivery.                                                                                                                                                                            | [Crash before acknowledgment](test/integration/queue-submission.test.ts#L753)                                                                                                                                                    |
+| Event recovery         | Committed events wait in the outbox. Publishers claim separate rows, and crashes release their claims. Delivery is at least once, with no global ordering. Consumers deduplicate by `eventId` and order balance changes by `walletVersion`.                                                              | [Concurrent publishers](test/concurrency/outbox-publishers.test.ts#L228); [claim recovery](test/concurrency/outbox-publishers.test.ts#L265); [worker and publisher crash recovery](test/concurrency/crash-recovery.test.ts#L419) |
 
 ## Connect a provider
 
@@ -104,16 +102,16 @@ Operational endpoints are `/health/live`, `/health/ready`, and `/metrics`. Logs 
 
 ## Everyday commands
 
-| Command | Purpose |
-| --- | --- |
-| `make up` | Start the stack without the walkthrough |
-| `make dev` | Run the API from source with reload |
-| `make test` | Run the tests against PostgreSQL and LocalStack |
-| `make test TESTS=test/unit` | Run a focused suite |
-| `make check` | Check formatting, lint, types, tests, dependencies, and the image build |
-| `make logs` | Show recent stack logs |
-| `make down` | Remove the stack **and its local database volume** |
-| `make help` | List all commands |
+| Command                     | Purpose                                                                 |
+| --------------------------- | ----------------------------------------------------------------------- |
+| `make up`                   | Start the stack without the walkthrough                                 |
+| `make dev`                  | Run the API from source with reload                                     |
+| `make test`                 | Run the tests against PostgreSQL and LocalStack                         |
+| `make test TESTS=test/unit` | Run a focused suite                                                     |
+| `make check`                | Check formatting, lint, types, tests, dependencies, and the image build |
+| `make logs`                 | Show recent stack logs                                                  |
+| `make down`                 | Remove the stack **and its local database volume**                      |
+| `make help`                 | List all commands                                                       |
 
 CI runs `make check`. Tests use a separate database and queues, so they can run beside the demo. Concurrency tests use independent processes to exercise competing bets, duplicate storms, separate wallets, and crash recovery.
 

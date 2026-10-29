@@ -85,59 +85,6 @@ function stackOf(directory: string, env: Record<string, string> = BARE_ENV): Sta
   return { project, slot };
 }
 
-/** What `docker/stack.sh` says for itself, which is where a slot it moved to is announced. */
-function noticeOf(directory: string, env: Record<string, string> = BARE_ENV): string {
-  const { success, stderr } = Bun.spawnSync([STACK_SH], { cwd: directory, env });
-  if (!success) {
-    throw new Error(`${STACK_SH} failed in ${directory}:\n${stderr.toString()}`);
-  }
-
-  return stderr.toString();
-}
-
-/** Holds `ports` for the duration of `body`, as another checkout's containers would hold them. */
-function occupying(ports: readonly string[], body: () => void): void {
-  const listeners = ports.map((port) =>
-    Bun.listen({ hostname: '127.0.0.1', port: Number(port), socket: { data: () => undefined } }),
-  );
-
-  try {
-    body();
-  } finally {
-    for (const listener of listeners) {
-      listener.stop(true);
-    }
-  }
-}
-
-/**
- * Publishes `port` from a container labelled as `project`'s, for the duration of `body`: what a
- * second `make up` on a checkout whose stack is already running meets. The image is the one the
- * dependencies already run, so nothing is pulled for this.
- */
-function publishing(port: string, project: string, body: () => void): void {
-  const container = run([
-    'docker',
-    'run',
-    '--detach',
-    '--rm',
-    '--label',
-    `com.docker.compose.project=${project}`,
-    '--publish',
-    `${port}:9`,
-    '--entrypoint',
-    'sleep',
-    'postgres:18-alpine',
-    '120',
-  ]);
-
-  try {
-    body();
-  } finally {
-    run(['docker', 'rm', '--force', container]);
-  }
-}
-
 /**
  * A repository whose main worktree is `name`, with one linked worktree per entry of `worktrees`,
  * created in that order. Every path is a sibling, as `.claude/worktrees` is not: the helper reads
@@ -238,9 +185,7 @@ function ports(stack: Record<string, string>): Record<string, string> {
  * Two checkouts of this repository must be able to run `make check` at the same time, and stopping
  * one stack must leave the other running. That holds when each checkout owns its Compose project,
  * its image and its published ports, and when the addresses the suites read point at the
- * containers that checkout started. A single clone stays on the names and ports it always had, and
- * moves to the next free slot rather than failing when something else already publishes one of
- * them.
+ * containers that checkout started. A single clone stays on the names and ports it always had.
  */
 describe('docker-stack-is-per-checkout', () => {
   test('a repository with no linked worktree takes its own name', () => {
@@ -260,20 +205,17 @@ describe('docker-stack-is-per-checkout', () => {
   });
 
   /**
-   * Which slot a checkout lands on depends on what the host already publishes. That no two
-   * checkouts of one repository land on the same one does not: each searches from its own position
-   * in `git worktree list` in steps of the number of worktrees, so the slots it will consider are
-   * exactly those whose remainder is its position, and two of them searching in the same second
-   * still cannot choose the same ports.
+   * A checkout's slot is its position in `git worktree list` and nothing else: no search, so no
+   * dependence on what the host is publishing at the time. Two checkouts of one repository
+   * therefore cannot answer the same slot, whenever and wherever they are asked.
    */
   test('no two checkouts of one repository can land on the same slot', () => {
     withRepository('wagering', ['first', 'second'], ({ main, linked }) => {
       const checkouts = [main, ...linked];
       const slots = checkouts.map((checkout) => stackOf(checkout).slot);
 
+      expect(slots).toEqual([0, 1, 2]);
       expect(new Set(slots).size).toBe(checkouts.length);
-      expect(slots.map((slot) => slot % checkouts.length)).toEqual([0, 1, 2]);
-      expect(slots.every((slot, position) => slot >= position)).toBe(true);
     });
   });
 
@@ -333,83 +275,20 @@ describe('docker-stack-is-per-checkout', () => {
   });
 
   /**
-   * A checkout whose slot is already published by something else has to start anyway, or the first
-   * command a reviewer runs fails on a port they did not choose and cannot see. The slot is
-   * therefore the first one from this checkout's own whose three ports are all free, which leaves
-   * the answer deterministic — the same ports whenever they are free — and self-announcing when it
-   * is not.
-   *
-   * The cases take the current answer as their baseline rather than naming a slot: what runs
-   * beside them on the host is not theirs to decide, and the property is the move, not its
-   * destination.
+   * The one way to leave the numbering: a pin replaces the slot the checkout would derive, and
+   * keeps everything else about it, so a checkout whose block collides with something on the host
+   * is moved by the person who can see the collision.
    */
-  test('a slot with a port in use is skipped for the next one whose ports are all free', () => {
-    withRepository('wagering', [], ({ main }) => {
-      const free = chosenStack(main);
+  test('an explicit STACK_SLOT is taken as given, over the slot the checkout derives', () => {
+    withRepository('wagering', ['first'], ({ linked }) => {
+      const [checkout = ''] = linked;
+      const derived = chosenStack(checkout);
+      const pinned = chosenStack(checkout, { ...BARE_ENV, STACK_SLOT: '7' });
 
-      occupying([free.ports['POSTGRES_PORT'] ?? ''], () => {
-        const moved = chosenStack(main);
-
-        expect(moved.slot).toBeGreaterThan(free.slot);
-        expect(Object.values(moved.ports)).not.toContain(free.ports['POSTGRES_PORT']);
-        expect(moved.project).toBe(free.project);
-      });
-
-      // Deterministic, not sticky: nothing is remembered, so the ports come back when they are free.
-      expect(chosenStack(main)).toEqual(free);
-    });
-  });
-
-  test('the move is announced in one line, naming the slot and the base URL it leads to', () => {
-    withRepository('wagering', [], ({ main }) => {
-      const free = chosenStack(main);
-
-      occupying(Object.values(free.ports), () => {
-        const moved = chosenStack(main);
-        const notice = noticeOf(main);
-
-        expect(notice.trimEnd().split('\n')).toHaveLength(1);
-        expect(notice).toContain(`slot ${String(moved.slot)}`);
-        expect(notice).toContain(`http://localhost:${moved.ports['HTTP_PORT'] ?? ''}`);
-      });
-    });
-  });
-
-  // Silence is the other half of announcing it: a checkout that is on the slot it asked for has
-  // nothing to tell anyone, and this checkout is on its own.
-  test('a checkout that stays on its own slot says nothing', () => {
-    expect(noticeOf(ROOT)).toBe('');
-  });
-
-  test('an explicit STACK_SLOT is taken as given, with its ports in use and unannounced', () => {
-    withRepository('wagering', [], ({ main }) => {
-      const free = chosenStack(main);
-      const pinned = { ...BARE_ENV, STACK_SLOT: String(free.slot) };
-
-      occupying(Object.values(free.ports), () => {
-        expect(chosenStack(main, pinned)).toEqual(free);
-        expect(noticeOf(main, pinned)).toBe('');
-      });
-    });
-  });
-
-  /**
-   * The occupant that must not move a checkout is its own stack: `make up` on a checkout whose
-   * containers are already running has to find the slot they publish, or it would start a second
-   * stack beside the one the reviewer is reading.
-   */
-  test("a port published by this checkout's own stack keeps it, another project's moves it", () => {
-    withRepository('wagering', [], ({ main }) => {
-      const free = chosenStack(main);
-      const port = free.ports['HTTP_PORT'] ?? '';
-
-      publishing(port, free.project, () => {
-        expect(chosenStack(main)).toEqual(free);
-      });
-
-      publishing(port, `${free.project}-someone-else`, () => {
-        expect(chosenStack(main).slot).toBeGreaterThan(free.slot);
-      });
+      expect(derived.slot).toBe(1);
+      expect(pinned.slot).toBe(7);
+      expect(pinned.project).toBe(derived.project);
+      expect(pinned.ports).toEqual(ports(makeStack(['STACK_SLOT=7'])));
     });
   });
 

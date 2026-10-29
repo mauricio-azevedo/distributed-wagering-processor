@@ -76,6 +76,8 @@ Acceptance: OUTBOX-002, OUTBOX-003, OUTBOX-004, OUTBOX-005, OUTBOX-006, OUTBOX-0
 
 Exit evidence: two publishers drain one outbox without losing a row; a publisher killed while holding a claimed batch leaves its rows to the next instance; a publication whose commit is lost is published again with the same `eventId` and applied once by a reference consumer.
 
+Cross-slice verification of this slice and `sqs-inbox-dlq`: the two windows that produce a duplicate are also opened together, in one run of the service with three instances, by the crash-recovery drill (`test/concurrency/crash-recovery.test.ts`). It kills a worker that has committed a delivery and not acknowledged its message and a publisher whose publication reached the broker and whose commit never happened, both at a barrier it asserts the pre-kill state at, and then leaves the recovery to the surviving and restarted instances (MSG-006, MSG-011, OUTBOX-005, OUTBOX-006, REF-002, REF-005, CONC-005, RECON-004). It is also the last suite to adopt the ledger-reconstruction sweep, which is what turns RECON-004 green.
+
 ## 9. http-observability-shutdown — Remaining surface and operations
 
 Scope: consistent status classes across every endpoint; `docs/openapi.yaml` served at `/docs` and `/docs-json`; structured logs with redaction; metrics; the remaining configuration variables; graceful shutdown of every role; the authentication extension point; acceptance statuses updated with the evidence of every slice.

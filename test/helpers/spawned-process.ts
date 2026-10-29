@@ -47,10 +47,16 @@ export interface SpawnedProcessOptions {
    * missing variable requires: the `.env` of a checkout would otherwise supply it.
    */
   readonly envFile?: string;
+  /**
+   * Whether the process is given a pipe on stdin, which is what `send` writes to. A helper that
+   * takes instructions while it runs needs one; a role that is only started and signalled does not,
+   * and gets no stdin at all so a read of it cannot hold the process open.
+   */
+  readonly stdin?: boolean;
 }
 
 export class SpawnedProcess {
-  private readonly child: Bun.Subprocess<'ignore', 'pipe', 'pipe'>;
+  private readonly child: Bun.Subprocess<'ignore' | 'pipe', 'pipe', 'pipe'>;
   private readonly written: string[] = [];
   private readonly reading: Promise<void>;
 
@@ -59,6 +65,7 @@ export class SpawnedProcess {
     args: readonly string[],
     overrides: Record<string, string | undefined>,
     envFile: string | undefined,
+    stdin: boolean,
   ) {
     // The suite's own environment with the overrides applied, and the variables an override set to
     // `undefined` left out: that absence is what a case asserting a missing variable is about.
@@ -81,6 +88,7 @@ export class SpawnedProcess {
       {
         cwd: ROOT,
         env,
+        stdin: stdin ? 'pipe' : 'ignore',
         stdout: 'pipe',
         stderr: 'pipe',
       },
@@ -89,8 +97,32 @@ export class SpawnedProcess {
   }
 
   /** Spawns it. Nothing is waited for here: a case that expects a refusal waits for the exit. */
-  static spawn({ script, args = [], env, envFile }: SpawnedProcessOptions): SpawnedProcess {
-    return new SpawnedProcess(script, args, env, envFile);
+  static spawn({
+    script,
+    args = [],
+    env,
+    envFile,
+    stdin = false,
+  }: SpawnedProcessOptions): SpawnedProcess {
+    return new SpawnedProcess(script, args, env, envFile, stdin);
+  }
+
+  /**
+   * One instruction, as one line of JSON on stdin. The flush is what is awaited, because a process
+   * acts on a line and not on a partial write, so a case that asked for something has to know the
+   * whole of it left this end of the pipe.
+   */
+  async send(instruction: unknown): Promise<void> {
+    const sink = this.child.stdin;
+
+    if (sink === undefined) {
+      throw new Error('the process was spawned without a stdin pipe, so it takes no instructions');
+    }
+
+    // The write is not awaited and the flush is: a buffered write resolves to how much it took,
+    // which says nothing about the pipe, and the flush is what puts the whole line through it.
+    void sink.write(`${JSON.stringify(instruction)}\n`);
+    await sink.flush();
   }
 
   /** The address this instance serves on, which an ephemeral `HTTP_PORT` makes it the only source of. */
@@ -138,6 +170,20 @@ export class SpawnedProcess {
     await this.reading;
 
     return code;
+  }
+
+  /**
+   * The signal the process died of, or `null` for one that exited by itself. It is what tells a
+   * drill that a kill was a kill: a process that ran its own shutdown would have exited with a code
+   * and no signal, which is the opposite of the uncleaned death `SIGKILL` is used to produce.
+   */
+  killedBy(): NodeJS.Signals | number | null {
+    return this.child.signalCode;
+  }
+
+  /** Whether the process is still running, which is how many instances a drill has left. */
+  alive(): boolean {
+    return this.child.exitCode === null && this.child.signalCode === null;
   }
 
   /** Everything the process has written so far, for an assertion or a diagnosis. */

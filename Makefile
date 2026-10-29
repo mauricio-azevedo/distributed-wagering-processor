@@ -32,7 +32,7 @@ LOCALSTACK_PORT ?= $(shell expr $(STACK_PORT_BASE) + 2)
 endif
 export COMPOSE_PROJECT_NAME STACK_IMAGE HTTP_PORT POSTGRES_PORT LOCALSTACK_PORT
 
-.PHONY: help stack check fmt fmt-check lint typecheck test audit build dev infra migrate up down
+.PHONY: help stack check fmt fmt-check lint typecheck test audit build dev infra migrate up down demo
 
 help: ## List the targets
 	@awk 'BEGIN { FS = ":.*## " } /^[a-zA-Z_-]+:.*## / { printf "  %-10s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -42,6 +42,8 @@ stack: ## Print this checkout's Compose project, image and published ports
 	  STACK_IMAGE '$(STACK_IMAGE)' HTTP_PORT '$(HTTP_PORT)' POSTGRES_PORT '$(POSTGRES_PORT)' \
 	  LOCALSTACK_PORT '$(LOCALSTACK_PORT)'
 
+# `make-check-gate` (OPS-001, `ops.repository-gate`): this target is the gate, and the `ci` workflow
+# runs this same target, so green locally means green in CI and nothing merges red.
 check: fmt-check lint typecheck test audit build ## Run the whole quality gate; verifies only, never rewrites
 
 fmt: ## Rewrite files with Prettier
@@ -79,3 +81,9 @@ up: ## Start the whole stack: dependencies, migrations and the service
 
 down: ## Stop the stack and drop its data
 	docker compose down --volumes
+
+# The one target that drives the containers instead of an application a suite boots, which is why it
+# starts the whole stack and not just the dependencies: what it demonstrates is the topology of
+# compose.yaml. `make down` before `make test`, because the suites drive the same queues.
+demo: up ## Walk through the demonstrations of docs/demonstrations.md against the running stack
+	$(BUN) run demo/walkthrough.ts

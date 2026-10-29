@@ -13,9 +13,11 @@ import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config
  * of the whole transaction at commit.
  *
  * Every case here is direct SQL as `wagering_app`, the role the service runs with, because the
- * guarantee is what the database refuses whatever wrote it; the use cases that will write both
- * sides arrive in later slices (WALLET-004, TX-001). A refusal is asserted three ways: the message
- * naming the rows that disagree, SQLSTATE 23000, and the state the transaction left behind.
+ * guarantee is what the database refuses whatever wrote it. What the use cases write instead is a
+ * chain that satisfies it: `ledger-sequence-by-wallet-version` in `bet-submission.test.ts` has
+ * three instances with skewed clocks and id mints write five operations on one wallet and shows
+ * the versions contiguous (LEDGER-007). A refusal here is asserted three ways: the message naming
+ * the rows that disagree, SQLSTATE 23000, and the state the transaction left behind.
  */
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.

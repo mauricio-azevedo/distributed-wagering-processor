@@ -2,11 +2,16 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import path from 'node:path';
 
 import { AppModule } from '../../src/app.module';
+import { sha256Hex } from '../../src/application/sha256';
+import { SubmitWagerTransaction } from '../../src/application/use-cases/submit-wager-transaction';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
-import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
+import { silentLogger } from '../../src/infrastructure/observability/logger';
+import { MetricsRegistry, uncountedMetrics } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
+import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
@@ -914,5 +919,244 @@ describe('transient-failure-503', () => {
     expect(applied.body.idempotentReplay).toBe(false);
     expect(applied.body.balance).toEqual(brl('460.00'));
     expect(await ledgerRows(walletId)).toHaveLength(2);
+  });
+});
+
+/**
+ * TX-007: every recorded outcome stores the balance it observed, and the three outcomes a
+ * submission can reach are recorded from one balance here so the column is read as what it is —
+ * the balance at the moment of the decision, not the balance afterwards. An applied operation is
+ * the one case where a second row says the same thing, and `observed_balance` has to equal the
+ * `balance_after` of the entry it wrote; the other two wrote no entry at all.
+ *
+ * The unit suite holds the same rule at the transition level (`wager-transaction.test.ts`); what
+ * this adds is the column, through the mapping, under the two currency columns of section 7 of
+ * ARCHITECTURE.md.
+ */
+describe('observed-balance-is-recorded', () => {
+  test('a processed, a rejected and a parked outcome all record the balance they saw', async () => {
+    const walletId = await openWallet('500.00');
+
+    const processed = await submit(bet(walletId));
+    const rejected = await submit(
+      bet(walletId, { externalTransactionId: 'acme-tx-000124', money: brl('1000.00') }),
+    );
+    const parked = await submit(
+      bet(walletId, {
+        externalTransactionId: 'acme-tx-000125',
+        kind: 'ROLLBACK',
+        money: brl('40.00'),
+        referenceExternalTransactionId: 'acme-tx-999999',
+      }),
+    );
+
+    expect([processed.status, rejected.status, parked.status]).toEqual([200, 422, 202]);
+    expect([processed.body.status, rejected.body.status, parked.body.status]).toEqual([
+      'PROCESSED',
+      'REJECTED',
+      'PENDING_REFERENCE',
+    ]);
+
+    const rows = await transactionRows(walletId);
+    const outcomeOf = (transactionId: string | undefined) =>
+      rows.find(({ id }) => id === transactionId);
+
+    // One balance, three outcomes: the bet moved it, and the two that followed only looked at it.
+    for (const answer of [processed, rejected, parked]) {
+      expect(outcomeOf(answer.body.transactionId)).toMatchObject({
+        observed_balance: '460.00',
+        observed_balance_currency: 'BRL',
+      });
+      expect(answer.body.balance).toEqual(brl('460.00'));
+    }
+
+    // The applied one is the only outcome an entry explains, and the two have to agree.
+    const [, debit] = await ledgerRows(walletId);
+
+    expect(debit).toMatchObject({
+      transaction_id: processed.body.transactionId,
+      balance_after: outcomeOf(processed.body.transactionId)?.observed_balance,
+    });
+    expect(await walletRow(walletId)).toEqual({ balance: '460.00', version: 2 });
+  });
+});
+
+/**
+ * IDEM-009: the replay decision holds no state of its own, so it survives the process that took it.
+ * The reservation is the committed transaction row (ADR 0004), which is why there is nothing to
+ * restart carefully: the first arrival is applied by a process that then exits, and what the next
+ * arrival finds is a row, not a cache.
+ *
+ * Three instances answer the same operation here — one that applied it and is gone, one that never
+ * saw it, and the suite's own running application, which has a warm entity manager and a connection
+ * pool of its own and still answers from the database. The in-process half of the rule, where the
+ * conflict is classified from the stored row alone, is `idempotency.test.ts`.
+ */
+describe('idempotency-survives-restart', () => {
+  const ROOT = path.resolve(import.meta.dirname, '../..');
+  const SUBMIT_IN_A_PROCESS = path.join(ROOT, 'test', 'helpers', 'submit-transaction.ts');
+
+  /** One submission in an instance of its own, which exits before the next one starts. */
+  async function submitInAnInstance(
+    body: Record<string, unknown>,
+  ): Promise<{ status: string; failureCode: string | null; idempotentReplay: boolean }> {
+    const instance = Bun.spawn(
+      [
+        process.execPath,
+        'run',
+        SUBMIT_IN_A_PROCESS,
+        JSON.stringify({
+          operation: body,
+          idempotencyKey: keyFor(body),
+          correlationId: CORRELATION_ID,
+        }),
+      ],
+      { cwd: ROOT, env: process.env, stdout: 'pipe', stderr: 'pipe' },
+    );
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(instance.stdout).text(),
+      new Response(instance.stderr).text(),
+      instance.exited,
+    ]);
+
+    if (code !== 0) {
+      throw new Error(`the instance exited ${code.toString()}: ${stdout}${stderr}`);
+    }
+
+    return JSON.parse(stdout) as {
+      status: string;
+      failureCode: string | null;
+      idempotentReplay: boolean;
+    };
+  }
+
+  test('an instance that applied it and exited leaves the decision for the next one', async () => {
+    const walletId = await openWallet('500.00');
+    const submission = bet(walletId);
+
+    const applying = await submitInAnInstance(submission);
+
+    expect(applying).toEqual({
+      status: 'PROCESSED',
+      failureCode: null,
+      idempotentReplay: false,
+    });
+
+    // That process is gone — its heap, entity manager and connection pool with it — and this is a
+    // new one, which has nothing to go on but the row the first one committed.
+    const replaying = await submitInAnInstance(submission);
+
+    expect(replaying).toEqual({
+      status: 'PROCESSED',
+      failureCode: null,
+      idempotentReplay: true,
+    });
+
+    // And a third instance, the one this suite has been running throughout, answers the same.
+    const overHttp = await submit(submission);
+
+    expect(overHttp.status).toBe(200);
+    expect(overHttp.body.idempotentReplay).toBe(true);
+    expect(overHttp.body.balance).toEqual(brl('460.00'));
+
+    // Three arrivals, one debit: the key was committed by the transaction that moved the money.
+    const operations = (await transactionRows(walletId)).filter(({ kind }) => kind === 'BET');
+
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({ status: 'PROCESSED', observed_balance: '460.00' });
+    expect(await ledgerRows(walletId)).toHaveLength(2); // the opening credit and the one debit
+    expect(await walletRow(walletId)).toEqual({ balance: '460.00', version: 2 });
+  }, 30_000);
+});
+
+/**
+ * LEDGER-007: `walletVersion` is the ledger's only ordering key, and the suite that proves the
+ * schema refuses a gap in the chain (`wallet-ledger-chain.test.ts`) writes both sides by hand. Here
+ * the use case writes them, from three instances whose clocks and id mints are deliberately skewed
+ * against each other, which is the condition the rule exists for: ids are UUIDv7 and timestamps come
+ * from each instance's own clock, so neither is monotonic across instances and neither may order
+ * anything (interpretation 20.1 #14).
+ *
+ * The three run one after another rather than at once — the races are CONC-001 to CONC-009 — because
+ * what is being shown is the sequence, not the contention: five operations leave versions 2 to 6
+ * behind the opening credit, with no gap, and sorting the very same entries by id or by creation
+ * time produces a different order and a broken chain.
+ */
+describe('ledger-sequence-by-wallet-version', () => {
+  /** Far enough apart that no two instances can mint an id or a timestamp in the same minute. */
+  const SKEWS_MS = [-5 * 60_000, 5 * 60_000, 0];
+
+  /**
+   * One instance: its own forked entity manager, so it shares no identity map with the others, and
+   * its own skew on both the clock and the id mint, since the production generator reads the host
+   * clock and would otherwise hide the skew it is supposed to expose.
+   */
+  function instance(skewMs: number): SubmitWagerTransaction {
+    return new SubmitWagerTransaction({
+      unitOfWork: new MikroOrmUnitOfWork(runtime.em.fork(), LOCK_TIMEOUT_MS),
+      clock: { now: () => new Date(Date.now() + skewMs) },
+      ids: { next: () => Bun.randomUUIDv7('hex', Date.now() + skewMs) },
+      sha256Hex,
+      logger: silentLogger,
+      metrics: uncountedMetrics,
+    });
+  }
+
+  test('five operations from three skewed instances leave one contiguous chain', async () => {
+    const walletId = await openWallet('100.00');
+    const instances = SKEWS_MS.map(instance);
+    const operations: [string, 'BET' | 'WIN', string][] = [
+      ['acme-tx-000201', 'BET', '10.00'],
+      ['acme-tx-000202', 'WIN', '20.00'],
+      ['acme-tx-000203', 'BET', '5.00'],
+      ['acme-tx-000204', 'WIN', '3.00'],
+      ['acme-tx-000205', 'BET', '8.00'],
+    ];
+
+    for (const [index, [externalTransactionId, kind, amount]] of operations.entries()) {
+      const submitting = instances[index % instances.length];
+      if (submitting === undefined) {
+        throw new Error('expected an instance for every operation');
+      }
+
+      const outcome = await submitting.execute({
+        operation: {
+          providerId: 'provider-acme',
+          externalTransactionId,
+          playerId: PLAYER_ID,
+          walletId,
+          roundId: 'round-7f3a',
+          gameId: 'lucky-sevens',
+          kind,
+          money: brl(amount),
+          referenceExternalTransactionId: null,
+        },
+        idempotencyKey: `provider-acme:${externalTransactionId}`,
+        correlationId: CORRELATION_ID,
+      });
+
+      expect(outcome.transaction.status).toBe('PROCESSED');
+    }
+
+    const entries = await ledgerRows(walletId);
+
+    // The opening credit is version 1, so five operations end at 6 with nothing missing.
+    expect(entries.map(({ wallet_version }) => wallet_version)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(await walletRow(walletId)).toEqual({ balance: '100.00', version: 6 });
+
+    // Read in that order, every entry continues the one before it and the last one is the balance.
+    let running = '0.00';
+    for (const entry of entries) {
+      expect(entry.balance_before).toBe(running);
+      running = entry.balance_after;
+    }
+    expect(running).toBe('100.00');
+
+    // And the two orderings nothing may use disagree with it, which is why the rule exists: sorting
+    // these same rows by id or by the clock that minted them breaks the chain it just satisfied.
+    const byVersion = entries.map(({ transaction_id }) => transaction_id);
+
+    expect(byVersion.toSorted()).not.toEqual(byVersion);
+    expect((await transactionRows(walletId)).map(({ id }) => id)).not.toEqual(byVersion);
   });
 });

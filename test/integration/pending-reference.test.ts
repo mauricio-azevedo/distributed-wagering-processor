@@ -863,6 +863,49 @@ describe('scheduler-exclusive-claims', () => {
   });
 });
 
+/**
+ * LEDGER-005: an entry records a movement, so an outcome that moved nothing writes none. The rule
+ * has three legs and they do not live in one place, because each is reached by a different path: a
+ * `LOSS` and a rejected `BET` are submissions, proven in `reversals-references.test.ts`, while a
+ * `FAILED` transaction is reachable only through the scheduler (`tx.failed-semantics`), which is
+ * this suite. What this leg adds over the permanent-failure case above is the question asked of the
+ * ledger directly — not "the ledger is unchanged", which the balance already implies, but "no entry
+ * names this transaction", which is what the rule says.
+ */
+describe('no-ledger-entry-without-effect', () => {
+  const entriesNaming = (transactionId: string): Promise<unknown[]> =>
+    sql('select "id" from "wallet_ledger_entries" where "transaction_id" = ?', [transactionId]);
+
+  test('a transaction the scheduler marked FAILED is named by no entry', async () => {
+    const walletId = await openWallet('500.00');
+    const rollbackId = await parked(
+      operation('acme-rollback-1', 'ROLLBACK', walletId, {
+        referenceExternalTransactionId: 'acme-bet-1',
+      }),
+    );
+    const betId = await applied(operation('acme-bet-1', 'BET', walletId));
+
+    const attempts = await sweep(
+      failing(unitOfWork, () => {
+        throw new WalletNotFoundError(walletId);
+      }),
+    );
+
+    expect(attempts).toMatchObject([{ transactionId: rollbackId, outcome: 'failed' }]);
+    expect(await transactionRow(rollbackId)).toMatchObject({
+      status: 'FAILED',
+      failure_code: 'PROCESSING_FAILED',
+    });
+
+    // The reversal reached a terminal outcome and moved nothing, so the only entries are the two
+    // movements that did happen, and neither of them is its.
+    expect(await entriesNaming(rollbackId)).toEqual([]);
+    expect(await entriesNaming(betId)).toHaveLength(1);
+    expect(await ledgerKinds(walletId)).toEqual(['OPENING CREDIT 500.00', 'BET DEBIT 40.00']);
+    expect(await walletRow(walletId)).toEqual({ balance: '460.00', version: 2 });
+  });
+});
+
 /** One player per wallet, because a player holds one wallet per currency (WALLET-001). */
 const playerOf = (slot: number): string =>
   `01a17cb1-f5c0-7588-9a61-47a9444c04${slot.toString().padStart(2, '0')}`;

@@ -1,6 +1,8 @@
 # Implementation plan
 
-Delivery slices ordered by risk and dependency. Each slice names the acceptance entries it must turn green (ids from [acceptance.yaml](acceptance.yaml)) and the evidence that closes it. A slice is done when its entries are `implemented` and `passing`, `make check` is green, and the ledger-reconstruction invariant (RECON-004) holds in every suite it added.
+Delivery slices ordered by risk and dependency. Each slice names the acceptance entries it had to turn green (ids from [acceptance.yaml](acceptance.yaml)) and the evidence that closed it. A slice was done when its entries were `implemented` and `passing`, `make check` was green, and the ledger-reconstruction invariant (RECON-004) held in every suite it added.
+
+Every slice below has shipped, in this order; this file is now the record of how the service was built, and [acceptance.yaml](acceptance.yaml) is the scoreboard it kept.
 
 Development is test-first throughout: a failing unit test for domain behaviour before the production code, integration tests against PostgreSQL and LocalStack in containers for adapters, real parallelism and several processes for concurrency.
 
@@ -84,6 +86,8 @@ Scope: consistent status classes across every endpoint; `docs/openapi.yaml` serv
 
 Acceptance: API-001, API-009, API-011, API-012, MODEL-006, OBS-001, OBS-002, OBS-003, OBS-005, OUTBOX-008, OPS-003, OPS-005, OPS-007, AUTH-001, AUTH-002. Optional extensions tracked but not scheduled: LEDGER-010, OPS-008, OPS-009.
 
-Landed with the runtime roles and the shutdown protocol of ADR 0013: OPS-003, OPS-005 and OPS-007, and with them this slice's share of slice 7 — MSG-010 and OPS-006. The observability surface landed with ADR 0012. What remains is the HTTP conformance and the authentication extension point.
+Landed in three parts: the observability surface with ADR 0012; the runtime roles and the shutdown protocol with ADR 0013, and with them this slice's share of slice 7 — MSG-010 and OPS-006; then the HTTP conformance sweep and the authentication extension point.
+
+The reviewer documentation closed it: the README setup path from a clean checkout, ARCHITECTURE.md describing what was built with its trade-offs and limitations, the seven demonstrations of [demonstrations.md](demonstrations.md) in `make demo`, and the evidence of the seven entries that had been held open for the crash-recovery drills — TX-001, TX-007, LEDGER-005, LEDGER-007, IDEM-001, IDEM-009 and REF-001.
 
 Exit evidence: `make check` green with every required entry `implemented` and `passing`; the acceptance plan is the release report.

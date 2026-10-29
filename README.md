@@ -98,7 +98,7 @@ make fmt                        # rewrite files with Prettier
 
 `GET /health/live` answers while the process serves HTTP; `GET /health/ready` answers `200` only when PostgreSQL and SQS are reachable, with one entry per dependency. `GET /docs` renders `docs/openapi.yaml` and `GET /docs-json` serves it byte for byte; `GET /metrics` exposes the Prometheus metrics.
 
-A single clone publishes the service on `3000`, PostgreSQL on `5433` and LocalStack on `4566`. Each `git worktree` of this repository gets its own Compose project, image and block of ports instead, so two checkouts run `make check` at the same time and `make down` in one leaves the other running. `make stack` prints what a checkout uses; `make` passes it to Compose, so a `docker compose` or `psql` command typed by hand needs `eval "$(make -s stack)"` first, or it addresses the wrong stack.
+A single clone publishes the service on `3000`, PostgreSQL on `5433` and LocalStack on `4566`. Each `git worktree` of this repository gets its own Compose project, image and block of ports instead, so two checkouts run `make check` at the same time and `make down` in one leaves the other running. `make stack` prints what a checkout uses; `make` passes it to Compose, so a `docker compose` or `psql` command typed by hand needs `eval "$(make -s stack)"` first, or it addresses the wrong stack. If one of the three default ports is already taken on the host, export `STACK_SLOT` with any number above zero — `export STACK_SLOT=7` — and that checkout publishes a block of its own instead; everything else, the gate included, is unchanged.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the gate, the pull request rules, CI, the board and the issue forms.
 

@@ -2,6 +2,7 @@ import type { EntityManager, QueryResult } from '@mikro-orm/postgresql';
 
 import { WalletNotFoundError } from '../../../application/errors';
 import type {
+  ProviderTransactionIdentity,
   Reservation,
   WagerTransactionRepository,
 } from '../../../application/ports/repositories';
@@ -22,6 +23,13 @@ const WALLET_FOREIGN_KEY = 'wager_transactions_wallet_id_foreign';
 
 /** SQLSTATE `foreign_key_violation`, the class a reference to a row that is not there raises. */
 const FOREIGN_KEY_VIOLATION = '23503';
+
+/**
+ * `tx.reference-matrix`: the kinds that reverse the transaction they reference, which are the ones
+ * the partial unique index of `rule.reference.reversed-once` covers. It is the schema's own
+ * vocabulary, spelled where the statement that reads the index lives.
+ */
+const REVERSAL_KINDS = ['REFUND', 'ROLLBACK'];
 
 /** `WagerTransactionRepository` over the entity manager of one open transaction (ADR 0008). */
 export class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
@@ -110,6 +118,39 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
     const row = await this.em.findOne(WagerTransactionRow, { id: transactionId });
 
     return row === null ? null : toWagerTransaction(row);
+  }
+
+  /**
+   * `rule.reference.resolution`: the unique key of a provider transaction (`tx.identity`), which
+   * is the only way a reference names one. The service id is never a lookup key here, so a
+   * provider cannot reach a row by guessing one.
+   */
+  async findByProviderTransaction(
+    identity: ProviderTransactionIdentity,
+  ): Promise<WagerTransaction | null> {
+    const row = await this.em.findOne(WagerTransactionRow, {
+      providerId: identity.providerId,
+      externalTransactionId: identity.externalTransactionId,
+    });
+
+    return row === null ? null : toWagerTransaction(row);
+  }
+
+  /**
+   * `rule.reference.reversed-once`, as the question the decision under the lock asks: the predicate
+   * of the partial unique index of SCHEMA-015, read instead of waited for. Counting the rows that
+   * index admits is what lets the second reversal of a target be recorded as the `REJECTED`
+   * outcome the contract promises; letting the index raise the violation would abort the
+   * transaction that was about to persist it.
+   */
+  async hasProcessedReversal(transactionId: string): Promise<boolean> {
+    const reversals = await this.em.count(WagerTransactionRow, {
+      referenceTransactionId: transactionId,
+      kind: { $in: REVERSAL_KINDS },
+      status: 'PROCESSED',
+    });
+
+    return reversals > 0;
   }
 
   /**

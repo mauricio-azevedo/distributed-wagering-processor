@@ -226,6 +226,29 @@ describe('wallet-aggregate-invariants', () => {
     expect(credited.version).toBe(4);
   });
 
+  test('an operation that moves no money is refused for the owner and the currency alone', () => {
+    const wallet = walletHolding('100.00');
+
+    expect(wallet.refuseUnmoved({ playerId: PLAYER_ID, money: brl('40.00') })).toBeNull();
+    expect(wallet.refuseUnmoved({ playerId: PLAYER_ID, money: brl('0.00') })).toBeNull();
+    expect(wallet.refuseUnmoved({ playerId: PLAYER_ID, money: brl('100.01') })).toBeNull();
+    expect(wallet.refuseUnmoved({ playerId: OTHER_PLAYER_ID, money: brl('40.00') })).toBe(
+      'WALLET_PLAYER_MISMATCH',
+    );
+    expect(wallet.refuseUnmoved({ playerId: PLAYER_ID, money: Money.from('40.00', 'USD') })).toBe(
+      'CURRENCY_MISMATCH',
+    );
+  });
+
+  test('an operation that moves no money leaves balance and version where they stood', () => {
+    const wallet = walletHolding('100.00');
+
+    wallet.refuseUnmoved({ playerId: PLAYER_ID, money: brl('40.00') });
+
+    expect(wallet.balance.toString()).toBe('100.00');
+    expect(wallet.version).toBe(3);
+  });
+
   test('the aggregate exposes no setter', () => {
     const wallet = walletHolding('100.00');
     const assignBalance = (): void => {

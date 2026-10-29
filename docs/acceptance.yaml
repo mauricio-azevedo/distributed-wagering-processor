@@ -212,8 +212,8 @@ entries:
       - The LOSS of "0.00" answers 200 PROCESSED with balance 460.00, no ledger entry and an unchanged version.
     evidence: { testId: submission-validation-follows-the-contract, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-007
     priority: required
@@ -319,8 +319,8 @@ entries:
       - The first WIN is 422 REJECTED with BALANCE_LIMIT_EXCEEDED and leaves balance, ledger and version unchanged; the second is PROCESSED and the balance equals the bound.
     evidence: { testId: credit-past-the-bound-is-rejected, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- WALLET
   - id: WALLET-001
@@ -380,8 +380,8 @@ entries:
       - Version is 2 after the first BET and still 2 after the replay, the rejection and the LOSS.
     evidence: { testId: version-tracks-balance-changes-only, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-005
     priority: required
@@ -736,7 +736,7 @@ entries:
       - The ledger has no entry for any of the three; the wallet version is unchanged.
     evidence: { testId: no-ledger-entry-without-effect, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: LEDGER-006
@@ -859,8 +859,8 @@ entries:
       - 200 PROCESSED with 525.00; one CREDIT entry; version incremented by one.
     evidence: { testId: win-credits-once, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-004
     priority: required
@@ -874,8 +874,8 @@ entries:
       - First two are PROCESSED; the third is REJECTED with REFERENCE_MISMATCH.
     evidence: { testId: win-optional-reference, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-005
     priority: required
@@ -889,8 +889,8 @@ entries:
       - Both answer 200 PROCESSED with balance 460.00; version 2; no entry; WagerTransactionProcessed emitted for each, no WalletBalanceChanged.
     evidence: { testId: loss-has-no-balance-effect, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-006
     priority: required
@@ -904,8 +904,8 @@ entries:
       - PROCESSED and REJECTED with REFERENCE_MISMATCH respectively.
     evidence: { testId: loss-optional-reference, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-007
     priority: required
@@ -919,8 +919,8 @@ entries:
       - 200 PROCESSED with 500.00; one CREDIT entry; the BET is marked as reversed.
     evidence: { testId: refund-credits-bet-once, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-008
     priority: required
@@ -934,8 +934,8 @@ entries:
       - 422 REJECTED with REFERENCE_KIND_NOT_ALLOWED.
     evidence: { testId: refund-references-only-bets, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-009
     priority: required
@@ -949,8 +949,8 @@ entries:
       - CREDIT 40.00, DEBIT 65.00, DEBIT 40.00, each PROCESSED with one entry.
     evidence: { testId: rollback-inverts-reference, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-010
     priority: required
@@ -964,8 +964,8 @@ entries:
       - Each is 422 REJECTED with REFERENCE_KIND_NOT_ALLOWED.
     evidence: { testId: rollback-allowed-kinds, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-011
     priority: required
@@ -979,8 +979,8 @@ entries:
       - Each REFUND resolves to its own provider's BET.
     evidence: { testId: reference-resolves-within-provider, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-012
     priority: required
@@ -994,8 +994,8 @@ entries:
       - Each is 422 REJECTED with REFERENCE_MISMATCH.
     evidence: { testId: reference-same-context, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-013
     priority: required
@@ -1009,8 +1009,8 @@ entries:
       - 422 REJECTED with REFERENCE_NOT_PROCESSED; balance unchanged.
     evidence: { testId: reference-must-be-processed, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-014
     priority: required
@@ -1039,8 +1039,8 @@ entries:
       - Both are 422 REJECTED with REFERENCE_AMOUNT_MISMATCH.
     evidence: { testId: reversal-amount-must-match, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-016
     priority: required
@@ -1054,8 +1054,8 @@ entries:
       - The second reversal is 422 REJECTED with REFERENCE_ALREADY_REVERSED; exactly one credit happened in each case.
     evidence: { testId: reference-reversed-once, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-017
     priority: required
@@ -1069,8 +1069,8 @@ entries:
       - 422 REJECTED with REVERSAL_INSUFFICIENT_BALANCE, not INSUFFICIENT_BALANCE; row persisted; balance unchanged.
     evidence: { testId: reversal-insufficient-balance-distinct-code, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-018
     priority: required
@@ -1099,8 +1099,8 @@ entries:
       - REFERENCE_KIND_NOT_ALLOWED and REFERENCE_ALREADY_REVERSED respectively.
     evidence: { testId: reversal-chain-limits, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-020
     priority: required
@@ -1124,8 +1124,8 @@ entries:
       - The decision reads nothing but the two instances.
     evidence: { testId: reversal-eligibility-is-a-domain-decision, layer: unit }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- IDEM
   - id: IDEM-001
@@ -2430,7 +2430,7 @@ entries:
       - Processed for OPENING, BET, LOSS and the applied ROLLBACK; BalanceChanged for OPENING, BET and the ROLLBACK only; Rejected for the rejected BET and the expiry; PendingReference once; nothing for FAILED.
     evidence: { testId: events-fire-when-specified, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: OUTBOX-012

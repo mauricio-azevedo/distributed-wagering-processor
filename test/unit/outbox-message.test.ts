@@ -160,6 +160,31 @@ describe('outbox-retry-backoff-is-capped', () => {
     expect(row.nextAttemptAt).toEqual(new Date(FAILED_AT.getTime() + 300_000));
   });
 
+  test.each([
+    [0, false],
+    [9, false],
+    [10, true],
+    [40, true],
+  ])('a row that failed %i times reports stalled %p', (attempts, stalled) => {
+    expect(pendingAfter(attempts).hasStalled()).toBe(stalled);
+  });
+
+  test('the tenth failure is what makes a row stalled, and it stays publishable', () => {
+    const row = enqueued();
+
+    for (let failure = 0; failure < 9; failure += 1) {
+      row.scheduleRetry(FAILED_AT);
+    }
+
+    expect(row.hasStalled()).toBe(false);
+
+    row.scheduleRetry(FAILED_AT);
+
+    expect(row.hasStalled()).toBe(true);
+    expect(row.isPublished()).toBe(false);
+    expect(row.nextAttemptAt).toEqual(new Date(FAILED_AT.getTime() + 300_000));
+  });
+
   test('a row is never discarded: after ten failures it is still pending and publishable', () => {
     const row = enqueued();
 
@@ -211,7 +236,7 @@ describe('outbox-transitions-are-explicit', () => {
       row.publishedAt = PUBLISHED_AT;
     };
     // A private member of TypeScript is still on the prototype at runtime; the surface the
-    // publisher can reach is three readings, one question and the two transitions.
+    // publisher can reach is three readings, two questions and the two transitions.
     const surface = Object.getOwnPropertyNames(OutboxMessage.prototype).filter(
       (name) => !['constructor', 'assertPending', 'backoffSeconds'].includes(name),
     );
@@ -220,6 +245,7 @@ describe('outbox-transitions-are-explicit', () => {
     expect(row.publishedAt).toBeNull();
     expect(surface.toSorted()).toEqual([
       'attempts',
+      'hasStalled',
       'isPublished',
       'markPublished',
       'nextAttemptAt',

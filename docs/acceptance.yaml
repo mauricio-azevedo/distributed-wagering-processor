@@ -2274,90 +2274,90 @@ entries:
     requirement: Nothing is published before the financial transaction commits.
     contract: outbox.publish-after-commit
     enforcement:
-      - Events are written to the outbox table only; the publisher reads committed rows.
+      - Events are written to the outbox table only; PublishOutbox claims rows whose published_at is null, a predicate no uncommitted row can match.
     scenario:
-      - Hold a financial transaction open past its outbox insert; observe the events queue.
+      - Hold a financial transaction open past its outbox insert; run a publisher cycle on another connection and watch the events queue.
     expected:
-      - No message until commit; the message appears after.
+      - The cycle claims nothing and no message appears; once the transaction commits, the next cycle claims the row and publishes it.
     evidence: { testId: publish-after-commit, layer: integration }
-    deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    deliverySlice: outbox-publisher
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-003
     priority: required
     requirement: Concurrent publishers drain one outbox without losing a row.
     contract: outbox.concurrent-publishers
     enforcement:
-      - FOR UPDATE SKIP LOCKED batch claims.
+      - PublishOutbox claims a batch with FOR UPDATE SKIP LOCKED and commits the publication markers in the transaction that holds the claim.
     scenario:
-      - Enqueue 5000 rows; run two publishers.
+      - Enqueue 5000 rows; run two publisher processes until the outbox holds nothing pending.
     expected:
-      - Every event id is received at least once; the overwhelming majority exactly once.
+      - The two publishers' own counts of sent messages add up to 5000, so no row was claimed twice; no row is left pending, none was retried, and every event id reaches the queue.
     evidence: { testId: two-publishers-one-outbox, layer: concurrency }
     deliverySlice: outbox-publisher
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-004
     priority: required
     requirement: The event id is fixed when enqueued and reused on every publication.
     contract: outbox.stable-event-id
     enforcement:
-      - eventId fixed when the event is recorded, carried into the stored envelope by OutboxMessage.enqueue and used as the primary key.
+      - eventId fixed when the event is recorded, carried into the stored envelope by OutboxMessage.enqueue and used as the primary key; every publication sends the stored envelope and never one rebuilt from state that moved.
     scenario:
-      - Publish a row, force a republish.
+      - Publish a row, lose the commit that records the publication, and let the next cycle republish it.
     expected:
-      - Both messages carry the same eventId.
+      - Both messages carry the same eventId and are byte-identical.
     evidence: { testId: stable-event-id, layer: integration }
-    deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    deliverySlice: outbox-publisher
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-005
     priority: required
     requirement: A crash after commit and before publication is recovered by another instance.
     contract: outbox.crash-recovery
     enforcement:
-      - Locks released by PostgreSQL; rows remain pending.
+      - The claim is a row lock held by the publisher's transaction, which PostgreSQL releases when the connection closes; the rows stay pending, so nothing has to be reaped and nobody has to be called.
     scenario:
-      - Commit a transaction on instance A and kill A before its publisher runs; also kill a publisher after it claimed a batch.
+      - SIGKILL a publisher holding a claimed batch it has not published, with the rest of the backlog still claimable, then run another instance.
     expected:
-      - Instance B publishes the rows within one polling interval.
+      - While the first instance lives, another claim sees only the rows it did not take; once it is killed, the surviving instance publishes every row of the backlog, each at its first attempt.
     evidence: { testId: publisher-crash-recovery, layer: concurrency }
     deliverySlice: outbox-publisher
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-006
     priority: required
     requirement: Duplicate publication is safe for consumers.
     contract: [outbox.duplicate-safe, event.at-least-once]
     enforcement:
-      - Same envelope on republish; consumers deduplicate by eventId; FIFO deduplication id set.
+      - The envelope is sent as the row stores it and the publication marker commits after the send, so a lost commit republishes the same message; consumers deduplicate by eventId and the FIFO deduplication id is an extra filter, never the guarantee.
     scenario:
-      - Kill a publisher after SendMessage and before commit.
+      - Lose the commit that records a publication, let the next cycle republish the row, and hand the reference consumer every copy the publisher sent along with the one the queue delivered.
     expected:
-      - At least one copy reaches the queue and every copy carries the same eventId and an identical envelope; the row ends with published_at set; a reference consumer applies the event once whatever the number of copies.
+      - A copy reaches the queue and every copy carries the same eventId and an identical envelope; the row ends with published_at set; the reference consumer applies the event once whatever the number of copies.
     evidence: { testId: duplicate-publication-safe, layer: integration }
     deliverySlice: outbox-publisher
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-007
     priority: required
     requirement: A failed publication is retried with capped backoff and never dropped.
     contract: outbox.retry-backoff
     enforcement:
-      - OutboxMessage.scheduleRetry increments attempts and sets next_attempt_at to the capped backoff; no transition discards a row; alert metric after ten attempts.
+      - OutboxMessage.scheduleRetry increments attempts and sets next_attempt_at to the capped backoff; the claim leaves a row that is not due alone; no transition discards a row; from the tenth attempt the publisher records outbox.publication-stalled at error level, and the backlog metrics that raise the alert condition arrive with OUTBOX-008.
     scenario:
-      - Stop LocalStack for ten minutes with rows pending; restart.
+      - Run cycles against an unreachable broker over a clock the case moves, one row already at nine attempts, then make the broker reachable again.
     expected:
-      - Attempts grow with capped intervals; after restart every row is published.
+      - Attempts grow with intervals of two, four, ... seconds capped at five minutes; a row before its next attempt is not claimed; the tenth attempt is reported; nothing is discarded; every row is published with its attempts intact once the broker returns.
     evidence: { testId: publisher-backoff-never-drops, layer: integration }
     deliverySlice: outbox-publisher
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-008
     priority: required
@@ -2370,7 +2370,7 @@ entries:
     expected:
       - wager_outbox_pending and wager_outbox_lag_seconds rise, then return to zero.
     evidence: { testId: outbox-metrics, layer: integration }
-    deliverySlice: outbox-publisher
+    deliverySlice: http-observability-shutdown
     implementationStatus: planned
     verificationStatus: not-run
 
@@ -2379,15 +2379,15 @@ entries:
     requirement: Events are published to the events queue with the wallet as group and the event id as deduplication id.
     contract: outbox.destination
     enforcement:
-      - SendMessage parameters in the publisher.
+      - SqsEventPublisher sends one message per row to wager-integration-events.fifo, taking both FIFO parameters off the row itself.
     scenario:
-      - Publish an event; inspect the message attributes.
+      - Publish an event; receive it from the queue with its message attributes.
     expected:
-      - MessageGroupId equals aggregateId; MessageDeduplicationId equals eventId.
+      - MessageGroupId equals aggregateId; MessageDeduplicationId equals eventId; the body is the stored envelope, carrying the members docs/asyncapi.yaml defines.
     evidence: { testId: events-destination-attributes, layer: integration }
     deliverySlice: outbox-publisher
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-010
     priority: required
@@ -2438,15 +2438,15 @@ entries:
     requirement: Consumers are told ordering is not guaranteed and are given the fields to order by.
     contract: event.ordering
     enforcement:
-      - walletVersion on balance events; occurredAt on all; documented in the system contract.
+      - walletVersion on balance events; occurredAt on all; stated in the system contract and in the publishIntegrationEvents operation of docs/asyncapi.yaml; the reference consumer of the suites orders by walletVersion.
     scenario:
-      - Run two publishers over one wallet's events; order the received events by walletVersion.
+      - Publish one wallet's balance events in cycles of their own and hand the delivered messages to the reference consumer in reverse order of delivery.
     expected:
-      - The reordered sequence rebuilds the ledger chain exactly.
+      - Ordered by walletVersion the chain rebuilds exactly: each event's balanceBefore is the previous event's balanceAfter, and the last balanceAfter is the wallet's balance.
     evidence: { testId: consumer-side-ordering, layer: integration }
     deliverySlice: outbox-publisher
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- REF
   - id: REF-001

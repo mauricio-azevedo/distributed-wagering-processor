@@ -15,6 +15,19 @@ const serviceSchema = z.object({
   AWS_REGION: z.string().min(1),
   /** Set for LocalStack; absent, the SDK resolves the regional endpoint. */
   SQS_ENDPOINT: z.url({ protocol: /^https?$/ }).optional(),
+  /**
+   * The three knobs of the outbox publisher (ADR 0005). They are configuration and not
+   * correctness: whatever they are set to, every row is published at least once and none is lost.
+   *
+   * `OUTBOX_BATCH_SIZE` and `OUTBOX_PUBLISH_TIMEOUT_MS` together bound how long one cycle holds a
+   * database connection while it talks to the broker, which is the cost ADR 0005 accepts for a
+   * protocol with no lease; `OUTBOX_POLL_INTERVAL_MS` is how long a publisher waits after a cycle
+   * that found nothing, so it is the upper bound on how late an event is published when the
+   * service is idle, and the floor on the load an empty outbox puts on PostgreSQL.
+   */
+  OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(50),
+  OUTBOX_PUBLISH_TIMEOUT_MS: z.coerce.number().int().min(1).default(5000),
+  OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(1).default(1000),
 });
 
 const migrationSchema = z.object({

@@ -146,6 +146,23 @@ describe('two-database-roles', () => {
     }
   });
 
+  test('every table is owned by the migrator role', async () => {
+    const orm = await MikroORM.init(
+      ormConfig(loadMigrationEnv(process.env).MIGRATION_DATABASE_URL),
+    );
+    try {
+      const owners = await orm.em
+        .getConnection()
+        .execute<{ tableowner: string }[]>(
+          `select distinct tableowner from pg_tables where schemaname = 'public'`,
+        );
+
+      expect(owners.map((row) => row.tableowner)).toEqual(['wagering_migrator']);
+    } finally {
+      await orm.close(true);
+    }
+  });
+
   test('the service connects as the runtime role, which cannot change the schema', async () => {
     const orm = await MikroORM.init(ormConfig(env.DATABASE_URL));
     try {

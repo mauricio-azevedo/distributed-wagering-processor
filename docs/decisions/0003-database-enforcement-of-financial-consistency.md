@@ -56,6 +56,15 @@ Checks:
   `(direction = 'CREDIT' AND balance_after = balance_before + amount) OR (direction = 'DEBIT' AND balance_after = balance_before - amount)`;
   composite foreign key `(wallet_id, currency) REFERENCES wallets (id, currency)`, so an entry can never carry
   a currency other than its wallet's.
+- Every monetary column carries one more `CHECK` of its own, excluding the non-finite `NaN` with
+  `<> 'NaN'::numeric` (`money.finite-in-database`). It stands beside the range check of the same column rather
+  than inside it: `NaN` satisfies every range, equality and arithmetic predicate in this list, so the exclusion
+  is the only thing that refuses it, and keeping it separate is what lets SCHEMA-026 drop it alone and show
+  that the rest of the schema admits the value.
+- The closed vocabularies are checks too, on `TEXT` columns rather than enumerated types: kind, status and
+  failure code on `wager_transactions`, kind and direction on `wallet_ledger_entries`, event type on
+  `outbox_messages`. A vocabulary then grows by a migration that replaces one constraint instead of by an
+  `ALTER TYPE` that the table and every dependent view have to follow.
 
 Immutability:
 
@@ -74,8 +83,9 @@ Immutability:
   classified like a refusal by a constraint and the persistence adapter needs no special case to call it
   permanent.
 - Two database roles: `wagering_migrator` owns the schema and runs migrations; `wagering_app` runs the service
-  with `SELECT` and `INSERT` on the ledger, `SELECT`, `INSERT` and `UPDATE` elsewhere, and no DDL. The trigger
-  protects against mistakes; the privileges protect against bypassing the trigger.
+  with `SELECT` and `INSERT` on the ledger, `SELECT`, `INSERT` and `UPDATE` on the other tables, no `DELETE`
+  anywhere, nothing at all on the migration log, and no DDL, which follows from not owning the tables. The
+  trigger protects against mistakes; the privileges protect against bypassing the trigger.
 
 The transaction trigger was checked against PostgreSQL 18 with direct SQL, the updates as `wagering_app` and
 the deletes as the schema owner: a `PROCESSED` row set back to `PENDING` with `processed_at` cleared, a

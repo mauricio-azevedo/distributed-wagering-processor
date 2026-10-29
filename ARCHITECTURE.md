@@ -74,6 +74,7 @@ Each decision is `accepted`, and each one shipped as recorded: no ADR was supers
 - [ADR 0012](docs/decisions/0012-structured-logs-and-operational-metrics.md) Logs and metrics: JSON lines behind the `Logger` port with the correlation id bound per unit of work in an `AsyncLocalStorage`, redaction in that one adapter, and the metric names and their labels spelled in the `Metrics` port as a mapped type so a name outside the contract does not compile.
 - [ADR 0013](docs/decisions/0013-runtime-roles-and-the-shutdown-protocol.md) Runtime roles and shutdown: `APP_ROLE` selects the controllers and whether the worker processes start, one signal handler bounds every drain by the grace period, the HTTP drain releases the connections nobody is using, and one `WorkerLoop` gives the three background processes the same stop.
 - [ADR 0014](docs/decisions/0014-isolating-the-suites-from-the-demonstration-stack.md) Suite isolation: the gate and the demonstrations share the containers and nothing else — a database and a trio of queues each, with the queue prefix as the only setting it takes.
+- [ADR 0015](docs/decisions/0015-measuring-the-service-under-load.md) Measuring under load: a scenario of this repository's own on an overlay that adds three `api` instances and changes nothing else, counting completed unique operations apart from replays and persisted rejections, reading the counters and gauges the service already exports, and draining before it reconciles every wallet it touched.
 - [ADR 0011](docs/decisions/0011-pending-reference-recovery.md) Pending references: one schedule row claimed per attempt with `FOR UPDATE SKIP LOCKED`, the attempt reusing the financial step a submission takes, the window consulted only after an attempt that ran, and `FAILED` reached only from a failure the service positively recognises as permanent.
 
 ### Persistence with MikroORM
@@ -171,9 +172,10 @@ Both kills are taken at a barrier and never at a moment the suite picked: the in
 
 - The publisher holds a database connection while talking to the broker (bounded by batch size and timeout). Leases would free the connection at the price of lease tuning and a reaper; see ADR 0005.
 - Events are not ordered across publisher instances; consumers order by `walletVersion` or `occurredAt`.
+- Event publication, not financial processing, is this stack's throughput ceiling. Each processed operation commits one or two integration events in the same transaction, and the load experiment measured the publishers moving roughly 500–570 outbox rows per second against the ~2,200 per second that ~1,200 operations per second produce: the backlog peaked above 84,000 rows and the oldest unpublished row reached minutes of age before both gauges returned to zero once load stopped. It costs no correctness — a row is published at least once whatever the backlog (ADR 0005) — and it is visible in exactly the metric an operator alerts on (`outbox.lag-metrics`). The levers are the publisher's batch and poll interval and the number of `worker` instances, none of which this version tunes ([docs/load-experiment.md](docs/load-experiment.md)).
 - Reversal chains stop at one level: a `REFUND` can be rolled back, but a `ROLLBACK` cannot be reversed and a refunded bet cannot be refunded again after the refund was rolled back. One reversal per transaction, positive `LOSS` amounts and the binding of a provider transaction id to its first key are deliberate tightenings, listed with their compatibility consequences in the system contract (section 20.2).
 - The wallet lock is an explicit SQL statement in the repository rather than an ORM lock mode (ADR 0002).
-- Throughput on one wallet is bounded by the duration of its financial transaction (ADR 0002). The concurrency suite asserts nothing about it, and no figure in it is a latency target: what it shows for `conc.parallel-wallets` is that an operation on one wallet does not wait for an operation on another, observed by holding one transaction open while the other commits rather than by comparing how long two loads took.
+- Throughput on one wallet is bounded by the duration of its financial transaction (ADR 0002). The concurrency suite asserts nothing about it, and no figure in it is a latency target: what it shows for `conc.parallel-wallets` is that an operation on one wallet does not wait for an operation on another, observed by holding one transaction open while the other commits rather than by comparing how long two loads took. What that bound costs is measured instead: with half the traffic aimed at four of sixty wallets, those four answered with about twice the median and eleven to thirteen times the 99th percentile of the rest, and `wager_lock_conflicts_total` stayed at zero because nothing waited out the three-second ceiling ([docs/load-experiment.md](docs/load-experiment.md)).
 - Balances are bounded by the money column; a credit past `999999999999999999.99` is rejected with `BALANCE_LIMIT_EXCEEDED` (ADR 0001).
 - A `FAILED` transaction replays as `500` with the outcome body; a provider's generic retry policy may resend it until it reads the body, harmlessly.
 - A transaction that reaches `FAILED` emits no event in this version; it is visible through the read endpoints and metrics.
@@ -189,9 +191,11 @@ Both kills are taken at a barrier and never at a moment the suite picked: the in
 
 Everything sections 1 to 9 describe is implemented and verified: every required entry of
 [docs/acceptance.yaml](docs/acceptance.yaml) is `implemented` and `passing`, naming the suite that
-carries it, and `make check` runs all of them. The three `optional` entries are extensions this
-version deliberately does not build — double-entry bookkeeping (LEDGER-010), a load-test report
-(OPS-008) and OpenTelemetry tracing (OPS-009) — each recorded with what building it would add.
+carries it, and `make check` runs all of them. Of the three `optional` entries, the load-test report
+(OPS-008) was built afterwards as an extension: `bun run test:load` drives three `api` instances and
+the two workers and [docs/load-experiment.md](docs/load-experiment.md) is its report. Double-entry
+bookkeeping (LEDGER-010) and OpenTelemetry tracing (OPS-009) are extensions this version
+deliberately does not build, each recorded with what building it would add.
 [docs/demonstrations.md](docs/demonstrations.md) walks the same guarantees against a running stack.
 
 What follows is that implementation layer by layer, in the order it was built, because each layer

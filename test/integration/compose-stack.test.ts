@@ -35,9 +35,16 @@ interface ComposeFile {
  * The topology as Compose itself resolves it, anchors, defaults and variables included: asserting
  * the YAML text would prove what the file says, and this proves what Compose will do with it.
  */
-function resolved(): ComposeFile {
+function resolved(...files: string[]): ComposeFile {
   const { success, stdout, stderr } = Bun.spawnSync(
-    ['docker', 'compose', 'config', '--format', 'json'],
+    [
+      'docker',
+      'compose',
+      ...['compose.yaml', ...files].flatMap((file) => ['--file', file]),
+      'config',
+      '--format',
+      'json',
+    ],
     { cwd: ROOT, env: BARE_ENV },
   );
 
@@ -49,6 +56,11 @@ function resolved(): ComposeFile {
 }
 
 const stack = resolved();
+
+const publishedBy = (service: ComposeService): string[] =>
+  (service.ports ?? []).map(
+    ({ published, target }) => `${published ?? ''}:${(target ?? 0).toString()}`,
+  );
 
 const serviceOf = (name: string): ComposeService => {
   const service = stack.services[name];
@@ -110,11 +122,7 @@ describe('compose-stack', () => {
 
   test('two worker instances run, and only the api publishes a port', () => {
     expect(serviceOf('worker').deploy?.replicas).toBe(2);
-    expect(
-      serviceOf('api').ports?.map(
-        ({ published, target }) => `${published ?? ''}:${(target ?? 0).toString()}`,
-      ),
-    ).toEqual(['3000:3000']);
+    expect(publishedBy(serviceOf('api'))).toEqual(['3000:3000']);
     expect(serviceOf('worker').ports).toBeUndefined();
   });
 
@@ -145,5 +153,55 @@ describe('compose-stack', () => {
       expect(grace).toBeGreaterThan(0);
       expect(grace).toBeLessThan(20_000);
     }
+  });
+});
+
+/**
+ * `compose-load-stack` (OPS-008): the topology the load experiment measures, which is the stack
+ * above with three `api` instances instead of one. It is an overlay of `compose.yaml` and not a
+ * second stack precisely because of what the experiment claims: the numbers describe the deployed
+ * configuration, so the only difference the overlay is allowed to make is the instance count and
+ * the host ports those instances need. A knob tuned here — a longer lock timeout, a larger outbox
+ * batch — would turn the report into a measurement of something nobody runs.
+ */
+describe('compose-load-stack', () => {
+  const load = resolved('compose.load.yaml');
+
+  const loadServiceOf = (name: string): ComposeService => {
+    const service = load.services[name];
+
+    if (service === undefined) {
+      throw new Error(`the load topology declares no ${name} service`);
+    }
+
+    return service;
+  };
+
+  test('three api instances run, and the two workers are the ones the stack already runs', () => {
+    expect(loadServiceOf('api').deploy?.replicas).toBe(3);
+    expect(loadServiceOf('worker').deploy?.replicas).toBe(2);
+    expect(Object.keys(load.services).toSorted()).toEqual(Object.keys(stack.services).toSorted());
+  });
+
+  /**
+   * One published range instead of one port, because three containers cannot share a host port and
+   * `make stack` reserves a block of them per checkout. Compose hands each instance a free port
+   * from the range in no particular order, which is why the experiment asks Compose which port
+   * went to which instance instead of computing it.
+   */
+  test('the api publishes a range of exactly three ports, replacing the single one', () => {
+    expect(publishedBy(loadServiceOf('api'))).toEqual(['3000-3002:3000']);
+  });
+
+  test('nothing else about either role changes, so the numbers describe the deployed stack', () => {
+    for (const role of ['api', 'worker']) {
+      expect(loadServiceOf(role).environment).toEqual(serviceOf(role).environment);
+      expect(loadServiceOf(role).image).toBe(serviceOf(role).image);
+      expect(loadServiceOf(role).stop_grace_period).toBe(serviceOf(role).stop_grace_period);
+      expect(loadServiceOf(role).healthcheck?.test).toEqual(serviceOf(role).healthcheck?.test);
+      expect(loadServiceOf(role).depends_on).toEqual(serviceOf(role).depends_on);
+    }
+
+    expect(loadServiceOf('worker').ports).toBeUndefined();
   });
 });

@@ -31,7 +31,7 @@
 
 ## CI
 
-- `ci` copies `.env.example` to `.env` and runs `make check` on every PR and on push to `main`; on failure it prints the container logs.
+- `ci` runs the same checks as `make check`, split into four parallel jobs — `static` (`fmt-check`, `lint`, `typecheck`, `audit`, `build`), `fast` (`test/unit` and `test/contract`), `integration` (`test/integration`, sharded three ways with Bun's `--shard`, balanced by the committed `test/integration.timings.json`) and `concurrency` (`test/concurrency`) — on every PR and on push to `main`; a fifth job, `ci`, depends on the four and is the required status check (`ops.parallel-gate`, ADR 0016). Each job that runs tests starts its own PostgreSQL and LocalStack through `make infra` and prints the container logs on failure.
 - `pr-title` validates the PR title. It sits outside `make check` because it reads the PR, not the code.
 - Actions are pinned to a full commit SHA, version in a comment: `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. Tags can be moved; SHAs can't.
 

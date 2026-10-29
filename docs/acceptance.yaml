@@ -2970,7 +2970,7 @@ entries:
     evidence: { testId: parallel-ci-gate, layer: manual }
     deliverySlice: parallel-ci-gate
     implementationStatus: implemented
-    verificationStatus: not-run
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- AUTH
   - id: AUTH-001

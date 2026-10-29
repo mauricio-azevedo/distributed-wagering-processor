@@ -411,7 +411,7 @@ function committingAfterTheWalletRead(
         work({
           ...repositories,
           wallets: {
-            insert: (wallet) => repositories.wallets.insert(wallet),
+            ...repositories.wallets,
             findById: async (walletId) => {
               const wallet = await repositories.wallets.findById(walletId);
               await writer();

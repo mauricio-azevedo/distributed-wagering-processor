@@ -13,6 +13,14 @@ export type TransactionStatus =
   'PENDING' | 'PENDING_REFERENCE' | 'PROCESSED' | 'REJECTED' | 'FAILED';
 
 /**
+ * The statuses a recorded outcome can carry, which are the four `TransactionStatus` of
+ * [docs/openapi.yaml](../../docs/openapi.yaml): every answer about a transaction and every replay
+ * is one of them, because `PENDING` is only ever the status of a row inside the transaction that is
+ * about to record its first outcome.
+ */
+export type RecordedTransactionStatus = Exclude<TransactionStatus, 'PENDING'>;
+
+/**
  * The failure codes a rejection can carry. `PROCESSING_FAILED` is the outcome of `fail` alone, and
  * a `FAILED` transaction carries nothing else (`tx.failed-semantics`), so the code each transition
  * owns is settled by the type rather than by review (`failure.stable-codes`).

@@ -8,6 +8,25 @@
 /** `tx.kinds`: what a provider submits, plus the internal `OPENING` credit. */
 export type TransactionKind = 'OPENING' | 'BET' | 'WIN' | 'LOSS' | 'REFUND' | 'ROLLBACK';
 
+/**
+ * `tx.kinds`, `tx.opening-internal`: the kinds a provider may submit. `OPENING` is the service's
+ * own credit and is refused on both entry points, so it is excluded by the type rather than by a
+ * check each adapter repeats.
+ *
+ * The list exists beside the type because the adapters validate against it at runtime: it is the
+ * one spelling of `WagerOperationKind` of [docs/openapi.yaml](../../docs/openapi.yaml), so the
+ * kinds a request may carry and the kinds the type admits cannot drift apart.
+ */
+export type WagerOperationKind = Exclude<TransactionKind, 'OPENING'>;
+
+export const WAGER_OPERATION_KINDS: readonly WagerOperationKind[] = [
+  'BET',
+  'WIN',
+  'LOSS',
+  'REFUND',
+  'ROLLBACK',
+];
+
 /** `tx.affects-balance`: the kinds that move money and so write a ledger entry. */
 export type BalanceChangingKind = Exclude<TransactionKind, 'LOSS'>;
 

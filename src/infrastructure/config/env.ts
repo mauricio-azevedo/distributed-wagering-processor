@@ -6,6 +6,12 @@ const postgresUrl = z.url({ protocol: /^postgres(ql)?$/ });
 const serviceSchema = z.object({
   HTTP_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   DATABASE_URL: postgresUrl,
+  /**
+   * `conc.row-lock`: how long a financial operation waits for a wallet row before the attempt
+   * becomes a transient failure (ADR 0002). It is a setting because the ceiling belongs to the
+   * deployment: it trades how long a caller is held for how often one is asked to retry.
+   */
+  LOCK_TIMEOUT_MS: z.coerce.number().int().min(1).default(3000),
   AWS_REGION: z.string().min(1),
   /** Set for LocalStack; absent, the SDK resolves the regional endpoint. */
   SQS_ENDPOINT: z.url({ protocol: /^https?$/ }).optional(),

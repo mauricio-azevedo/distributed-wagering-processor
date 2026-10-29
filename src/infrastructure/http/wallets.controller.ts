@@ -3,6 +3,7 @@ import { Body, Controller, Get, HttpCode, Param, Post, Res } from '@nestjs/commo
 import { GetWallet } from '../../application/use-cases/get-wallet';
 import { OpenWallet } from '../../application/use-cases/open-wallet';
 import { ReconcileWallet } from '../../application/use-cases/reconcile-wallet';
+import { uuidSchema } from './contract.dto';
 import { CorrelationId } from './correlation-id';
 import { ZodValidationPipe } from './request-validation';
 import {
@@ -11,7 +12,6 @@ import {
   type WalletResponse,
   openWalletRequestSchema,
   reconciliationReportResponse,
-  uuidSchema,
   walletResponse,
 } from './wallet.dto';
 

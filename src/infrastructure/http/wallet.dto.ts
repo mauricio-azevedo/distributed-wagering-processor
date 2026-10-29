@@ -1,36 +1,16 @@
 import { z } from 'zod';
 
 import type { ReconciliationReport } from '../../application/use-cases/reconcile-wallet';
-import { AMOUNT_PATTERN, CURRENCY_PATTERN, type MoneyProps } from '../../domain/money';
+import type { MoneyProps } from '../../domain/money';
 import type { Wallet } from '../../domain/wallet';
+import { moneyPropsSchema, uuidSchema } from './contract.dto';
 
 /**
  * The request and response shapes of the wallet endpoints, implementing `OpenWalletRequest`,
- * `Wallet`, `MoneyProps` and `Uuid` of [docs/openapi.yaml](../../../docs/openapi.yaml)
+ * `Wallet` and `ReconciliationReport` of [docs/openapi.yaml](../../../docs/openapi.yaml)
  * (`model.contract-first`). The document is authoritative; these schemas are how the service
- * enforces it at runtime.
- *
- * The money patterns come from the domain, which is the one place they are written, so a request
- * the validator admits is one `Money.from` can parse and a rejection names the member instead of
- * surfacing as a parse error with no path (`money.decimal-string`).
+ * enforces it at runtime, over the primitive shapes of `contract.dto.ts`.
  */
-
-/** `Uuid`: RFC 9562 canonical lowercase form, the shape of every id the service mints or receives. */
-export const uuidSchema = z
-  .string()
-  .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, {
-    error: 'must be a lowercase UUID',
-  });
-
-/** `MoneyProps`: an exact amount as a string, never a JSON number (`model.money-props-in-contracts`). */
-const moneyPropsSchema = z.strictObject({
-  amount: z.string({ error: 'must be a decimal string' }).regex(AMOUNT_PATTERN, {
-    error: `must match ${AMOUNT_PATTERN.source}`,
-  }),
-  currency: z.string({ error: 'must be a string' }).regex(CURRENCY_PATTERN, {
-    error: `must be an ISO 4217 alphabetic code matching ${CURRENCY_PATTERN.source}`,
-  }),
-});
 
 /**
  * `OpenWalletRequest`: the owner and the amount the wallet opens with, whose currency is the

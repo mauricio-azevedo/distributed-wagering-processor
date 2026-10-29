@@ -210,9 +210,9 @@ entries:
     expected:
       - Every submission in the first group answers 400 VALIDATION_FAILED and persists no transaction row.
       - The LOSS of "0.00" answers 200 PROCESSED with balance 460.00, no ledger entry and an unchanged version.
-    evidence: { testId: operation-amount-must-be-positive, layer: integration }
+    evidence: { testId: submission-validation-follows-the-contract, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: MONEY-007
@@ -287,10 +287,10 @@ entries:
       - Open a BRL wallet; submit a BET in USD against it.
     expected:
       - 422 REJECTED with CURRENCY_MISMATCH; balance and ledger unchanged.
-    evidence: { testId: currency-conflict-is-rejected, layer: integration }
+    evidence: { testId: wallet-rejects-foreign-currency, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-012
     priority: required
@@ -380,7 +380,7 @@ entries:
       - Version is 2 after the first BET and still 2 after the replay, the rejection and the LOSS.
     evidence: { testId: version-tracks-balance-changes-only, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: WALLET-005
@@ -412,8 +412,8 @@ entries:
       - 422 with failureCode CURRENCY_MISMATCH; the transaction row exists as REJECTED; no entry.
     evidence: { testId: wallet-rejects-foreign-currency, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-007
     priority: required
@@ -427,8 +427,8 @@ entries:
       - 422 with failureCode WALLET_PLAYER_MISMATCH; balance unchanged; row persisted.
     evidence: { testId: wallet-rejects-foreign-player, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-008
     priority: required
@@ -522,7 +522,7 @@ entries:
       - HTTP answers 400 VALIDATION_FAILED; the messages land in the dead-letter queue; nothing is persisted.
     evidence: { testId: internal-kind-and-provider-are-refused, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: TX-002
@@ -535,10 +535,10 @@ entries:
       - Submit two different payloads with the same providerId and externalTransactionId under different keys.
     expected:
       - The second answers 409 EXTERNAL_TRANSACTION_ALREADY_BOUND; one row exists.
-    evidence: { testId: provider-transaction-id-is-unique, layer: integration }
+    evidence: { testId: idempotency-conflicts-persist-nothing, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: TX-003
     priority: required
@@ -565,10 +565,10 @@ entries:
       - Submit a ROLLBACK whose reference equals its own external id.
     expected:
       - 400 VALIDATION_FAILED; nothing persisted.
-    evidence: { testId: self-reference-is-invalid, layer: integration }
+    evidence: { testId: submission-validation-follows-the-contract, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: TX-005
     priority: required
@@ -767,7 +767,7 @@ entries:
       - walletVersion runs 1..6 without gaps; ordering by walletVersion matches the balance chain even where UUID order does not.
     evidence: { testId: ledger-sequence-by-wallet-version, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: LEDGER-008
@@ -829,8 +829,8 @@ entries:
       - 200 PROCESSED with balance 460.00; one DEBIT entry 40.00 from 500.00 to 460.00; version 2.
     evidence: { testId: bet-debits-once, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-002
     priority: required
@@ -844,8 +844,8 @@ entries:
       - 422 with INSUFFICIENT_BALANCE; balance 100.00; version 1; no entry; WagerTransactionRejected emitted.
     evidence: { testId: bet-insufficient-balance-rejected, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-003
     priority: required
@@ -1084,8 +1084,8 @@ entries:
       - Wallet and ledger identical; outbox gained exactly one WagerTransactionRejected.
     evidence: { testId: rejection-has-no-side-effects, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-019
     priority: required
@@ -1139,7 +1139,7 @@ entries:
       - POST without the header; POST with a 300-character key; a message without data.idempotencyKey.
     expected:
       - 400 IDEMPOTENCY_KEY_REQUIRED; 400 VALIDATION_FAILED; the message goes to the dead-letter queue.
-    evidence: { testId: idempotency-key-required-and-formatted, layer: integration }
+    evidence: { testId: request-errors-are-stateless, layer: integration }
     deliverySlice: atomic-bet
     implementationStatus: in-progress
     verificationStatus: not-run
@@ -1155,10 +1155,10 @@ entries:
       - Two providers submit different operations with the same key string.
     expected:
       - Both are processed; two rows exist.
-    evidence: { testId: idempotency-key-scoped-per-provider, layer: integration }
+    evidence: { testId: idempotency-conflicts-persist-nothing, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-003
     priority: required
@@ -1205,8 +1205,8 @@ entries:
       - 200 then 200 with idempotentReplay true and the same transactionId; 422 then 422 likewise.
     evidence: { testId: replay-returns-stored-outcome, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-006
     priority: required
@@ -1218,9 +1218,9 @@ entries:
       - Park a ROLLBACK (202); replay (202); let the reference arrive and the scheduler apply it; replay again; move the balance with another bet; replay once more.
     expected:
       - 202, 202, then 200 with the balance observed when applied, unchanged by the later bet.
-    evidence: { testId: replay-after-wallet-change-and-restart, layer: integration }
+    evidence: { testId: replay-after-wallet-change, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: IDEM-007
@@ -1234,10 +1234,10 @@ entries:
       - Submit a BET 40.00; submit a BET 41.00 under the same key.
     expected:
       - 409 IDEMPOTENCY_PAYLOAD_MISMATCH; the first transaction is untouched; no second row.
-    evidence: { testId: payload-mismatch-is-conflict, layer: integration }
+    evidence: { testId: idempotency-conflicts-persist-nothing, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-008
     priority: required
@@ -1250,10 +1250,10 @@ entries:
       - Submit a BET under key A; submit the same external id under key B.
     expected:
       - 409 EXTERNAL_TRANSACTION_ALREADY_BOUND; nothing stored for B.
-    evidence: { testId: external-id-bound-to-first-key, layer: integration }
+    evidence: { testId: idempotency-conflicts-persist-nothing, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-009
     priority: required
@@ -1298,8 +1298,8 @@ entries:
       - Identical; no new event.
     evidence: { testId: replay-writes-nothing, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-012
     priority: required
@@ -1345,7 +1345,7 @@ entries:
       - 503 with Retry-After; the message is retried later and succeeds once the lock is released; wager_lock_conflicts_total incremented.
     evidence: { testId: lock-timeout-is-transient, layer: integration }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: CONC-003
@@ -1912,7 +1912,7 @@ entries:
       - Same fields; failureCode present only on the rejected and the failed ones.
     evidence: { testId: outcome-shape-is-uniform, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: API-004
@@ -1927,7 +1927,7 @@ entries:
       - The response echoes the header or carries a generated id; the emitted event and the log lines carry the same value.
     evidence: { testId: correlation-id-propagates, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: API-005
@@ -1950,16 +1950,19 @@ entries:
     requirement: A transient failure known to have occurred before commit answers 503 with Retry-After and persists nothing.
     contract: [api.retry-after, api.transient-failure]
     enforcement:
-      - Infrastructure errors classified as transient map to 503.
+      - Infrastructure errors classified as transient map to 503; transientDatabaseFailure reads the SQLSTATE of a lock timeout, a serialization failure, a deadlock, a cancelled statement and an unreachable or shutting-down database, and the unit suite covers that taxonomy.
+      - lock_timeout, set on every financial transaction from LOCK_TIMEOUT_MS, is what bounds the wait for the wallet row.
       - A failure raised before the financial transaction commits leaves it rolled back, so the key is free and the resend is a new operation. The case where the commit outcome is unknown is API-013, and its expectation is the opposite.
     scenario:
-      - Stop PostgreSQL; submit a bet; restart; submit the same request.
+      - Hold the wallet row from another session; submit a bet over HTTP; release the lock and submit the same request again.
+      - Inject a failure at the last statement of the financial transaction, before its commit; resend the same request.
     expected:
-      - 503 with Retry-After; after restart the request is processed as new, not as a replay.
+      - 503 SERVICE_UNAVAILABLE with Retry-After, naming the ceiling it exceeded, and no transaction row, entry or event; the resend is processed as new, not as a replay.
+      - The injected pre-commit failure leaves nothing either, and its resend is processed as new; one debit exists in total.
     evidence: { testId: transient-failure-503, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-007
     priority: required
@@ -2018,8 +2021,8 @@ entries:
       - No row is written by any of the six requests and the repetitions answer like the originals; after the wallet exists the same submission is processed.
     evidence: { testId: request-errors-are-stateless, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-011
     priority: required
@@ -2066,8 +2069,8 @@ entries:
       - Both wallets reconcile against their own ledgers.
     evidence: { testId: unknown-commit-outcome-takes-effect-once, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- MSG
   - id: MSG-001
@@ -2263,8 +2266,8 @@ entries:
       - No row of any kind exists after either failure.
     evidence: { testId: financial-write-is-atomic, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-002
     priority: required
@@ -2278,7 +2281,7 @@ entries:
       - No message until commit; the message appears after.
     evidence: { testId: publish-after-commit, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: OUTBOX-003

@@ -15,6 +15,7 @@ Built with Bun, TypeScript, NestJS, MikroORM, PostgreSQL, and SQS.
 - [Connect a provider](#connect-a-provider)
 - [Check a wallet](#check-a-wallet)
 - [Everyday commands](#everyday-commands)
+- [Breaking it on purpose](#breaking-it-on-purpose)
 - [Load test](#load-test)
 - [Scope and design](#scope-and-design)
 
@@ -118,6 +119,22 @@ Operational endpoints are `/health/live`, `/health/ready`, and `/metrics`. Logs 
 CI runs `make check`. Tests use a separate database and queues, so they can run beside the demo. Concurrency tests use independent processes to exercise competing bets, duplicate storms, separate wallets, and crash recovery.
 
 Settings are documented in [.env.example](.env.example) and [compose.yaml](compose.yaml). An existing `.env` is preserved.
+
+## Breaking it on purpose
+
+A green test suite can mean the code is correct — or that the tests never looked hard enough. `make drill` checks which one it is: it breaks the wallet lock three different ways and confirms the right test fails each time.
+
+```sh
+make drill
+```
+
+- **Remove the lock** — two bets race the same balance, and one debit becomes two.
+- **Swap it for an in-process mutex** — looks safe on one instance, fails the moment two processes are involved.
+- **Take the lock in the wrong mode** — two bets on one wallet deadlock instead of queueing.
+
+Every change reverts automatically, even if the run is interrupted. It's not part of `make check`: it edits source on purpose, so it's a command you run, not one CI runs.
+
+More detail: [docs/demonstrations.md](docs/demonstrations.md#breaking-it-on-purpose).
 
 ## Load test
 

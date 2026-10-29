@@ -15,6 +15,7 @@ Built with Bun, TypeScript, NestJS, MikroORM, PostgreSQL, and SQS.
 - [Connect a provider](#connect-a-provider)
 - [Check a wallet](#check-a-wallet)
 - [Everyday commands](#everyday-commands)
+- [Load test](#load-test)
 - [Scope and design](#scope-and-design)
 
 ## Run it
@@ -116,6 +117,23 @@ Operational endpoints are `/health/live`, `/health/ready`, and `/metrics`. Logs 
 CI runs `make check`. Tests use a separate database and queues, so they can run beside the demo. Concurrency tests use independent processes to exercise competing bets, duplicate storms, separate wallets, and crash recovery.
 
 Settings are documented in [.env.example](.env.example) and [compose.yaml](compose.yaml). An existing `.env` is preserved.
+
+## Load test
+
+```sh
+bun run test:load
+```
+
+Brings up three API instances and two workers, runs a 30-second measured load against them, and drains the backlog. It prints throughput, latency percentiles, error rate, lock conflicts, and outbox lag — the measured cost behind the guarantees above, not another correctness check.
+
+| Metric                 | Result                              |
+| ----------------------- | ------------------------------------ |
+| Throughput              | ~1,100–1,320 completed ops/s (HTTP) |
+| Latency (p50 / p95 / p99) | ~10 ms / ~85 ms / ~200 ms          |
+| Infrastructure errors   | 0 in 83,473 attempts                 |
+| Lost or duplicated money | None (reconciliation: 0 divergences) |
+
+Full environment, methodology, and analysis: [docs/load-experiment.md](docs/load-experiment.md).
 
 ## Scope and design
 

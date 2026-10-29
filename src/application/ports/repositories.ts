@@ -15,7 +15,14 @@ import type { Wallet } from '../../domain/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
 
 export interface WalletRepository {
-  /** Writes a wallet that does not exist yet (`wallet.opening-credit`, `wallet.zero-opening`). */
+  /**
+   * Writes a wallet that does not exist yet (`wallet.opening-credit`, `wallet.zero-opening`).
+   *
+   * Rejects with `WalletAlreadyExistsError` when the player already has a wallet in that currency
+   * (`wallet.duplicate-is-conflict`). The adapter translates the violation of the unique key, so
+   * the decision is the database's and holds for every instance at once, and the use case takes no
+   * look-then-write that two concurrent openings would both pass (WALLET-001).
+   */
   insert(wallet: Wallet): Promise<void>;
 
   /** The wallet as the database holds it, or `null` when the id names none. */

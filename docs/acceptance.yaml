@@ -220,15 +220,15 @@ entries:
     requirement: Zero is accepted as an initial balance and as a LOSS amount, and nowhere else.
     contract: money.zero-only-initial-balance
     enforcement:
-      - CreateWalletRequest allows "0.00"; the money-moving operation variants require a positive amount (MONEY-006); the ledger refuses "0.00" outright (LEDGER-006).
+      - OpenWalletRequest allows "0.00" by taking MoneyProps rather than the positive variant the money-moving operations take (MONEY-006); the ledger refuses "0.00" outright (LEDGER-006), which is why a zero opening writes no entry at all.
     scenario:
       - Open a wallet with "0.00".
     expected:
-      - 201 with balance "0.00" and version 1.
+      - 201 with balance "0.00" and version 1, and no ledger entry.
     evidence: { testId: zero-initial-balance-accepted, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-008
     priority: required
@@ -328,15 +328,15 @@ entries:
     requirement: A player has at most one wallet per currency; a duplicate is a conflict.
     contract: [wallet.unique-player-currency, wallet.duplicate-is-conflict]
     enforcement:
-      - UNIQUE (player_id, currency); the use case maps the violation to 409 WALLET_ALREADY_EXISTS.
+      - UNIQUE (player_id, currency); the wallet repository translates a violation of that key into WalletAlreadyExistsError and the exception filter answers 409 WALLET_ALREADY_EXISTS. The use case reads nothing first, so the key is the only check and it decides for every instance at once.
     scenario:
-      - Open a BRL wallet for a player twice, the second time concurrently from two instances.
+      - Open a BRL wallet for a player twice, the second time concurrently from two instances, each its own process; open a USD wallet for the same player.
     expected:
-      - Exactly one wallet exists; every other attempt answers 409 and changes nothing.
+      - Exactly one wallet exists per currency; every other attempt answers 409 and changes nothing.
     evidence: { testId: one-wallet-per-player-and-currency, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-002
     priority: required
@@ -350,8 +350,8 @@ entries:
       - The domain raises an insufficient-balance outcome; the SQL statement fails on the check constraint.
     evidence: { testId: wallet-balance-never-negative, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-003
     priority: required
@@ -365,8 +365,8 @@ entries:
       - Both report version 1; the first has one ledger entry with walletVersion 1.
     evidence: { testId: wallet-opens-at-version-one, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-004
     priority: required
@@ -435,15 +435,15 @@ entries:
     requirement: A positive initial balance is recorded as an OPENING transaction with its CREDIT entry in the same transaction.
     contract: wallet.opening-credit
     enforcement:
-      - OpenWallet writes wallet, OPENING transaction and entry in one unit of work.
+      - OpenWallet writes the wallet, the OPENING transaction already PROCESSED, its CREDIT entry and the two outbox rows in one unit of work.
     scenario:
-      - Open a wallet with "500.00"; inject a failure after the wallet insert in a second run.
+      - Open a wallet with "500.00"; in a second run inject a failure after the OPENING transaction insert, so the wallet and the transaction have already reached PostgreSQL when it is raised.
     expected:
-      - 'First run: wallet, OPENING row (providerId system) and entry (balanceBefore 0.00, balanceAfter 500.00, walletVersion 1) all exist. Second run: nothing exists.'
+      - 'First run: wallet, OPENING row (providerId system, idempotencyKey system:<walletId>, gameId wallet-opening), entry (balanceBefore 0.00, balanceAfter 500.00, walletVersion 1) and the processed and balance-changed outbox rows all exist. Second run: no row in any table.'
     evidence: { testId: opening-credit-is-atomic, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-009
     priority: required
@@ -457,23 +457,23 @@ entries:
       - No transaction row, no ledger entry, version 1, no WalletBalanceChanged event.
     evidence: { testId: zero-opening-writes-only-the-wallet, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-010
     priority: required
     requirement: A wallet can be read with its current balance and version.
     contract: [wallet.read-shape, api.wallet-read]
     enforcement:
-      - GET /wallets/{walletId} maps the aggregate to the response DTO.
+      - GET /wallets/{walletId} maps the aggregate to the response DTO; GetWallet raises WalletNotFoundError for an unknown id, so the absence is a use-case decision and not a controller reading a null.
     scenario:
-      - Read an existing wallet and an unknown id.
+      - Read an existing wallet, an unknown id and an id that is not a UUID.
     expected:
-      - 200 with id, playerId, balance, version, createdAt, updatedAt; 404 WALLET_NOT_FOUND otherwise.
+      - 200 with exactly id, playerId, balance, version, createdAt, updatedAt; 404 WALLET_NOT_FOUND for the unknown id; 400 VALIDATION_FAILED naming /path/walletId for the malformed one.
     evidence: { testId: wallet-read-endpoint, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-011
     priority: required
@@ -1889,15 +1889,16 @@ entries:
     requirement: Request errors are problem details with a code and a correlation id.
     contract: [api.problem-details, failure.request-errors]
     enforcement:
-      - Exception filter producing application/problem+json.
+      - Exception filter producing application/problem+json over one complete table of status and title per ErrorCode, so a code a later slice raises cannot reach a caller unmapped.
+      - The correlation id is bound on first need rather than only in route middleware, so a body the framework refused before any route carries one too.
     scenario:
-      - Trigger a 400 with two invalid fields, a 404 and a 409.
+      - Trigger a 400 with two invalid fields, a 404 and a 409; send a body that is not JSON; send a request with and one without X-Correlation-Id.
     expected:
-      - Each body has type, title, status, detail, code, correlationId; the 400 lists both fields in errors.
+      - Each body has type, title, status, detail, code and correlationId, with type the URN of its code; the 400 lists both fields in errors; the malformed body is VALIDATION_FAILED rather than a framework error; the response header and the body carry the same id, echoed or generated.
     evidence: { testId: problem-details-shape, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-003
     priority: required
@@ -1965,15 +1966,15 @@ entries:
     requirement: Wallet creation answers 201 with Location, 409 for duplicates and 400 for invalid bodies.
     contract: api.wallet-create
     enforcement:
-      - OpenWallet controller.
+      - WalletsController over OpenWallet, with the body validated against OpenWalletRequest by a zod schema that refuses an unknown member and an amount sent as a JSON number.
     scenario:
-      - Create; create again; send a body without initialBalance.
+      - Create; create again; send a body without initialBalance; send one carrying a member the contract does not define; send the amount as a JSON number.
     expected:
-      - 201 with Location /wallets/{id}; 409 WALLET_ALREADY_EXISTS; 400 VALIDATION_FAILED.
+      - 201 with Location /wallets/{id} and the wallet body; 409 WALLET_ALREADY_EXISTS with the first wallet unchanged; 400 VALIDATION_FAILED naming each offending member.
     evidence: { testId: wallet-create-endpoint, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-008
     priority: required
@@ -2586,14 +2587,16 @@ entries:
     requirement: Every suite that moves money ends by proving stored balance equals ledger-derived balance.
     contract: recon.final-invariant
     enforcement:
-      - Shared afterAll helper used by every integration and concurrency suite.
+      - Shared helper (test/helpers/wallet-reconciliation.ts) that rebuilds a wallet's balance in SQL, as the sum of credits minus debits and as the balanceAfter of the entry at the wallet's version, and compares both with the stored balance. It recomputes the sum in SQL rather than reusing the service's arithmetic, so a defect there cannot agree with itself.
+      - The suites truncate between tests, so the sweep runs in afterEach over the wallets that test touched, before its rows are removed.
+      - Adopted by the suites that move money through a use case; each later slice adopts it with the suites it adds, which is why this entry is not yet green.
     scenario:
       - Run the full suite.
     expected:
       - The helper runs for every touched wallet and passes.
     evidence: { testId: final-invariant-every-suite, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
   - id: RECON-005
     priority: required

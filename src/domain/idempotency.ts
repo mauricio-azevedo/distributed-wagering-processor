@@ -1,4 +1,5 @@
 import { canonicalJson } from './canonical-json';
+import type { ErrorCode } from './error-code';
 import { CanonicalHashError } from './errors';
 import { Money, type MoneyProps } from './money';
 import type { TransactionKind } from './transaction-kind';
@@ -112,8 +113,10 @@ export function payloadHashOf(operation: SubmittedOperation, sha256Hex: Sha256He
  * enumerates them, and both are answered with `409` and nothing persisted
  * (`idem.payload-mismatch-conflict`, `idem.external-id-bound`).
  */
-export type IdempotencyConflictCode =
-  'IDEMPOTENCY_PAYLOAD_MISMATCH' | 'EXTERNAL_TRANSACTION_ALREADY_BOUND';
+export type IdempotencyConflictCode = Extract<
+  ErrorCode,
+  'IDEMPOTENCY_PAYLOAD_MISMATCH' | 'EXTERNAL_TRANSACTION_ALREADY_BOUND'
+>;
 
 export type ReservationDecision =
   | { readonly replay: true; readonly stored: WagerTransaction }

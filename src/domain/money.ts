@@ -9,11 +9,18 @@ export interface MoneyProps {
   readonly currency: string;
 }
 
-/** `money.decimal-string`: two decimals, no sign, no leading zeros, at most 18 integer digits. */
-const AMOUNT = /^(0|[1-9][0-9]{0,17})\.[0-9]{2}$/;
+/**
+ * `money.decimal-string`: two decimals, no sign, no leading zeros, at most 18 integer digits.
+ *
+ * Exported because the DTOs of the adapters have to refuse a malformed amount as a request error
+ * naming the member (`api.problem-details`), before the parser below would throw: one pattern for
+ * both, so a request the validator admits is one `Money.from` can parse. `MoneyProps` of
+ * [docs/openapi.yaml](../../docs/openapi.yaml) is the authoritative definition both mirror.
+ */
+export const AMOUNT_PATTERN = /^(0|[1-9][0-9]{0,17})\.[0-9]{2}$/;
 
-/** `money.currency-iso`: an ISO 4217 alphabetic code. */
-const CURRENCY = /^[A-Z]{3}$/;
+/** `money.currency-iso`: an ISO 4217 alphabetic code, exported for the same reason. */
+export const CURRENCY_PATTERN = /^[A-Z]{3}$/;
 
 const MINOR_UNITS_PER_UNIT = 100n;
 
@@ -127,9 +134,9 @@ function formatMinorUnits(minorUnits: bigint): string {
 }
 
 function parseAmount(amount: unknown): bigint {
-  if (typeof amount !== 'string' || !AMOUNT.test(amount)) {
+  if (typeof amount !== 'string' || !AMOUNT_PATTERN.test(amount)) {
     throw new MoneyValidationError(
-      `amount must be a decimal string matching ${AMOUNT.source}, got ${describeValue(amount)}`,
+      `amount must be a decimal string matching ${AMOUNT_PATTERN.source}, got ${describeValue(amount)}`,
     );
   }
 
@@ -137,9 +144,9 @@ function parseAmount(amount: unknown): bigint {
 }
 
 function parseCurrency(currency: unknown): string {
-  if (typeof currency !== 'string' || !CURRENCY.test(currency)) {
+  if (typeof currency !== 'string' || !CURRENCY_PATTERN.test(currency)) {
     throw new MoneyValidationError(
-      `currency must be an ISO 4217 alphabetic code matching ${CURRENCY.source}, got ${describeValue(currency)}`,
+      `currency must be an ISO 4217 alphabetic code matching ${CURRENCY_PATTERN.source}, got ${describeValue(currency)}`,
     );
   }
 

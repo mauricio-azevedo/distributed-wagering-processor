@@ -1,6 +1,6 @@
 import type { Money, MoneyProps } from './money';
 import type { TransactionKind } from './transaction-kind';
-import type { RejectionCode } from './wager-transaction';
+import type { RejectionCode, WagerTransaction } from './wager-transaction';
 import type { LedgerDirection, WalletLedgerEntry } from './wallet-ledger-entry';
 
 /**
@@ -117,6 +117,25 @@ export interface TransactionIdentity {
   readonly gameId: string;
   readonly kind: TransactionKind;
   readonly money: Money;
+}
+
+/**
+ * The identity of a transaction read off the row itself, which is how a use case names it once and
+ * lets every event of that processing derive its aggregate and its causation from the same value
+ * (`event.aggregate-is-wallet`, `event.correlation-causation`).
+ */
+export function transactionIdentity(transaction: WagerTransaction): TransactionIdentity {
+  return {
+    transactionId: transaction.id,
+    providerId: transaction.providerId,
+    externalTransactionId: transaction.externalTransactionId,
+    walletId: transaction.walletId,
+    playerId: transaction.playerId,
+    roundId: transaction.roundId,
+    gameId: transaction.gameId,
+    kind: transaction.kind,
+    money: transaction.money,
+  };
 }
 
 /** `TransactionIdentity` serialized: the amount becomes a string, nothing else changes. */

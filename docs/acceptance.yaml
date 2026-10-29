@@ -388,15 +388,17 @@ entries:
     requirement: Every balance change has exactly one ledger entry and the stored balance mirrors the ledger head at commit.
     contract: wallet.ledger-mirror
     enforcement:
-      - The use case writes wallet and entry together; two deferred constraint triggers, on wallets and on the ledger, refuse a mismatch at commit.
+      - Two deferred constraint triggers, on wallets and on the ledger, refuse a mismatch at commit, so the guarantee holds for every writer and does not wait for a use case.
+      - The use cases of the later slices write the wallet row and its entry in one transaction; that they do is WALLET-004 and TX-001, not this entry.
     scenario:
-      - Process a BET; then, as the migrator role, update the balance without an entry and commit.
+      - 'By SQL as the runtime role: commit a balance change with its entry; commit three changes in one transaction, mirrored by the last; move the wallet row before appending the entry; then update the balance without an entry.'
     expected:
-      - The BET leaves one entry whose balanceAfter equals the balance; the manual update fails at commit.
-    evidence: { testId: balance-and-ledger-move-together, layer: integration }
+      - Each committed change leaves one entry whose balanceAfter equals the stored balance and whose walletVersion equals the stored version, whichever half was written first.
+      - The update without an entry fails at commit and leaves the wallet and its ledger as they were.
+    evidence: { testId: balance-and-ledger-move-together, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: WALLET-006
     priority: required
@@ -1598,7 +1600,7 @@ entries:
     enforcement:
       - UNIQUE (wallet_id, wallet_version); CHECK (wallet_version >= 1).
     scenario:
-      - Insert two entries with wallet_version 3 for one wallet; insert wallet_version 0.
+      - On a wallet opened with a credit, insert a second entry at the wallet_version its opening entry carries; insert wallet_version 0.
     expected:
       - Unique violation; check violation.
     evidence: { testId: schema-unique-wallet-version, layer: schema }
@@ -1705,13 +1707,15 @@ entries:
     enforcement:
       - DEFERRABLE INITIALLY DEFERRED constraint trigger on wallets comparing the row with the entry of greatest wallet_version.
     scenario:
-      - 'On a wallet with entries, by SQL: update balance and version without an entry; update balance only; update version only; insert a wallet with a positive balance and no entry; then insert an entry and update the wallet consistently.'
+      - 'On a wallet with entries, by SQL: update balance and version without an entry; update balance only; update version only; insert a wallet with a positive balance and no entry; insert a wallet with no balance and no entry; then move one wallet twice in one transaction, each move with its entry.'
     expected:
-      - The first four transactions fail at commit naming the wallet and its head; the fifth commits.
+      - The first four transactions fail at commit with SQLSTATE 23000, the three updates naming the wallet and the head it does not mirror, the insert naming the absence of a ledger; the wallet and its ledger are left as they were.
+      - A wallet with balance 0.00 and version 1 commits without a ledger, the one state the mirror admits without one.
+      - The two moves commit: the wallet row is re-read at commit, so several moves of one wallet are judged on the state the transaction ends in.
     evidence: { testId: schema-balance-matches-ledger-at-commit, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-018
     priority: required
@@ -1768,11 +1772,11 @@ entries:
     scenario:
       - 'By SQL, without touching the wallet row: insert a well-formed next entry on a wallet with entries; insert a first entry on a wallet opened with 0.00; insert a next entry and update the balance but not the version.'
     expected:
-      - All three fail at commit naming the ledger head and the wallet row; no new entry exists afterwards.
+      - All three fail at commit with SQLSTATE 23000, naming the entry that is the head of its wallet and the version and balance the wallet row carries instead; no new entry exists afterwards.
     evidence: { testId: schema-entry-requires-mirroring-wallet, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-022
     priority: required
@@ -1781,13 +1785,15 @@ entries:
     enforcement:
       - The entries trigger checks the predecessor (wallet_version - 1, balance_after = balance_before) and the successor (wallet_version + 1, balance_before = balance_after).
     scenario:
-      - "By SQL, each with the wallet row updated to match the new entry: an entry whose balance_before differs from the predecessor's balance_after; an entry at version 4 after version 2; a first entry at version 3; then, without touching the wallet, an entry at version 1 on a wallet opened with 0.00 whose first entry is at version 2."
+      - "By SQL, each with the wallet row updated to match the new entry: an entry whose balance_before differs from the predecessor's balance_after; an entry two versions past the head, leaving a gap; a first entry at version 3; a first entry whose balance_before is not 0.00."
+      - 'By SQL, without touching the wallet: an entry at version 1 under the version-2 head of a wallet opened with 0.00; an orphan entry on a wallet with no entries.'
     expected:
-      - All four fail at commit naming the broken link; the wallet and its ledger are unchanged.
+      - All six fail at commit with SQLSTATE 23000, naming the link that is broken: the predecessor an entry does not continue, the successor it is not continued by, the first entry of a ledger that does not start at 0.00 at version 1 or 2, or the head no wallet row mirrors.
+      - The wallet and its ledger are left as they were.
     evidence: { testId: schema-ledger-chain-continuous, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-023
     priority: required
@@ -1796,13 +1802,15 @@ entries:
     enforcement:
       - Implied by the two triggers, the arithmetic check, the unique wallet version and ledger immutability; asserted by SQL.
     scenario:
-      - 'By SQL: open wallets with 100.00 and with 0.00; append operations one per transaction and two in one transaction; interleave the refused attempts of SCHEMA-017, SCHEMA-021 and SCHEMA-022.'
+      - 'By SQL: open one wallet with 100.00 and two with 0.00, one of which is never operated; then, from a seeded generator, twelve transactions of one to three credits and debits on a wallet it picks, each transaction mirrored by its last entry.'
+      - After every transaction, interleave two refused attempts on the wallet it touched: a balance moved without an entry and an entry appended without the wallet.
     expected:
-      - Every well-formed transaction commits; for every wallet, balance = SUM(credits) - SUM(debits) = balance_after of the entry with the greatest wallet_version, and the wallet with no entries has balance 0.00 and version 1.
+      - Every generated transaction commits and every interleaved attempt is refused.
+      - For every wallet, balance = SUM(credits) - SUM(debits) = balance_after of the entry with the greatest wallet_version, which carries the stored version; the wallet that was never operated has balance 0.00, version 1 and no entries.
     evidence: { testId: schema-balance-equals-ledger-sum, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-024
     priority: required
@@ -1850,11 +1858,11 @@ entries:
     scenario:
       - Read back every CHECK of the schema carrying the exclusion.
       - By SQL as the runtime role, insert NaN into each monetary column: wallet balance, transaction amount and observed_balance, ledger amount, balance_before and balance_after.
-      - As the migrator role, drop the three exclusions of the ledger, insert a NaN entry that satisfies every remaining per-row check, restore them NOT VALID, then insert another NaN entry; truncate and validate them again afterwards.
+      - As the migrator role, drop the four exclusions a balance change passes through (the three of the ledger and the one of the wallet balance), then commit in one transaction a two-entry chain whose amounts, balance_before and balance_after are NaN with the wallet row moved onto its head; restore the four NOT VALID, then insert another NaN entry and move the balance to NaN; truncate and recreate them validated afterwards.
     expected:
       - The columns they guard are exactly the six monetary columns of the schema.
       - Every insert of the second scenario is refused by a finiteness CHECK of its own table. Which one reports a ledger entry is the server's choice, because NaN propagates through addition and an entry cannot carry it in one monetary column alone without failing the balanced arithmetic.
-      - The insert of the third scenario commits while the exclusions are absent, proving the positive-amount check, the non-negative balance_after and the balanced arithmetic all accept NaN; the insert after they are restored is refused. The commit-time chain of SCHEMA-021 and SCHEMA-022 is blind to it in the same way and is covered when those triggers land.
+      - The chain of the third scenario commits while the exclusions are absent, proving that the positive-amount check, the non-negative balance_after, the balanced arithmetic and the two deferred triggers of SCHEMA-017, SCHEMA-021 and SCHEMA-022 all accept NaN: NaN = NaN holds, so every link of the chain matches and the wallet row mirrors its head. The entry and the balance written after the exclusions are restored are both refused, each by the check of its own table.
     evidence: { testId: schema-refuses-non-finite-amounts, layer: schema }
     deliverySlice: schema-wallet-opening
     implementationStatus: implemented

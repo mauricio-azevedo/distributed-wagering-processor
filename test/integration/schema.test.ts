@@ -11,9 +11,12 @@ import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config
  * constraint or the trigger that refused it; nothing here goes through a repository, because the
  * point is what the database refuses whatever wrote it.
  *
- * The deferred wallet-to-ledger triggers (SCHEMA-017, SCHEMA-021 to SCHEMA-023) are not installed
- * yet, so a wallet row and its ledger are independent here: a case may append an entry without
- * moving the balance of the wallet it belongs to.
+ * The commit-time link between a balance and its ledger lives in its own suite
+ * (`wallet-ledger-chain.test.ts`, SCHEMA-017 and SCHEMA-021 to SCHEMA-023), but it holds here too:
+ * a wallet row carrying a balance has to mirror the head of its ledger, so the default wallet of
+ * this suite opens at `0.00` with no entry, and a case that needs a committed entry opens its
+ * wallet with a credit through `givenWalletOpenedWith`. Every refusal below is decided per row, so
+ * it is reported before the commit the deferred triggers would judge.
  */
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
@@ -30,6 +33,8 @@ const THIRD_TRANSACTION = '0193f0c0-0003-7000-8000-000000000007';
 const ENTRY = '0193f0c0-0003-7000-8000-000000000008';
 const OTHER_ENTRY = '0193f0c0-0003-7000-8000-000000000009';
 const EVENT = '0193f0c0-0003-7000-8000-00000000000a';
+const OPENING_TRANSACTION = '0193f0c0-0003-7000-8000-00000000000b';
+const OPENING_ENTRY = '0193f0c0-0003-7000-8000-00000000000c';
 
 const AT = new Date('2026-10-29T12:00:00.000Z');
 
@@ -58,6 +63,12 @@ const LEDGER_FINITENESS = [
   'wallet_ledger_entries_balance_after_is_finite_check',
   'wallet_ledger_entries_balance_before_is_finite_check',
 ];
+
+/**
+ * The four that stand between `NaN` and a committed balance change: the three above and the one on
+ * the wallet row the entry has to be mirrored by.
+ */
+const BALANCE_CHANGE_FINITENESS = [...LEDGER_FINITENESS, 'wallets_balance_is_finite_check'];
 
 type Column = string | number | Date | null;
 type Row = Record<string, Column>;
@@ -97,6 +108,35 @@ function insert(orm: MikroORM, table: string, row: Row): Promise<unknown> {
   );
 }
 
+/** The writes of one case, as a single transaction; what `run` and `insert` do statement by statement. */
+interface Session {
+  run(statement: string, params?: Column[]): Promise<unknown>;
+  insert(table: string, row: Row): Promise<unknown>;
+}
+
+/**
+ * Commits several writes together, which the two cases of this suite that touch both a wallet row
+ * and its ledger need: the deferred triggers of ADR 0003 judge the transaction, not the statement.
+ */
+function committing(orm: MikroORM, body: (session: Session) => Promise<unknown>): Promise<unknown> {
+  const connection = orm.em.getConnection();
+  return connection.transactional((context) => {
+    const statement = (sql: string, params: Column[] = []): Promise<unknown> =>
+      connection.execute(sql, params, 'run', context);
+    return body({
+      run: statement,
+      insert: (table, row) => {
+        const columns = Object.keys(row);
+        return statement(
+          `insert into "${table}" (${columns.map((column) => `"${column}"`).join(', ')})
+             values (${columns.map(() => '?').join(', ')})`,
+          Object.values(row),
+        );
+      },
+    });
+  });
+}
+
 interface Refusal {
   readonly message: string;
   /** The SQLSTATE the server raised: `23000` for a trigger of ADR 0003, `235xx` for a constraint. */
@@ -126,11 +166,16 @@ function sqlStateOf(error: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * A wallet as it opens at `0.00`: version 1 and no ledger entry, the one state the commit-time
+ * mirror of ADR 0003 admits for a wallet without a ledger, and therefore the fixture a case that
+ * writes nothing to the ledger can insert on its own.
+ */
 const walletRow = (overrides: Row = {}): Row => ({
   id: WALLET,
   player_id: PLAYER,
   currency: 'BRL',
-  balance: '100.00',
+  balance: '0.00',
   version: 1,
   created_at: AT,
   updated_at: AT,
@@ -197,6 +242,46 @@ const secondSubmission = (overrides: Row = {}): Row => ({
 async function givenWalletAndTransaction(transaction: Row = {}): Promise<void> {
   await insert(app, 'wallets', walletRow());
   await insert(app, 'wager_transactions', transactionRow(transaction));
+}
+
+/**
+ * A wallet opened with a credit: the row, the internal `OPENING` transaction and the version-1
+ * entry, committed together because the wallet row has to mirror the head of its ledger (ADR 0003,
+ * SCHEMA-017). This is the fixture of a case that needs an entry the database accepted; the
+ * refusals of this suite are decided per row and need no committed ledger.
+ */
+function givenWalletOpenedWith(balance: string, transaction: Row = {}): Promise<unknown> {
+  return committing(app, async (session) => {
+    await session.insert('wallets', walletRow({ balance }));
+    await session.insert(
+      'wager_transactions',
+      transactionRow({
+        id: OPENING_TRANSACTION,
+        provider_id: 'system',
+        external_transaction_id: WALLET,
+        idempotency_key: `system:${WALLET}`,
+        round_id: WALLET,
+        game_id: 'wallet-opening',
+        kind: 'OPENING',
+        amount: balance,
+        ...processed({ observed_balance: balance }),
+      }),
+    );
+    await session.insert(
+      'wallet_ledger_entries',
+      entryRow({
+        id: OPENING_ENTRY,
+        transaction_id: OPENING_TRANSACTION,
+        kind: 'OPENING',
+        direction: 'CREDIT',
+        amount: balance,
+        balance_before: '0.00',
+        balance_after: balance,
+        wallet_version: 1,
+      }),
+    );
+    await session.insert('wager_transactions', transactionRow(transaction));
+  });
 }
 
 async function rowCount(table: string): Promise<number> {
@@ -536,8 +621,7 @@ describe('schema-positive-amounts', () => {
 
 describe('schema-one-entry-per-transaction', () => {
   test('a second entry for one transaction is refused', async () => {
-    await givenWalletAndTransaction();
-    await insert(app, 'wallet_ledger_entries', entryRow());
+    await givenWalletOpenedWith('100.00');
 
     const refusal = await refused(
       insert(
@@ -545,10 +629,11 @@ describe('schema-one-entry-per-transaction', () => {
         'wallet_ledger_entries',
         entryRow({
           id: OTHER_ENTRY,
+          transaction_id: OPENING_TRANSACTION,
           direction: 'CREDIT',
-          balance_before: '60.00',
-          balance_after: '100.00',
-          wallet_version: 3,
+          balance_before: '100.00',
+          balance_after: '140.00',
+          wallet_version: 2,
         }),
       ),
     );
@@ -559,18 +644,20 @@ describe('schema-one-entry-per-transaction', () => {
 
 describe('schema-unique-wallet-version', () => {
   beforeEach(async () => {
-    await givenWalletAndTransaction();
+    await givenWalletOpenedWith('100.00');
   });
 
   test('two entries with one wallet version are refused', async () => {
-    await insert(app, 'wager_transactions', transactionRow(secondSubmission()));
-    await insert(app, 'wallet_ledger_entries', entryRow({ wallet_version: 3 }));
-
     const refusal = await refused(
       insert(
         app,
         'wallet_ledger_entries',
-        entryRow({ id: OTHER_ENTRY, transaction_id: OTHER_TRANSACTION, wallet_version: 3 }),
+        entryRow({
+          direction: 'CREDIT',
+          balance_before: '0.00',
+          balance_after: '40.00',
+          wallet_version: 1,
+        }),
       ),
     );
 
@@ -650,13 +737,12 @@ describe('schema-entry-currency-fk', () => {
 
 describe('schema-ledger-trigger', () => {
   beforeEach(async () => {
-    await givenWalletAndTransaction();
-    await insert(app, 'wallet_ledger_entries', entryRow());
+    await givenWalletOpenedWith('100.00');
   });
 
   test('the owner of the table cannot update an entry', async () => {
     const refusal = await refused(
-      run(migrator, 'update wallet_ledger_entries set amount = 1.00 where id = ?', [ENTRY]),
+      run(migrator, 'update wallet_ledger_entries set amount = 1.00 where id = ?', [OPENING_ENTRY]),
     );
 
     expect(refusal.message).toMatch(/wallet_ledger_entries is immutable/);
@@ -665,7 +751,7 @@ describe('schema-ledger-trigger', () => {
 
   test('the owner of the table cannot delete an entry', async () => {
     const refusal = await refused(
-      run(migrator, 'delete from wallet_ledger_entries where id = ?', [ENTRY]),
+      run(migrator, 'delete from wallet_ledger_entries where id = ?', [OPENING_ENTRY]),
     );
 
     expect(refusal.message).toMatch(/wallet_ledger_entries is immutable/);
@@ -676,16 +762,15 @@ describe('schema-ledger-trigger', () => {
 
 describe('ledger-rejects-update-and-delete', () => {
   beforeEach(async () => {
-    await givenWalletAndTransaction();
-    await insert(app, 'wallet_ledger_entries', entryRow());
+    await givenWalletOpenedWith('100.00');
   });
 
   test('the runtime role is refused by its privileges, before any trigger runs', async () => {
     const update = await refused(
-      run(app, 'update wallet_ledger_entries set amount = 1.00 where id = ?', [ENTRY]),
+      run(app, 'update wallet_ledger_entries set amount = 1.00 where id = ?', [OPENING_ENTRY]),
     );
     const remove = await refused(
-      run(app, 'delete from wallet_ledger_entries where id = ?', [ENTRY]),
+      run(app, 'delete from wallet_ledger_entries where id = ?', [OPENING_ENTRY]),
     );
 
     expect(update.message).toMatch(/permission denied for table wallet_ledger_entries/);
@@ -694,9 +779,9 @@ describe('ledger-rejects-update-and-delete', () => {
 
   test('the owner is refused by the trigger, and the entry is still there', async () => {
     await refused(
-      run(migrator, 'update wallet_ledger_entries set amount = 1.00 where id = ?', [ENTRY]),
+      run(migrator, 'update wallet_ledger_entries set amount = 1.00 where id = ?', [OPENING_ENTRY]),
     );
-    await refused(run(migrator, 'delete from wallet_ledger_entries where id = ?', [ENTRY]));
+    await refused(run(migrator, 'delete from wallet_ledger_entries where id = ?', [OPENING_ENTRY]));
 
     expect(await rowCount('wallet_ledger_entries')).toBe(1);
   });
@@ -1210,56 +1295,109 @@ describe('schema-refuses-non-finite-amounts', () => {
   });
 
   /**
-   * Why the exclusion is the only predicate that works: with it gone, an entry of `NaN` satisfies
-   * `amount > 0`, `balance_after >= 0` and the balanced arithmetic all at once. No
-   * trigger-disabling mechanism bypasses a `CHECK`, so the demonstration drops the three checks as
-   * the owner and restores them `NOT VALID`, the row it inserted being one they now refuse.
+   * Why the exclusions are the only predicates that work: with them gone, an entry of `NaN`
+   * satisfies `amount > 0`, `balance_after >= 0` and the balanced arithmetic all at once, and a
+   * chain of such entries satisfies the deferred triggers of SCHEMA-021 and SCHEMA-022 as well,
+   * because `NaN = NaN` is true, so every link matches and the wallet row mirrors its head. One
+   * stored `NaN` would therefore defeat the per-row checks, the commit-time chain and the equality
+   * of `recon.calculation` at the same time; nothing but the exclusion stands in its way.
+   *
+   * No trigger-disabling mechanism bypasses a `CHECK`, so the demonstration drops the four
+   * exclusions of a balance change as the owner and restores them `NOT VALID`, the rows it
+   * committed being ones they now refuse.
    */
-  test('without the exclusion the other checks accept NaN, and restoring it refuses the next row', async () => {
+  test('without the exclusions the rest of the schema accepts a NaN chain', async () => {
     await givenWalletAndTransaction();
-    const nanEntry = entryRow({
-      direction: 'CREDIT',
-      amount: 'NaN',
-      balance_before: '0.00',
-      balance_after: 'NaN',
-      wallet_version: 1,
-    });
-    const definitions = await migrator.em
+    await insert(app, 'wager_transactions', transactionRow(secondSubmission()));
+    await insert(
+      app,
+      'wager_transactions',
+      transactionRow({
+        id: THIRD_TRANSACTION,
+        external_transaction_id: 'acme-tx-000125',
+        idempotency_key: 'provider-acme:acme-tx-000125',
+      }),
+    );
+    const exclusions = await migrator.em
       .getConnection()
-      .execute<{ constraint: string; definition: string }[]>(
-        `select conname as "constraint", pg_get_constraintdef(oid) as "definition"
+      .execute<{ relation: string; constraint: string; definition: string }[]>(
+        `select conrelid::regclass::text as "relation", conname as "constraint",
+                pg_get_constraintdef(oid) as "definition"
          from pg_constraint
-        where conrelid = 'wallet_ledger_entries'::regclass
-          and conname in (${LEDGER_FINITENESS.map(() => '?').join(', ')})`,
-        LEDGER_FINITENESS,
+        where connamespace = 'public'::regnamespace
+          and conname in (${BALANCE_CHANGE_FINITENESS.map(() => '?').join(', ')})`,
+        BALANCE_CHANGE_FINITENESS,
       );
+    const nan = (overrides: Row): Row =>
+      entryRow({
+        direction: 'CREDIT',
+        kind: 'WIN',
+        amount: 'NaN',
+        balance_before: 'NaN',
+        balance_after: 'NaN',
+        ...overrides,
+      });
 
     try {
-      expect(definitions).toHaveLength(LEDGER_FINITENESS.length);
-      for (const check of LEDGER_FINITENESS) {
-        await run(migrator, `alter table wallet_ledger_entries drop constraint "${check}"`);
+      expect(exclusions).toHaveLength(BALANCE_CHANGE_FINITENESS.length);
+      for (const { relation, constraint } of exclusions) {
+        await run(migrator, `alter table "${relation}" drop constraint "${constraint}"`);
       }
 
-      await insert(app, 'wallet_ledger_entries', nanEntry);
-      expect(await rowCount('wallet_ledger_entries')).toBe(1);
+      /*
+       * One transaction, so both deferred triggers judge the chain it leaves behind: a first entry
+       * that starts the ledger at 0.00, a second one carrying `NaN` in all three of its monetary
+       * columns, and the wallet row moved onto the head. The ledger is contiguous, every link
+       * matches and the balance mirrors the head, all of it with a balance that is not a number.
+       */
+      await committing(app, async (session) => {
+        await session.insert(
+          'wallet_ledger_entries',
+          nan({ balance_before: '0.00', wallet_version: 1 }),
+        );
+        await session.insert(
+          'wallet_ledger_entries',
+          nan({ id: OTHER_ENTRY, transaction_id: OTHER_TRANSACTION, wallet_version: 2 }),
+        );
+        await session.run(`update wallets set balance = 'NaN', version = 2 where id = ?`, [WALLET]);
+      });
 
-      for (const { constraint, definition } of definitions) {
+      expect(await rowCount('wallet_ledger_entries')).toBe(2);
+
+      for (const { relation, constraint, definition } of exclusions) {
         await run(
           migrator,
-          `alter table wallet_ledger_entries add constraint "${constraint}" ${definition} not valid`,
+          `alter table "${relation}" add constraint "${constraint}" ${definition} not valid`,
         );
       }
 
-      const refusal = await refused(
-        insert(app, 'wallet_ledger_entries', { ...nanEntry, id: OTHER_ENTRY, wallet_version: 2 }),
+      const entry = await refused(
+        insert(
+          app,
+          'wallet_ledger_entries',
+          nan({ id: OPENING_ENTRY, transaction_id: THIRD_TRANSACTION, wallet_version: 3 }),
+        ),
       );
-      expect(LEDGER_FINITENESS.some((check) => refusal.message.includes(check))).toBe(true);
+      const balance = await refused(
+        run(app, `update wallets set balance = 'NaN' where id = ?`, [WALLET]),
+      );
+
+      expect(LEDGER_FINITENESS.some((check) => entry.message.includes(check))).toBe(true);
+      expect(balance.message).toMatch(/wallets_balance_is_finite_check/);
     } finally {
-      // The row the exclusion refuses has to go before the checks can be valid again, and a ledger
-      // entry is only ever removed by truncation.
-      await run(migrator, 'truncate table wallet_ledger_entries');
-      for (const check of LEDGER_FINITENESS) {
-        await run(migrator, `alter table wallet_ledger_entries validate constraint "${check}"`);
+      /*
+       * This is the one case that changes the schema, so it puts it back whatever failed above,
+       * and puts it back exactly: the rows the exclusions refuse go first, because a ledger entry
+       * is only ever removed by truncation, and each constraint is then recreated validated, the
+       * state the migration left it in and the one the catalogue of OPS-002 compares against.
+       */
+      await run(migrator, `truncate table ${TABLES.join(', ')}`);
+      for (const { relation, constraint, definition } of exclusions) {
+        await run(migrator, `alter table "${relation}" drop constraint if exists "${constraint}"`);
+        await run(
+          migrator,
+          `alter table "${relation}" add constraint "${constraint}" ${definition}`,
+        );
       }
     }
   });

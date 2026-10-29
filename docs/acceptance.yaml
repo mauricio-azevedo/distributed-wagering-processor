@@ -2624,7 +2624,8 @@ entries:
     enforcement:
       - Shared helper (test/helpers/wallet-reconciliation.ts) that rebuilds a wallet's balance in SQL, as the sum of credits minus debits and as the balanceAfter of the entry at the wallet's version, and compares both with the stored balance. It recomputes the sum in SQL rather than reusing the service's arithmetic, so a defect there cannot agree with itself.
       - The suites truncate between tests, so the sweep runs in afterEach over the wallets that test touched, before its rows are removed.
-      - Adopted by the suites that move money through a use case; each later slice adopts it with the suites it adds, which is why this entry is not yet green. The concurrency suite adopts it per scenario rather than per test, because a scenario that repeats rounds truncates between them: a sweep that waited for the test to end would find the rows of the last round alone.
+      - Adopted by every suite that moves money through a use case, the crash-recovery drill of test/concurrency/crash-recovery.test.ts included, which is the last one to adopt it. test/integration/schema.test.ts is the one suite that writes money and does not, because every case in it is direct SQL asserting a refusal: it never reaches a use case and the rows it leaves are the ones a constraint rejected.
+      - The concurrency suites adopt it per scenario rather than per test, because a scenario that repeats rounds truncates between them: a sweep that waited for the test to end would find the rows of the last round alone.
       - TouchedWallets.forget drops a wallet from the sweep, for the fixtures of RECON-003 and RECON-005 alone: they corrupt a wallet on purpose to prove the report sees it, so the invariant the sweep asserts is the one such a case breaks.
     scenario:
       - Run the full suite.
@@ -2632,8 +2633,8 @@ entries:
       - The helper runs for every touched wallet and passes.
     evidence: { testId: final-invariant-every-suite, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
   - id: RECON-005
     priority: required
     requirement: Reconciliation never reports a wallet consistent on the strength of a non-finite stored value.

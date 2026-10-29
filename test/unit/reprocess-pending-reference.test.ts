@@ -387,7 +387,7 @@ function reprocessPendingReference(fixture: Fixture = {}, startedAt: Date = ATTE
   };
 
   return {
-    execute: () => useCase.execute(),
+    execute: (claiming?: () => boolean) => useCase.execute(claiming),
     advanceBy,
     store,
     calls,
@@ -436,6 +436,31 @@ describe('reprocess-claims-only-what-is-due', () => {
 
     expect(attempts).toHaveLength(2);
     expect(calls.filter((call) => call === 'claim the next due schedule')).toHaveLength(3);
+  });
+
+  /**
+   * `ops.graceful-shutdown`: a sweep is where a shutdown takes effect, because the claim of the
+   * attempt in flight is the one thing a scheduler holds. The driver says when to stop claiming and
+   * the sweep finishes the attempt it had started, so nothing is abandoned mid-attempt and the rows
+   * it had not reached are left due for the instance that survives.
+   */
+  test('a sweep stops claiming when its driver says it is stopping', async () => {
+    const { execute, calls } = reprocessPendingReference({
+      parked: [
+        parkedRollback(),
+        parkedRollback('01a18268-f900-758e-8c3e-13ce27511121', 'acme-rollback-2'),
+      ],
+    });
+    let claims = 0;
+
+    const attempts = await execute(() => {
+      claims += 1;
+
+      return claims <= 1;
+    });
+
+    expect(attempts).toHaveLength(1);
+    expect(calls.filter((call) => call === 'claim the next due schedule')).toHaveLength(1);
   });
 });
 

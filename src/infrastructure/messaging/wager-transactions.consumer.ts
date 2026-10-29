@@ -20,6 +20,7 @@ import type {
   SubmitWagerTransaction,
 } from '../../application/use-cases/submit-wager-transaction';
 import { type LogContext, withLogContext } from '../observability/log-context';
+import { WorkerLoop, type WorkerProcess } from '../runtime/worker-loop';
 import {
   MessageContractError,
   type WagerTransactionRequested,
@@ -61,8 +62,12 @@ import { type VisibilityBackoff, visibilityBackoffSeconds } from './visibility-b
  *
  * A broker call that fails leaves the message where it is instead of failing the batch, so one
  * refused call cannot starve the messages behind it and nothing is ever deleted on the strength of
- * a call that did not happen. Starting and stopping the loop is `run` and `stop`; which process
- * runs it, and how it drains on `SIGTERM`, is #19's.
+ * a call that did not happen.
+ *
+ * `start` and `stop` are the loop, and `stop` is `msg.sigterm`: the receive in flight is abandoned,
+ * the message being processed is finished and acknowledged, and every message of the batch this
+ * consumer had not reached is handed straight back with its visibility cleared, so another instance
+ * takes it immediately instead of waiting out the visibility timeout.
  */
 
 /** `msg.inbox-identity`: the consumer half of every inbox identity this consumer writes. */
@@ -76,6 +81,17 @@ export const WAGER_TRANSACTIONS_CONSUMER = 'wager-transactions-consumer';
 const MAX_MESSAGES_PER_RECEIVE = 10;
 
 const MILLISECONDS_PER_SECOND = 1000;
+
+/**
+ * How long the loop waits after a receive that answered nothing, including one that failed. A
+ * receive that long-polled has already waited `waitTimeSeconds`, so this is what keeps a consumer
+ * configured with no long poll — a suite, or a broker that answers at once — from spinning, and the
+ * pause that lets an unreachable broker be unreachable for a second rather than be asked constantly.
+ */
+const EMPTY_RECEIVE_INTERVAL_MS = 1000;
+
+/** The visibility a released message is handed back under: none, so another instance sees it now. */
+const IMMEDIATELY_VISIBLE_SECONDS = 0;
 
 /**
  * The delivery attributes this consumer reads. The receive count drives the transient backoff; the
@@ -109,6 +125,17 @@ interface FailedDelivery<Class extends 'transient' | 'permanent'> {
   readonly error: unknown;
 }
 
+/**
+ * A delivery this consumer took from the broker and never opened, because it was draining
+ * (`msg.sigterm`). It is not one of the three classes: nothing was attempted, so there is nothing
+ * to classify, and the body was not even parsed — the message is handed back as it arrived.
+ */
+interface UnopenedDelivery {
+  readonly classification: 'unopened';
+  /** Always absent: a report carries the identity the body declared, and this body was not read. */
+  readonly messageId: null;
+}
+
 /** A delivery as its class, before anything has been done about it (`msg.classification`). */
 type ClassifiedDelivery =
   BusinessDelivery | FailedDelivery<'transient'> | FailedDelivery<'permanent'>;
@@ -123,10 +150,13 @@ type ClassifiedDelivery =
  * - `acknowledged` — deleted, the committed outcome being terminal for the message.
  * - `returned` — visibility set to the transient backoff, so it comes back on that schedule.
  * - `dead-lettered` — forwarded to the dead-letter queue and then deleted.
+ * - `released` — visibility cleared, so it is immediately available to another instance. It is what
+ *   a drain does with a message it took and will not process (`msg.sigterm`).
  * - `retained` — still in the input queue, because the broker refused the call that would have
  *   moved it. The broker redelivers it, and nothing was lost: an acknowledgement that failed is a
- *   redelivery the inbox absorbs, and a forward that failed is a message the redrive policy
- *   dead-letters once its receives are exhausted.
+ *   redelivery the inbox absorbs, a forward that failed is a message the redrive policy
+ *   dead-letters once its receives are exhausted, and a release that failed is one the visibility
+ *   timeout hands back a little later.
  */
 export type DeliveryReport =
   | (BusinessDelivery & { readonly disposition: 'acknowledged' | 'retained' })
@@ -135,7 +165,19 @@ export type DeliveryReport =
       readonly visibilitySeconds: number;
       readonly disposition: 'returned' | 'retained';
     })
-  | (FailedDelivery<'permanent'> & { readonly disposition: 'dead-lettered' | 'retained' });
+  | (FailedDelivery<'permanent'> & { readonly disposition: 'dead-lettered' | 'retained' })
+  | (UnopenedDelivery & { readonly disposition: 'released' | 'retained' });
+
+/**
+ * The failure a report carries, or `null` when the delivery did not fail: the use case answered, or
+ * the message was handed back unopened. It exists so a caller reads one function instead of
+ * narrowing the union by hand wherever it wants to know what went wrong.
+ */
+export function failureOf(report: DeliveryReport): unknown {
+  return report.classification === 'transient' || report.classification === 'permanent'
+    ? report.error
+    : null;
+}
 
 export interface WagerTransactionsConsumerDependencies {
   readonly sqs: SQSClient;
@@ -155,57 +197,104 @@ export interface WagerTransactionsConsumerDependencies {
   readonly retryBackoff: VisibilityBackoff;
 }
 
-export class WagerTransactionsConsumer {
-  private polling = false;
+export class WagerTransactionsConsumer implements WorkerProcess {
+  private readonly loop: WorkerLoop;
 
-  constructor(private readonly dependencies: WagerTransactionsConsumerDependencies) {}
+  /** The receive in flight, so a drain can abandon it instead of waiting out its long poll. */
+  private receiving: AbortController | undefined;
+
+  constructor(private readonly dependencies: WagerTransactionsConsumerDependencies) {
+    this.loop = new WorkerLoop({
+      cycle: async () => (await this.poll()).length > 0,
+      // A receive that found nothing has already long-polled for `waitTimeSeconds`, so this wait is
+      // only what keeps a consumer configured not to long-poll from spinning on an empty queue.
+      idleIntervalMs: EMPTY_RECEIVE_INTERVAL_MS,
+      failureEvent: 'wager.poll-failed',
+      logger: dependencies.logger,
+    });
+  }
+
+  get name(): string {
+    return this.dependencies.consumerName;
+  }
 
   /**
    * One receive-and-process cycle, which is what the loop repeats and what a test drives directly.
    * Messages are processed in the order the broker handed them over and one at a time, so a FIFO
    * group is applied in its order and no message of a batch waits on another's commit.
+   *
+   * Once the consumer is draining, the messages of the batch it has not reached are not opened at
+   * all: each is handed back with its visibility cleared, which is the half of `msg.sigterm` that
+   * gets them to another instance immediately rather than after the visibility timeout.
    */
   async poll(): Promise<readonly DeliveryReport[]> {
     const queueUrl = await this.dependencies.queueUrl();
-    const received = await this.dependencies.sqs.send(
-      new ReceiveMessageCommand({
-        QueueUrl: queueUrl,
-        MaxNumberOfMessages: MAX_MESSAGES_PER_RECEIVE,
-        WaitTimeSeconds: this.dependencies.waitTimeSeconds,
-        VisibilityTimeout: this.dependencies.visibilityTimeoutSeconds,
-        MessageSystemAttributeNames: [...DELIVERY_ATTRIBUTES],
-      }),
-    );
+    const received = await this.receive(queueUrl);
 
     const reports: DeliveryReport[] = [];
 
-    for (const message of received.Messages ?? []) {
-      reports.push(await this.handle(queueUrl, message));
+    for (const message of received) {
+      reports.push(
+        this.loop.claiming()
+          ? await this.handle(queueUrl, message)
+          : await this.hand(queueUrl, message),
+      );
     }
 
     return reports;
   }
 
+  /** Receive, process, repeat until `stop`. */
+  start(): void {
+    this.loop.start();
+  }
+
   /**
-   * Receive, process, repeat until `stop`. Stopping takes effect after the receive in flight
-   * answers, so it is bounded by `waitTimeSeconds`; the shutdown behaviour `msg.sigterm` asks for,
-   * which also returns the visibility of what it could not finish, is #19.
+   * `msg.sigterm`: stop receiving, finish what is in flight, hand back the rest.
+   *
+   * The receive in flight is abandoned rather than awaited, because a long poll holds a drain for
+   * up to twenty seconds for messages that have not arrived. A receive the broker had already
+   * answered when the abort landed is the one window this leaves: those messages were never handed
+   * to this process, so they are redelivered when their visibility expires and absorbed by the
+   * inbox — late, never lost (`msg.redelivery-safe`).
    */
-  async run(): Promise<void> {
-    this.polling = true;
+  async stop(): Promise<void> {
+    const stopping = this.loop.stop();
+    this.receiving?.abort();
+    await stopping;
+  }
 
-    while (this.running()) {
-      await this.poll();
+  /**
+   * One receive, under an abort a drain can trigger. A receive that was abandoned answers with no
+   * messages instead of raising: the drain asked for it, and there is nothing for the loop to
+   * report or retry.
+   */
+  private async receive(queueUrl: string): Promise<readonly Message[]> {
+    const receiving = new AbortController();
+    this.receiving = receiving;
+
+    try {
+      const { Messages } = await this.dependencies.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: queueUrl,
+          MaxNumberOfMessages: MAX_MESSAGES_PER_RECEIVE,
+          WaitTimeSeconds: this.dependencies.waitTimeSeconds,
+          VisibilityTimeout: this.dependencies.visibilityTimeoutSeconds,
+          MessageSystemAttributeNames: [...DELIVERY_ATTRIBUTES],
+        }),
+        { abortSignal: receiving.signal },
+      );
+
+      return Messages ?? [];
+    } catch (error) {
+      if (receiving.signal.aborted) {
+        return [];
+      }
+
+      throw error;
+    } finally {
+      this.receiving = undefined;
     }
-  }
-
-  stop(): void {
-    this.polling = false;
-  }
-
-  /** Read through a call, because the flag is set outside the loop and cleared from outside it. */
-  private running(): boolean {
-    return this.polling;
   }
 
   /**
@@ -363,6 +452,35 @@ export class WagerTransactionsConsumer {
       this.brokerRefused('wager.message.not-returned', error, message);
 
       return 'retained';
+    }
+  }
+
+  /**
+   * `msg.sigterm`: a message this consumer took and will not process, handed straight back with its
+   * visibility cleared so another instance receives it at once. Nothing was attempted on it, so
+   * there is no outcome, no inbox row and nothing to undo; what the next instance gets is a
+   * delivery of the same body, one receive later.
+   *
+   * A refused release leaves the message invisible for the rest of its visibility timeout, which is
+   * a redelivery slightly later and not a loss, so it is logged and reported as retained.
+   */
+  private async hand(queueUrl: string, message: Message): Promise<DeliveryReport> {
+    const unopened: UnopenedDelivery = { classification: 'unopened', messageId: null };
+
+    try {
+      await this.dependencies.sqs.send(
+        new ChangeMessageVisibilityCommand({
+          QueueUrl: queueUrl,
+          ReceiptHandle: message.ReceiptHandle,
+          VisibilityTimeout: IMMEDIATELY_VISIBLE_SECONDS,
+        }),
+      );
+
+      return { ...unopened, disposition: 'released' };
+    } catch (error) {
+      this.brokerRefused('wager.message.not-released', error, message);
+
+      return { ...unopened, disposition: 'retained' };
     }
   }
 

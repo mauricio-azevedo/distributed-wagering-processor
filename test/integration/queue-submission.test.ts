@@ -22,6 +22,7 @@ import {
   type DeliveryReport,
   WAGER_TRANSACTIONS_CONSUMER,
   WagerTransactionsConsumer,
+  failureOf,
 } from '../../src/infrastructure/messaging/wager-transactions.consumer';
 import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
@@ -531,9 +532,7 @@ describe('message-contract-validated', () => {
 
       expect(report.classification).toBe('permanent');
       expect(report.disposition).toBe('dead-lettered');
-      expect(report.classification === 'business' ? null : report.error).toBeInstanceOf(
-        MessageContractError,
-      );
+      expect(failureOf(report)).toBeInstanceOf(MessageContractError);
       expect(report.messageId).toBeNull();
       expect(await transactionsOf(walletId)).toEqual([]);
       expect(await inboxRows()).toEqual([]);
@@ -549,10 +548,8 @@ describe('message-contract-validated', () => {
 
     await send(betMessage(walletId, {}, { money: { amount: '40', currency: 'BRL' } }), walletId);
     const report = await pollOne();
-    const violations =
-      report.classification === 'business' || !(report.error instanceof MessageContractError)
-        ? ''
-        : report.error.violations;
+    const failure = failureOf(report);
+    const violations = failure instanceof MessageContractError ? failure.violations : '';
 
     expect(report.classification).toBe('permanent');
     expect(violations).toContain('amount');
@@ -650,9 +647,7 @@ describe('inbox-payload-conflict', () => {
     const report = await pollOne();
 
     expect(report).toMatchObject({ classification: 'permanent', disposition: 'dead-lettered' });
-    expect(report.classification === 'business' ? null : report.error).toBeInstanceOf(
-      InboxPayloadConflictError,
-    );
+    expect(failureOf(report)).toBeInstanceOf(InboxPayloadConflictError);
     expect(
       await metrics.total('wager_duplicates_detected_total', { source: 'inbox-conflict' }),
     ).toBe(conflicts + 1);
@@ -790,12 +785,12 @@ describe('killed-after-commit-before-ack', () => {
 });
 
 describe('consumer-loop-drains-the-queue', () => {
-  test('run polls until stop, acknowledging what it applied', async () => {
+  test('the loop polls until stop, acknowledging what it applied', async () => {
     const walletId = await openWallet('500.00');
 
     await send(betMessage(walletId), walletId);
 
-    const loop = consumer.run();
+    consumer.start();
 
     for (let waited = 0; waited < 100; waited += 1) {
       if ((await transactionsOf(walletId)).length === 1) {
@@ -805,8 +800,7 @@ describe('consumer-loop-drains-the-queue', () => {
       await sleep(100);
     }
 
-    consumer.stop();
-    await loop;
+    await consumer.stop();
 
     expect(await transactionsOf(walletId)).toMatchObject([{ status: 'PROCESSED' }]);
     expect(await queueContents()).toEqual([]);
@@ -853,9 +847,7 @@ describe('lock-timeout-is-transient', () => {
     // Transient, not a business outcome: nothing about this delivery is terminal, so the message is
     // returned to the queue rather than acknowledged or dead-lettered (`msg.classification`).
     expect(refused).toMatchObject({ classification: 'transient', disposition: 'returned' });
-    expect(refused.classification === 'business' ? null : refused.error).toBeInstanceOf(
-      ServiceUnavailableError,
-    );
+    expect(failureOf(refused)).toBeInstanceOf(ServiceUnavailableError);
     expect(await metrics.total('wager_lock_conflicts_total')).toBe(conflicts + 1);
 
     // Nothing was written, so the redelivery is a new operation and not a replay

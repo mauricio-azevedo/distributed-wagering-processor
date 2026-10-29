@@ -2226,15 +2226,15 @@ entries:
     requirement: On SIGTERM the consumer finishes in-flight work or returns visibility.
     contract: [msg.sigterm, ops.graceful-shutdown]
     enforcement:
-      - Shutdown hook stops polling, awaits in-flight handlers within the grace period, resets visibility of the rest.
+      - The consumer's stop abandons the receive in flight, finishes the message being applied and acknowledges it after its commit, and hands every message of the batch it had not reached back with its visibility cleared; the shutdown handler bounds all of it by SHUTDOWN_GRACE_PERIOD_MS.
     scenario:
-      - Send SIGTERM while ten messages are in flight with an artificially slow handler.
+      - Signal a consumer that holds one receive of five messages while the first is still being applied; then read what the queue offers and let a surviving instance apply it.
     expected:
-      - Messages finished before the grace period are acknowledged; the others become visible immediately and are processed by another worker; no duplicate effects.
+      - The message in flight is committed and acknowledged and the instance exits zero; the other four are receivable at once, each carrying a second delivery, and the surviving instance applies them, leaving one transaction, one inbox row and one debit per message.
     evidence: { testId: sigterm-drains-or-releases, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-011
     priority: required
@@ -2752,15 +2752,15 @@ entries:
     requirement: One image runs as api, worker or all.
     contract: ops.single-image-roles
     enforcement:
-      - APP_ROLE read at bootstrap selects the modules to start.
+      - APP_ROLE, validated at startup, selects the controllers the application serves and whether WorkerRuntime starts the consumer, the outbox publisher and the pending-reference scheduler.
     scenario:
-      - Start the image with each role.
+      - Run src/main.ts as each role against the stack, with a bet message waiting in the input queue and a wallet to spend from.
     expected:
-      - api serves HTTP and runs no consumer; worker runs the consumer, publisher and scheduler and serves only health; all does both.
+      - api serves the health and financial routes and leaves the message untouched; worker starts all three loops, serves health, answers 404 on the financial routes, applies the message and publishes its event; all serves the routes and applies the message in one process.
     evidence: { testId: app-roles, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OPS-004
     priority: required
@@ -2782,45 +2782,45 @@ entries:
     requirement: Invalid configuration stops the process before it serves traffic.
     contract: ops.config-env
     enforcement:
-      - Typed environment schema validated at bootstrap.
+      - Typed environment schema parsed in the bootstrap, before the application is built and before any port is opened.
     scenario:
-      - Start with a missing database URL and with a non-numeric lock timeout.
+      - Run src/main.ts with the database URL missing, with a non-numeric lock timeout and with an unknown APP_ROLE, each with no env file behind it, so the variable is genuinely absent.
     expected:
-      - The process exits non-zero with a message naming the variable; no port is opened.
+      - The process exits non-zero naming the variable, and nothing answers on the port it was given.
     evidence: { testId: config-validation, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OPS-006
     priority: required
     requirement: Docker Compose starts the full stack used by the integration suites.
     contract: ops.compose
     enforcement:
-      - PostgreSQL, LocalStack with queues, migration step, api and two workers.
+      - compose.yaml declares PostgreSQL, LocalStack with the three queues, the migration step, one api and two worker replicas, all three service containers from one image and one environment; make up brings it and make infra brings the dependencies the suites run against.
     scenario:
-      - docker compose up; run the integration suites.
+      - Resolve the stack with docker compose config, which is what Compose itself will run, and read the topology off it; every integration suite then runs against the dependencies of that same file.
     expected:
-      - All services healthy; suites pass against the containers.
+      - The five services are declared; the two roles share one image and one environment and differ only in APP_ROLE; two worker instances run and only api publishes a port; both roles wait for the migration step and LocalStack and are probed on /health/ready, and each is given longer to stop than it drains within; the suites pass against the containers.
     evidence: { testId: compose-stack, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OPS-007
     priority: required
     requirement: Every role shuts down gracefully on SIGTERM.
     contract: ops.graceful-shutdown
     enforcement:
-      - NestJS shutdown hooks; HTTP drain; consumer and publisher completion within the grace period.
+      - One signal handler per process closes the application within SHUTDOWN_GRACE_PERIOD_MS (ADR 0013): the HTTP server stops accepting, drains the requests in flight and releases the connections nobody is using, and the worker processes stop claiming and finish what they hold. A drain that does not finish inside the period exits 75, with nothing committed by what it could not finish.
     scenario:
-      - Send SIGTERM to an api instance with in-flight requests and to a worker with a batch in progress.
+      - Signal an api instance holding a request that is waiting for the wallet lock; a publisher in the middle of a batch; a scheduler holding a claim it can finish inside the period, and one holding a claim it cannot.
     expected:
-      - In-flight requests complete; the batch finishes or releases; exit code zero.
+      - The request is answered and its outcome committed while nothing new is accepted, and the instance exits zero; the batch is published whole and that instance exits zero; the attempt that fits is counted and rescheduled; the one that does not is rolled back, so the row is claimed at once by another instance and the process exits 75.
     evidence: { testId: graceful-shutdown-all-roles, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OPS-008
     priority: optional

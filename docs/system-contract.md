@@ -288,12 +288,13 @@ Operational scope: providers settle in BRL, so every example uses BRL. The model
 ## 19. Operations
 
 - `ops.migrations-reversible` — Database migrations are versioned files with `up` and `down`; the test suite applies up, down and up again on a clean database.
-- `ops.single-image-roles` — One container image runs as `api`, `worker` or `all` through `APP_ROLE`; the roles share code and configuration.
+- `ops.single-image-roles` — One container image runs as `api`, `worker` or `all` through `APP_ROLE`; the roles share code and configuration. `api` serves the HTTP surface and claims no queue, outbox or schedule work; `worker` runs the queue consumer, the outbox publisher and the pending-reference scheduler and serves the health routes alone; `all` is both, which is the shape of a local run.
 - `ops.two-db-roles` — Migrations run as `wagering_migrator`, which owns the schema. The service runs as `wagering_app`, which has no `UPDATE` or `DELETE` privilege on the ledger and no DDL privilege.
 - `ops.config-env` — Configuration comes from environment variables validated at startup; an invalid or missing value stops the process before it serves traffic.
 - `ops.repository-gate` — `make check` is the repository gate: formatting, lint, types, tests and dependency audit. CI runs the same target on every pull request and on `main`; nothing merges red.
 - `ops.compose` — `docker compose up` starts PostgreSQL, LocalStack with the three queues and the service roles; the integration and concurrency suites run against these containers, never against mocks.
-- `ops.graceful-shutdown` — On `SIGTERM` the HTTP server stops accepting connections and drains in-flight requests, the consumer behaves per `msg.sigterm`, and the publisher finishes its current batch before exiting.
+- `ops.graceful-shutdown` — On `SIGTERM` the HTTP server stops accepting connections and drains in-flight requests, the consumer behaves per `msg.sigterm`, the publisher finishes its current batch, and the pending-reference scheduler stops claiming and finishes the attempt it holds, all within `SHUTDOWN_GRACE_PERIOD_MS`.
+- `ops.shutdown-deadline` — The grace period is the deadline of the drain and not a suggestion: a process whose drain finishes inside it exits `0`, and one whose drain does not exits `75` without waiting any longer. Nothing is lost either way, because work the drain did not finish is work no transaction committed: a message that was not acknowledged is redelivered, a claim is released by the connection that held it, and the row a claim covered is due again unchanged. A deployment therefore sets the container's own stop grace period above this one, so the process is what decides it is done.
 
 ## 20. Adopted interpretations and additional policies
 

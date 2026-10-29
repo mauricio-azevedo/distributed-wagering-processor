@@ -2,8 +2,28 @@ import { z } from 'zod';
 
 const postgresUrl = z.url({ protocol: /^postgres(ql)?$/ });
 
+/**
+ * `ops.single-image-roles`: which composition of the one image this process runs. `api` serves the
+ * HTTP surface and claims no queue or database work; `worker` runs the queue consumer, the outbox
+ * publisher and the pending-reference scheduler and serves only the health routes; `all` runs both,
+ * which is the shape of a local run and of nothing else.
+ *
+ * `api` is the default because an unasked-for role is the costly one: a process that was told
+ * nothing and started consuming would compete for financial work no deployment meant to give it,
+ * whereas one that only serves traffic adds nothing to the claims already in flight.
+ */
+export const APP_ROLES = ['api', 'worker', 'all'] as const;
+
+export type AppRole = (typeof APP_ROLES)[number];
+
+/** Whether this role runs the three loops; `ops.single-image-roles` is this line and `controllersOf`. */
+export function runsWorkers(role: AppRole): boolean {
+  return role === 'worker' || role === 'all';
+}
+
 /** What the service reads; the migrator credentials stay out so a running instance never holds them. */
 const serviceSchema = z.object({
+  APP_ROLE: z.enum(APP_ROLES).default('api'),
   HTTP_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   DATABASE_URL: postgresUrl,
   /**
@@ -55,6 +75,25 @@ const serviceSchema = z.object({
    */
   SQS_RETRY_BACKOFF_BASE_SECONDS: z.coerce.number().int().min(0).max(43200).default(2),
   SQS_RETRY_BACKOFF_MAX_SECONDS: z.coerce.number().int().min(0).max(43200).default(300),
+  /**
+   * `ops.graceful-shutdown`: how long the drain started by `SIGTERM` may take before the process
+   * exits regardless. It is the deployment's trade between finishing work in hand and freeing the
+   * slot, and it decides nothing about correctness: work the drain did not finish is work no
+   * transaction committed, so it is where a redelivery or the next claim finds it.
+   *
+   * Fifteen seconds is below the thirty a Kubernetes pod is given by default and above the longest
+   * a financial operation under the default lock ceiling can take, so the common shutdown finishes
+   * inside it. A deployment whose container grace period is shorter sets this one shorter too,
+   * because the process has to be the one that decides it is done, not `SIGKILL`.
+   */
+  SHUTDOWN_GRACE_PERIOD_MS: z.coerce.number().int().min(1).default(15_000),
+  /**
+   * `ref.scheduler`: how long a scheduler waits after a sweep that found nothing due, which is the
+   * upper bound on how late a parked transaction is picked up once it becomes due. Like the outbox
+   * poll interval it is latency against idle load on PostgreSQL and changes no outcome: what is due
+   * is claimed by the next sweep, of this instance or of any other.
+   */
+  PENDING_REFERENCE_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1).default(1000),
 });
 
 const migrationSchema = z.object({

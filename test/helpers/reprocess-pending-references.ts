@@ -10,6 +10,10 @@
  * - With `holdMs` it claims one transaction, prints its id on a line of its own and holds the claim
  *   open for that long inside the transaction, so the process that spawned it can watch another
  *   sweep skip the claimed row and then kill this one mid-attempt.
+ * - With `loop` it runs the scheduler the `worker` role runs, under the service's own signal
+ *   handling, and lives until it is signalled: it prints `ready`, then drains on `SIGTERM` within
+ *   `SHUTDOWN_GRACE_PERIOD_MS` and exits by the code that drain earned (`ops.graceful-shutdown`).
+ *   With `holdMs` beside it, the attempt in flight is the claim a case signals it in the middle of.
  */
 import { MikroORM } from '@mikro-orm/postgresql';
 import { z } from 'zod';
@@ -23,12 +27,18 @@ import { jsonLinesLogger } from '../../src/infrastructure/observability/logger';
 import { uncountedMetrics } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
+import {
+  PENDING_REFERENCE_SCHEDULER,
+  PendingReferenceScheduler,
+} from '../../src/infrastructure/runtime/pending-reference-scheduler';
+import { onShutdownSignal } from '../../src/infrastructure/runtime/shutdown';
 
 /** A sweep that keeps finding work cannot loop forever: a drain is bounded by this many sweeps. */
 const MAX_SWEEPS = 200;
 
 const optionsSchema = z.object({
   holdMs: z.number().int().positive().optional(),
+  loop: z.literal(true).optional(),
 });
 
 const [argument] = process.argv.slice(2);
@@ -65,18 +75,48 @@ function holdingClaims(unitOfWork: UnitOfWork, holdMs: number): UnitOfWork {
   };
 }
 
-try {
-  const unitOfWork = new MikroOrmUnitOfWork(orm.em, env.LOCK_TIMEOUT_MS);
-  const reprocessPendingReference = new ReprocessPendingReference({
-    unitOfWork:
-      options.holdMs === undefined ? unitOfWork : holdingClaims(unitOfWork, options.holdMs),
-    clock: systemClock,
-    ids: uuidV7IdGenerator,
-    logger: jsonLinesLogger('reprocess-pending-references', process.stderr),
-    metrics: uncountedMetrics,
-    ...(options.holdMs === undefined ? {} : { sweepSize: 1 }),
+const say = (line: string): void => {
+  process.stdout.write(`${line}\n`);
+};
+
+const unitOfWork = new MikroOrmUnitOfWork(orm.em, env.LOCK_TIMEOUT_MS);
+// On stderr, so the lines a case parses off stdout are the helper's own.
+const logger = jsonLinesLogger('reprocess-pending-references', process.stderr);
+const reprocessPendingReference = new ReprocessPendingReference({
+  unitOfWork: options.holdMs === undefined ? unitOfWork : holdingClaims(unitOfWork, options.holdMs),
+  clock: systemClock,
+  ids: uuidV7IdGenerator,
+  logger,
+  metrics: uncountedMetrics,
+  ...(options.holdMs === undefined ? {} : { sweepSize: 1 }),
+});
+
+if (options.loop) {
+  const scheduler = new PendingReferenceScheduler(reprocessPendingReference, {
+    sweepIntervalMs: env.PENDING_REFERENCE_SWEEP_INTERVAL_MS,
+    logger,
   });
 
+  onShutdownSignal({
+    drain: async () => {
+      await scheduler.stop();
+      await orm.close(true);
+      say(`drained ${PENDING_REFERENCE_SCHEDULER}`);
+    },
+    gracePeriodMs: env.SHUTDOWN_GRACE_PERIOD_MS,
+    logger,
+  });
+
+  scheduler.start();
+  say('ready');
+
+  // The process now belongs to the signal: `onShutdownSignal` is what ends it.
+  await new Promise(() => {
+    /* until SIGTERM */
+  });
+}
+
+try {
   const attempts = [];
 
   for (let sweep = 0; sweep < MAX_SWEEPS; sweep += 1) {

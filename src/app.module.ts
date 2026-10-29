@@ -6,6 +6,8 @@ import {
   type MiddlewareConsumer,
   Module,
   type NestModule,
+  type Provider,
+  type Type,
 } from '@nestjs/common';
 import { APP_FILTER } from '@nestjs/core';
 import { TerminusModule } from '@nestjs/terminus';
@@ -20,7 +22,7 @@ import { ReconcileWallet } from './application/use-cases/reconcile-wallet';
 import { ReprocessPendingReference } from './application/use-cases/reprocess-pending-reference';
 import { SubmitWagerTransaction } from './application/use-cases/submit-wager-transaction';
 import { systemClock } from './infrastructure/clock';
-import type { Env } from './infrastructure/config/env';
+import { type AppRole, type Env, runsWorkers } from './infrastructure/config/env';
 import { HealthController } from './infrastructure/health/health.controller';
 import { PostgresHealthIndicator } from './infrastructure/health/postgres.health';
 import { SqsHealthIndicator } from './infrastructure/health/sqs.health';
@@ -30,6 +32,7 @@ import { ProviderTransactionsController } from './infrastructure/http/provider-t
 import { WageringController } from './infrastructure/http/wagering.controller';
 import { WalletsController } from './infrastructure/http/wallets.controller';
 import { uuidV7IdGenerator } from './infrastructure/id-generator';
+import { OutboxPublisher, outboxPublisher } from './infrastructure/messaging/outbox-publisher';
 import {
   WAGER_TRANSACTIONS_DLQ,
   WAGER_TRANSACTIONS_QUEUE,
@@ -48,10 +51,48 @@ import {
 } from './infrastructure/observability/metrics.controller';
 import { ormConfig } from './infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm.unit-of-work';
+import {
+  PENDING_REFERENCE_SCHEDULER,
+  PendingReferenceScheduler,
+} from './infrastructure/runtime/pending-reference-scheduler';
+import { WORKER_RUNTIME, WorkerRuntime } from './infrastructure/runtime/worker-runtime';
+
+/**
+ * `ops.single-image-roles`: what each role serves over HTTP. The operational routes belong to every
+ * role, so a container is probed and scraped the same way whichever it is, and the financial surface
+ * belongs to the roles that are there to answer providers: a `worker` that served it would take
+ * requests the load balancer never meant to send it.
+ */
+function controllersOf(role: AppRole): Type<unknown>[] {
+  // Health and metrics belong to every role: a worker is probed like an api instance, and the
+  // counters of the instance that raised them are read where they were raised (`obs.metrics`).
+  const everyRole = [HealthController, MetricsController];
+
+  return role === 'worker'
+    ? everyRole
+    : [...everyRole, WalletsController, WageringController, ProviderTransactionsController];
+}
+
+/**
+ * The three loops of the `worker` role, started and drained as one (`ops.graceful-shutdown`). They
+ * are constructed for every role — a provider costs nothing until something calls it, and a suite
+ * reaches for one whatever role it built the application with — and started only by the roles that
+ * are meant to claim work.
+ */
+const workerRuntimeProvider: Provider = {
+  provide: WorkerRuntime,
+  useFactory: (
+    consumer: WagerTransactionsConsumer,
+    publisher: OutboxPublisher,
+    scheduler: PendingReferenceScheduler,
+  ) => new WorkerRuntime([consumer, publisher, scheduler], jsonLinesLogger(WORKER_RUNTIME)),
+  inject: [WagerTransactionsConsumer, OutboxPublisher, PendingReferenceScheduler],
+};
 
 /**
  * Composition root. The validated environment is its only input, so a test can start the service on
- * any configuration.
+ * any configuration, and `APP_ROLE` is the one part of it that changes what the process is: which
+ * controllers answer, and whether the worker processes run (`ops.single-image-roles`).
  *
  * The use cases are constructed here with their ports rather than injected into: they carry no
  * framework decorator, which is what keeps the application layer free of NestJS
@@ -65,8 +106,7 @@ import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm.unit-
  * (`obs.structured-logs`).
  *
  * `WagerTransactionsConsumer` is constructed with the very `SubmitWagerTransaction` the controller
- * receives, which is what `msg.same-use-case` asks of the composition root, and is not started
- * here: which process polls the queue is `APP_ROLE`, and that with its shutdown behaviour is #19.
+ * receives, which is what `msg.same-use-case` asks of the composition root.
  */
 @Module({})
 export class AppModule implements NestModule {
@@ -74,13 +114,7 @@ export class AppModule implements NestModule {
     return {
       module: AppModule,
       imports: [MikroOrmModule.forRoot(ormConfig(env.DATABASE_URL)), TerminusModule],
-      controllers: [
-        HealthController,
-        MetricsController,
-        WalletsController,
-        WageringController,
-        ProviderTransactionsController,
-      ],
+      controllers: controllersOf(env.APP_ROLE),
       providers: [
         sqsClientProvider(env),
         PostgresHealthIndicator,
@@ -141,19 +175,14 @@ export class AppModule implements NestModule {
           inject: [MikroOrmUnitOfWork, MetricsRegistry],
         },
         {
-          /*
-           * The recovery of a parked transaction (ADR 0011). It is constructed here and swept by
-           * nothing yet: the `worker` role that runs it on a timer, like the queue consumer and the
-           * outbox publisher beside it, arrives with the runtime roles (#19). Until then a parked
-           * transaction is reprocessed by whatever drives a sweep — the integration suites do.
-           */
+          /* The recovery of a parked transaction (ADR 0011), swept by `PendingReferenceScheduler`. */
           provide: ReprocessPendingReference,
           useFactory: (unitOfWork: MikroOrmUnitOfWork, metrics: MetricsRegistry) =>
             new ReprocessPendingReference({
               unitOfWork,
               clock: systemClock,
               ids: uuidV7IdGenerator,
-              logger: jsonLinesLogger('pending-reference-scheduler'),
+              logger: jsonLinesLogger(PENDING_REFERENCE_SCHEDULER),
               metrics,
             }),
           inject: [MikroOrmUnitOfWork, MetricsRegistry],
@@ -191,6 +220,27 @@ export class AppModule implements NestModule {
             }),
           inject: [SQSClient, SubmitWagerTransaction, MetricsRegistry],
         },
+        {
+          /*
+           * The publisher of ADR 0005, wired from the same environment a suite wires it from and
+           * given this process's SQS client, so one process holds one connection pool to the
+           * broker whichever of its components is talking to it.
+           */
+          provide: OutboxPublisher,
+          useFactory: (em: EntityManager, sqs: SQSClient, metrics: MetricsRegistry) =>
+            outboxPublisher({ em, env, sqs, metrics }),
+          inject: [EntityManager, SQSClient, MetricsRegistry],
+        },
+        {
+          provide: PendingReferenceScheduler,
+          useFactory: (reprocess: ReprocessPendingReference) =>
+            new PendingReferenceScheduler(reprocess, {
+              sweepIntervalMs: env.PENDING_REFERENCE_SWEEP_INTERVAL_MS,
+              logger: jsonLinesLogger(PENDING_REFERENCE_SCHEDULER),
+            }),
+          inject: [ReprocessPendingReference],
+        },
+        ...(runsWorkers(env.APP_ROLE) ? [workerRuntimeProvider] : []),
       ],
     };
   }

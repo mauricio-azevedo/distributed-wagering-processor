@@ -21,6 +21,7 @@ A wallet and wagering transaction service for game providers. Providers open wal
 | Outbox publication                          | Runs: concurrent publishers claim committed outbox rows with `FOR UPDATE SKIP LOCKED`, publish them to `wager-integration-events.fifo` and record the publication; the runtime role that starts one in a deployment follows                                                                                                |
 | Queue entry point, inbox and dead letters   | Runs: a message on `wager-transactions.fifo` runs the same use case as the controller, its inbox row commits with the financial effect, it is deleted only after that commit, a transient failure comes back on a growing backoff and a permanent one is forwarded to the dead-letter queue                                |
 | Structured logs and operational metrics     | Runs: every line is a JSON record carrying the identity fields it knows and no amount or balance, one correlation id follows an operation from a request or a message into its events and its later retries, and `GET /metrics` exposes the documented Prometheus metrics with the outbox backlog measured on every scrape |
+| Runtime roles and graceful shutdown         | Runs: one image serves as `api`, `worker` or `all`; Compose starts one `api` and two `worker` instances; an invalid variable stops the process by name before any port opens; `SIGTERM` drains the requests in flight, the message being applied, the publication batch and the attempt in flight within the grace period  |
 | Concurrency under load                      | Proven: three independent processes against one database — two bets racing for one balance, fifty copies of one bet, two hundred wallets in parallel, a mixed load that raises no deadlock, and reconciliation running throughout                                                                                          |
 | Remaining wagering behaviour                | Planned; see the [implementation plan](docs/implementation-plan.md)                                                                                                                                                                                                                                                        |
 
@@ -46,7 +47,11 @@ Correctness under concurrency is the claim the service exists to make, so it is 
 
 The service is now debuggable from the outside. Every line it writes is a JSON record naming what happened and the identities it knows, and the correlation id of a request or a message reaches every line and every event of that operation — including the ones produced later, by a publisher in another process or by a sweep an hour afterwards, each of which reads the id off the row it is working on rather than minting one. No line carries an amount, a balance or a request body, because the one adapter they all pass through drops anything shaped like money; the reconciliation divergence record reaches the sink through a method of its own, which is the single documented exception and the only place an amount is ever written to a log. `GET /metrics` exposes the documented metrics — transactions by kind and status, duplicates by where they were caught, retries by the component that backed off, dead letters, lock conflicts, processing time by entrypoint, pending-reference attempts by outcome, divergences, and the outbox backlog with the age of its oldest unpublished row — each raised by the path that owns it and each proven by the suite that drives that path.
 
-What the service still owes is the runtime roles, so nothing yet runs the consumer, the publisher or the pending-reference sweep outside their own suites. The contract, the decisions and the acceptance plan fix what the service guarantees, how it is built and how each guarantee is proven, so that implementation proceeds slice by slice with the acceptance plan as its scoreboard.
+All of it is now deployable from one image. `APP_ROLE` decides what a process is: `api` serves the HTTP surface and claims nothing, `worker` runs the queue consumer, the outbox publisher and the pending-reference scheduler and serves the health routes alone, `all` is both for a local run. Compose starts PostgreSQL, LocalStack with the three queues, the migration step, one `api` and two `worker` instances, from one image and one environment that differ only in that variable. A missing or unreadable value stops the process by name before any port is opened.
+
+A stop loses nothing. One handler closes the application within `SHUTDOWN_GRACE_PERIOD_MS`: the HTTP server stops accepting and answers the requests in flight, releasing the connections nobody is using so a caller's keep-alive pool cannot hold the drain open; the consumer abandons the receive in flight, finishes and acknowledges the message it was applying, and hands back every message of its batch it had not reached with the visibility cleared, so another instance takes them at once; the publisher finishes the batch it claimed; the scheduler stops claiming between attempts and finishes the one it holds. A drain that needs longer than the period exits `75` rather than waiting, and still loses nothing, because what it did not finish never committed: PostgreSQL releases the claims and locks of the connection that dies, and an unacknowledged message is redelivered into the inbox that absorbs it.
+
+What the service still owes is the remaining HTTP conformance, the crash-recovery drills and the reviewer documentation. The contract, the decisions and the acceptance plan fix what the service guarantees, how it is built and how each guarantee is proven, so that implementation proceeds slice by slice with the acceptance plan as its scoreboard.
 
 ## Stack
 
@@ -62,7 +67,7 @@ cp .env.example .env            # addresses of the Compose dependencies, read by
 make                            # list the targets
 make stack                      # this checkout's Compose project, image and published ports
 make dev                        # start PostgreSQL and LocalStack, apply migrations, run the service with reload
-make up                         # the whole stack in containers: dependencies, migrations, the service on HTTP_PORT
+make up                         # the whole stack in containers: dependencies, migrations, one api on HTTP_PORT and two workers
 make down                       # stop the stack and drop its data
 make migrate                    # apply pending migrations as the migrator role
 make test                       # the test suites, against the Compose dependencies
@@ -104,11 +109,11 @@ docs/glossary.md             terms
 docs/decisions/              architecture decision records (MADR 4.0.0) and templates
 docs/acceptance.yaml         acceptance plan and verification status
 docs/implementation-plan.md  delivery slices
-src/main.ts                  bootstrap: validated environment, NestJS application, shutdown hooks
-src/app.module.ts            composition root
+src/main.ts                  bootstrap: validated environment, the role's NestJS application, the signal handler that drains it
+src/app.module.ts            composition root: the controllers and the worker processes APP_ROLE selects
 src/domain/                  framework-free domain model: Money, Wallet, WagerTransaction, WalletLedgerEntry, inbox and outbox records, integration events, operation and opening-credit identity, kinds, failure and error codes, domain errors
 src/application/             use cases (OpenWallet, GetWallet, ReconcileWallet, SubmitWagerTransaction, PublishOutbox), the ports they depend on (persistence repositories, unit of work, event publisher, clock, id generator, logger, metrics), the request-level errors they answer with
-src/infrastructure/          configuration, HTTP (controllers, DTOs, validation, problem details, correlation id), persistence (row mappings, repositories, unit of work, migrations), messaging (SQS client, the queue consumer, the events publisher and the publisher loop), observability (the JSON log adapter, the log context, the metric registry and the /metrics endpoint), health, clock and id generator
+src/infrastructure/          configuration, HTTP (controllers, DTOs, validation, problem details, correlation id), persistence (row mappings, repositories, unit of work, migrations), messaging (SQS client, the queue consumer, the events publisher and the publisher loop), runtime (the worker loop, the processes of the worker role and the shutdown protocol), observability (the JSON log adapter, the log context, the metric registry and the /metrics endpoint), health, clock and id generator
 test/                        unit, integration and concurrency suites, run by bun test
 compose.yaml, Dockerfile     the stack and the image
 docker/                      PostgreSQL roles and LocalStack queues, applied once at container init, and stack.sh, which names this checkout's stack

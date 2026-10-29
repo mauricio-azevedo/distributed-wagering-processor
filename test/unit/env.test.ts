@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
+import { APP_ROLES, loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 
 const complete = {
   DATABASE_URL: 'postgres://wagering_app:secret@localhost:5433/wagering',
@@ -10,7 +10,10 @@ const complete = {
 
 /** Every default the service runs with when the deployment names none. */
 const DEFAULTS = {
+  APP_ROLE: 'api' as const,
   HTTP_PORT: 3000,
+  SHUTDOWN_GRACE_PERIOD_MS: 15_000,
+  PENDING_REFERENCE_SWEEP_INTERVAL_MS: 1000,
   LOCK_TIMEOUT_MS: 3000,
   OUTBOX_BATCH_SIZE: 50,
   OUTBOX_PUBLISH_TIMEOUT_MS: 5000,
@@ -21,7 +24,7 @@ const DEFAULTS = {
   SQS_RETRY_BACKOFF_MAX_SECONDS: 300,
 };
 
-describe('config-validation', () => {
+describe('environment-schema', () => {
   test('a complete environment parses, with the port defaulted and unrelated variables dropped', () => {
     expect(loadEnv({ ...complete, PATH: '/usr/bin' })).toEqual({ ...complete, ...DEFAULTS });
   });
@@ -88,6 +91,41 @@ describe('config-validation', () => {
     );
     expect(() => loadEnv({ ...complete, SQS_RETRY_BACKOFF_MAX_SECONDS: '43201' })).toThrow(
       /SQS_RETRY_BACKOFF_MAX_SECONDS/,
+    );
+  });
+
+  /** `ops.single-image-roles`: the one variable that decides what a process of this image runs. */
+  test('each role is accepted and anything else is refused by name', () => {
+    for (const role of APP_ROLES) {
+      expect(loadEnv({ ...complete, APP_ROLE: role })).toEqual({
+        ...complete,
+        ...DEFAULTS,
+        APP_ROLE: role,
+      });
+    }
+
+    expect(() => loadEnv({ ...complete, APP_ROLE: 'publisher' })).toThrow(/APP_ROLE/);
+    expect(() => loadEnv({ ...complete, APP_ROLE: '' })).toThrow(/APP_ROLE/);
+  });
+
+  test('the shutdown grace period and the sweep interval are read, and refused by name', () => {
+    expect(
+      loadEnv({
+        ...complete,
+        SHUTDOWN_GRACE_PERIOD_MS: '2000',
+        PENDING_REFERENCE_SWEEP_INTERVAL_MS: '250',
+      }),
+    ).toEqual({
+      ...complete,
+      ...DEFAULTS,
+      SHUTDOWN_GRACE_PERIOD_MS: 2000,
+      PENDING_REFERENCE_SWEEP_INTERVAL_MS: 250,
+    });
+    expect(() => loadEnv({ ...complete, SHUTDOWN_GRACE_PERIOD_MS: 'a while' })).toThrow(
+      /SHUTDOWN_GRACE_PERIOD_MS/,
+    );
+    expect(() => loadEnv({ ...complete, PENDING_REFERENCE_SWEEP_INTERVAL_MS: '0' })).toThrow(
+      /PENDING_REFERENCE_SWEEP_INTERVAL_MS/,
     );
   });
 

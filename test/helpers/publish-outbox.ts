@@ -11,6 +11,8 @@
  *   to be finished instead of for a timer.
  * - `--hold`: claim a batch and then stop before sending anything, holding the claim until the
  *   process is killed. It is how a case kills a publisher that holds rows nobody has published.
+ * - `--send-delay N`: wait that long before each publication, so a batch takes long enough for a
+ *   case to signal the process while it is in the middle of one (`ops.graceful-shutdown`).
  *
  * It writes one line per event to stdout: `ready` when the loop started, `holding` when it is
  * holding a claim it will not publish, and `published <count>` before it exits, counting the
@@ -25,6 +27,8 @@ import type { OutboxMessage } from '../../src/domain/outbox-message';
 import { loadEnv } from '../../src/infrastructure/config/env';
 import { outboxPublisher } from '../../src/infrastructure/messaging/outbox-publisher';
 import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event-publisher';
+import { jsonLinesLogger } from '../../src/infrastructure/observability/logger';
+import { onShutdownSignal } from '../../src/infrastructure/runtime/shutdown';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 
 const argv = process.argv.slice(2);
@@ -81,8 +85,10 @@ const instrumented = (over: EventPublisher): EventPublisher => ({
       await Bun.sleep(HOLD_MS);
     }
 
+    await Bun.sleep(Number(option('send-delay') ?? 0));
     await over.publish(message);
     sent += 1;
+    say(`sent ${sent.toString()}`);
   },
 });
 
@@ -106,8 +112,16 @@ async function shutDown(): Promise<void> {
   await orm.close(true);
 }
 
-process.on('SIGTERM', () => {
-  void shutDown().then(() => process.exit(0));
+/*
+ * The service's own signal handling, so what a case signals is the shutdown a deployment gets:
+ * the cycle in flight is finished within the grace period and the process exits by its code
+ * (`ops.graceful-shutdown`).
+ */
+onShutdownSignal({
+  drain: shutDown,
+  gracePeriodMs: env.SHUTDOWN_GRACE_PERIOD_MS,
+  // On stderr, so the lines a case parses off stdout are this helper's own.
+  logger: jsonLinesLogger('publish-outbox', process.stderr),
 });
 
 publisher.start();

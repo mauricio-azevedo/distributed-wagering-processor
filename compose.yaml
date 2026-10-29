@@ -4,6 +4,39 @@ x-service: &service
   build: .
   image: '${STACK_IMAGE:-distributed-wagering-processor}'
 
+# `ops.single-image-roles`: one image, one configuration, and `APP_ROLE` as the only difference
+# between what the two service roles run. Everything here is shared by both, so a variable that
+# changes behaviour cannot drift between the role that serves providers and the role that works.
+x-runtime-environment: &runtime-environment
+  HTTP_PORT: 3000
+  DATABASE_URL: postgres://wagering_app:wagering_app@postgres:5432/wagering
+  LOCK_TIMEOUT_MS: 3000
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_ENDPOINT: http://localstack:4566
+  # Shorter than `stop_grace_period` below, so the process is always the one that decides it is
+  # done draining and Compose never has to kill it (`ops.graceful-shutdown`).
+  SHUTDOWN_GRACE_PERIOD_MS: 15000
+
+# The health probe of both roles: `worker` serves the health routes and nothing else, so one probe
+# covers the whole topology and `docker compose up --wait` waits for every instance of it.
+x-health: &health
+  test:
+    - CMD
+    - bun
+    - -e
+    - "const r = await fetch('http://localhost:3000/health/ready'); process.exit(r.ok ? 0 : 1)"
+  interval: 2s
+  timeout: 3s
+  retries: 30
+
+x-depends-on-dependencies: &depends-on-dependencies
+  migrate:
+    condition: service_completed_successfully
+  localstack:
+    condition: service_healthy
+
 services:
   postgres:
     image: postgres:18-alpine
@@ -51,29 +84,31 @@ services:
   api:
     <<: *service
     environment:
-      HTTP_PORT: 3000
-      DATABASE_URL: postgres://wagering_app:wagering_app@postgres:5432/wagering
-      LOCK_TIMEOUT_MS: 3000
-      AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      SQS_ENDPOINT: http://localstack:4566
+      <<: *runtime-environment
+      APP_ROLE: api
     ports:
       - '${HTTP_PORT:-3000}:3000'
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      localstack:
-        condition: service_healthy
-    healthcheck:
-      test:
-        - CMD
-        - bun
-        - -e
-        - "const r = await fetch('http://localhost:3000/health/ready'); process.exit(r.ok ? 0 : 1)"
-      interval: 2s
-      timeout: 3s
-      retries: 30
+    # Longer than `SHUTDOWN_GRACE_PERIOD_MS`: the drain of the requests in flight has to finish
+    # before Compose resorts to `SIGKILL` (`ops.graceful-shutdown`).
+    stop_grace_period: 20s
+    depends_on: *depends-on-dependencies
+    healthcheck: *health
+
+  # Two instances, because every guarantee this service makes has to hold with more than one worker
+  # claiming the same queue, outbox and schedule: the inbox absorbs the redelivery, and the claims
+  # of `SELECT ... FOR UPDATE SKIP LOCKED` keep the two off each other's rows (`ops.compose`).
+  worker:
+    <<: *service
+    environment:
+      <<: *runtime-environment
+      APP_ROLE: worker
+    # No published port: two instances cannot share one, and nothing outside the stack calls a
+    # worker. Its health routes answer inside the network, which is where the probe runs.
+    deploy:
+      replicas: 2
+    stop_grace_period: 20s
+    depends_on: *depends-on-dependencies
+    healthcheck: *health
 
 volumes:
   postgres-data:

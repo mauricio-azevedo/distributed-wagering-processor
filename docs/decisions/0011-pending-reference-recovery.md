@@ -87,9 +87,10 @@ error level and emitting nothing. Anything else counts as transient. The window 
 and never extended, so an outage spends the time a reference had left instead of ending the wait on the wrong
 reason.
 
-The periodic driver is not part of this decision: the `worker` role that sweeps on a timer arrives with the
-runtime roles, alongside the queue consumer and the outbox publisher. What exists here is the sweep itself,
-which any driver — a role, a test, an operator's script — can run on any instance.
+The periodic driver is not part of this decision: the `worker` role sweeps on a timer through
+`PendingReferenceScheduler` (ADR 0013), which also decides what a shutdown does with the attempt in flight.
+What this decision owns is the sweep itself, which any driver — a role, a test, an operator's script — can run
+on any instance; `execute` takes the predicate a driver stops claiming with and nothing else.
 
 ### Consequences
 

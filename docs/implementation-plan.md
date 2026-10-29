@@ -82,4 +82,6 @@ Scope: consistent status classes across every endpoint; `docs/openapi.yaml` serv
 
 Acceptance: API-001, API-009, API-011, API-012, MODEL-006, OBS-001, OBS-002, OBS-003, OBS-005, OUTBOX-008, OPS-003, OPS-005, OPS-007, AUTH-001, AUTH-002. Optional extensions tracked but not scheduled: LEDGER-010, OPS-008, OPS-009.
 
+Landed with the runtime roles and the shutdown protocol of ADR 0013: OPS-003, OPS-005 and OPS-007, and with them this slice's share of slice 7 — MSG-010 and OPS-006. The observability surface landed with ADR 0012. What remains is the HTTP conformance and the authentication extension point.
+
 Exit evidence: `make check` green with every required entry `implemented` and `passing`; the acceptance plan is the release report.

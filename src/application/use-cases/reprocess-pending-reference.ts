@@ -88,20 +88,26 @@ export class ReprocessPendingReference {
   }
 
   /**
-   * One sweep: due transactions, claimed and attempted one by one until none is due or the sweep
-   * is full. Each attempt is reported as it resolves — the line an operator follows it by and the
-   * counter its outcome belongs to — and answered to the caller as well, so a driver reads what the
-   * sweep did without having to read the logs.
+   * One sweep: due transactions, claimed and attempted one by one until none is due, the sweep is
+   * full, or the driver stops claiming. Each attempt is reported as it resolves — the line an
+   * operator follows it by and the counter its outcome belongs to — and answered to the caller as
+   * well, so a driver reads what the sweep did without having to read the logs.
    *
    * A transient failure with nothing claimed — the database itself being unreachable — ends the
    * sweep by rejecting: there is no transaction to report an attempt for, and the caller has to
    * learn that the dependency is gone rather than read it as an empty claim list. Nothing is
    * recorded and every row stays due (`ref.transient-failure`).
+   *
+   * `claiming` is how a shutdown reaches a sweep (`ops.graceful-shutdown`): it is read before each
+   * claim, so a scheduler that was signalled finishes the attempt it had started and takes no new
+   * one. The rows it never claimed are untouched and due, and the one it was holding is released by
+   * the commit or the rollback of its own transaction, so another instance picks them up at once
+   * rather than after a backoff this sweep never got to record.
    */
-  async execute(): Promise<readonly PendingReferenceAttempt[]> {
+  async execute(claiming: () => boolean = () => true): Promise<readonly PendingReferenceAttempt[]> {
     const attempts: PendingReferenceAttempt[] = [];
 
-    for (let claimed = 0; claimed < this.sweepSize; claimed += 1) {
+    for (let claimed = 0; claimed < this.sweepSize && claiming(); claimed += 1) {
       const attempt = await this.attempt();
 
       if (attempt === null) {

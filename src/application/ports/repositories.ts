@@ -22,9 +22,33 @@ export interface WalletRepository {
   findById(walletId: string): Promise<Wallet | null>;
 }
 
+/**
+ * The outcome of reserving a submission's two unique keys (`idem.persistent`, `conc.lock-order`).
+ *
+ * A lost reservation reports the transaction holding `(providerId, idempotencyKey)`, and `null`
+ * when that key was free, which leaves `(providerId, externalTransactionId)` as the key that
+ * collided. `classifyReservationConflict` in the domain turns either case into a replay or one of
+ * the two conflicts; the port carries the fact, not the decision.
+ */
+export type Reservation =
+  | { readonly reserved: true }
+  | { readonly reserved: false; readonly keyHolder: WagerTransaction | null };
+
 export interface WagerTransactionRepository {
   /** Records a submission (`tx.born-pending`) or the outcome it was created with. */
   insert(transaction: WagerTransaction): Promise<void>;
+
+  /**
+   * Claims the operation's identity: the first statement of a financial transaction, before the
+   * wallet is locked (`conc.lock-order`). The row either exists afterwards because this call
+   * wrote it, or it existed already, and the unique keys of the table decide which
+   * (`idem.provider-scoped`, `idem.external-id-bound`) for every instance at once.
+   *
+   * A duplicate arriving while the first attempt is still open waits on the unique index and then
+   * reads what that attempt committed, so the reservation is also the recovery from an unknown
+   * commit outcome: it commits exactly when the financial effect does (`api.indeterminate-commit`).
+   */
+  reserve(transaction: WagerTransaction): Promise<Reservation>;
 
   /** The transaction row of a service id, the identity the read endpoints use (`tx.read-shape`). */
   findById(transactionId: string): Promise<WagerTransaction | null>;

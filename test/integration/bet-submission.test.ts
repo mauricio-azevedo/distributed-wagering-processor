@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 
 import { AppModule } from '../../src/app.module';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
+import { CounterRegistry } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
@@ -44,6 +45,7 @@ let schema: MikroORM;
 let runtime: MikroORM;
 let app: INestApplication;
 let baseUrl: string;
+let metrics: CounterRegistry;
 
 beforeAll(async () => {
   schema = await MikroORM.init(ormConfig(migrationEnv.MIGRATION_DATABASE_URL));
@@ -55,6 +57,7 @@ beforeAll(async () => {
   });
   await app.listen(0);
   baseUrl = await app.getUrl();
+  metrics = app.get(CounterRegistry);
 });
 
 afterAll(async () => {
@@ -877,6 +880,7 @@ describe('transient-failure-503', () => {
 
   test('a lock wait past the ceiling answers 503 with Retry-After and persists nothing', async () => {
     const walletId = await openWallet('500.00');
+    const conflicts = metrics.total('wager_lock_conflicts_total');
 
     const answer = await holdingTheWallet(walletId, () => submit(bet(walletId)));
 
@@ -893,6 +897,10 @@ describe('transient-failure-503', () => {
 
     expect(await walletRow(walletId)).toEqual({ balance: '500.00', version: 1 });
     expect(await transactionRows(walletId)).toHaveLength(1); // the opening credit alone
+
+    // `obs.metrics`: the wait is counted where it was classified, so the same counter rises for a
+    // request and for a message (CONC-002).
+    expect(metrics.total('wager_lock_conflicts_total')).toBe(conflicts + 1);
   });
 
   test('the same request after the lock is released is processed as new, not as a replay', async () => {

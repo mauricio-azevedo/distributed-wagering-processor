@@ -1326,13 +1326,14 @@ entries:
     enforcement:
       - Row lock on the wallet; no shared lock.
     scenario:
-      - 200 wallets each receiving 20 bets, all submitted at once from three processes.
+      - 200 wallets each receiving 20 bets, all submitted at once from three processes, then the same submissions aimed at one wallet as the baseline the first run is measured against.
     expected:
-      - Every wallet ends consistent with its ledger; total duration is far below the serialized sum.
+      - Every wallet ends at version 21 with twenty debits and consistent with its ledger.
+      - One operation on a wallet of its own costs a fraction of one queued behind the rest, measured per operation so the comparison calibrates itself on the machine it runs on. The margin asserted sits just above the ratio of one that a lock wider than the row would produce, rather than near the ratio measured, so a busy machine cannot fail the case and a global lock cannot pass it.
     evidence: { testId: distinct-wallets-in-parallel, layer: concurrency }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: CONC-002
     priority: required
@@ -1340,14 +1341,17 @@ entries:
     contract: conc.row-lock
     enforcement:
       - SELECT ... FOR NO KEY UPDATE in the wallet repository; lock_timeout configured; mapping to 503 and to queue retry.
+      - The count is raised in the unit of work, where the wait is classified, so it is one measurement over both entry points instead of one entry point counting what the other does not.
     scenario:
-      - Hold a lock on a wallet from a test connection; submit a bet over HTTP and through the queue.
+      - Hold a lock on a wallet from the migrator's connection; submit a bet over HTTP and deliver one through the queue.
     expected:
-      - 503 with Retry-After; the message is retried later and succeeds once the lock is released; wager_lock_conflicts_total incremented.
+      - Over HTTP, 503 with Retry-After and nothing persisted.
+      - On the queue, the delivery is classified transient and the message returned rather than acknowledged, nothing is written, not even the inbox row, and the redelivery is applied as a new operation rather than replayed. The case runs against the consumer the composition root built, so the counter is evidence about the deployment's wiring; the backoff a returned message comes back on is MSG-007.
+      - wager_lock_conflicts_total is incremented in both cases.
     evidence: { testId: lock-timeout-is-transient, layer: integration }
     deliverySlice: concurrent-debits
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: CONC-003
     priority: required
@@ -1356,28 +1360,31 @@ entries:
     enforcement:
       - UPDATE ... WHERE version = expected; CHECK (balance >= 0).
     scenario:
-      - Simulate a stale update with a wrong expected version; attempt a negative balance by SQL.
+      - Update against a version the row no longer carries; and the bypass itself, two sessions that both read the wallet without locking it and both write the balance they computed.
     expected:
-      - Zero rows updated and an error raised; the check constraint refuses the negative balance.
+      - Zero rows updated and an error raised in both cases, so the second writer's balance is refused instead of overwriting the first's: one debit, one entry, the wallet at version 2.
+      - The check constraint that refuses a negative balance whatever the code does is SCHEMA-002, which keeps that half of the defence provable with no application code in the picture.
     evidence: { testId: version-guard-and-check, layer: integration }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: CONC-004
     priority: required
     requirement: No global lock and no unguarded read-compute-write exist.
     contract: [conc.no-global-lock, conc.no-unguarded-rmw]
     enforcement:
-      - Code review of every balance write; the only path is the use case under the lock.
+      - A check over the source, inside the gate rather than in a review: a race test can only show that today's paths serialize, never that tomorrow's second writer does not exist.
     scenario:
-      - Grep the codebase for advisory locks and wallet updates outside the use case.
+      - Scan src, comments stripped, for advisory and table locks; for every row-locking clause; for every write to the wallets table; and for every caller of the lock and of the balance update.
     expected:
-      - None found; reviewed on every change touching the wallet repository.
-    evidence: { testId: review-no-global-lock, layer: manual }
+      - No advisory lock and no table lock anywhere.
+      - Every row lock is one of the three reviewed ones, in its reviewed mode and its own repository: the wallet lock as FOR NO KEY UPDATE, the outbox claim as FOR UPDATE SKIP LOCKED, and the scheduler's claim as FOR UPDATE OF "s" SKIP LOCKED. The whole set is asserted, so another one has to be considered against conc.lock-order before it passes.
+      - The wallet repository is the only writer of the table and its update is constrained by the version the lock read. The lock is taken by the two operation paths alone, a submission and a scheduled attempt, each preceded by a claim of its own; the balance is written by the one step they share, so the guarded update cannot come to exist twice with two notions of the expected version.
+    evidence: { testId: wallet-concurrency-is-structural, layer: unit }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: CONC-005
     priority: required
@@ -1386,13 +1393,14 @@ entries:
     enforcement:
       - Coordination only through PostgreSQL.
     scenario:
-      - Run three api processes and two workers against one database; replay the whole concurrency suite through them.
+      - Run every scenario of the concurrency suite through three instances, each a process of its own with its own heap, entity manager and connection pool, armed and then started on an agreed instant.
     expected:
-      - Same results as with one instance; every wallet consistent with its ledger.
+      - The three instances are distinct operating-system processes, none of them the suite, which is what a suite racing objects in one runtime could not claim.
+      - The exactly-once decisions cross them: the copy that applies a duplicate storm runs in one instance and every other instance replays it rather than applying its own.
     evidence: { testId: three-instances-suite, layer: concurrency }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: CONC-006
     priority: required
@@ -1401,13 +1409,14 @@ entries:
     enforcement:
       - Row lock serializes; the second decision sees the first debit.
     scenario:
-      - Open with 100.00; submit two 80.00 bets simultaneously from two processes; retry both.
+      - Open with 100.00; submit two 80.00 bets simultaneously from two processes; retry both, also simultaneously. Twenty rounds, each on a wallet of its own.
     expected:
-      - One PROCESSED, one REJECTED INSUFFICIENT_BALANCE, balance 20.00, one DEBIT entry; retries replay without a second debit.
+      - One PROCESSED, one REJECTED INSUFFICIENT_BALANCE, balance 20.00, the wallet at version 2 and one DEBIT entry beside the opening CREDIT.
+      - Both retries replay the outcome their own transaction recorded, and neither moves the balance or writes a second entry.
     evidence: { testId: two-bets-one-balance, layer: concurrency }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: CONC-007
     priority: required
@@ -1416,13 +1425,14 @@ entries:
     enforcement:
       - Reservation insert before the lock; duplicates wait on the unique index.
     scenario:
-      - Submit the same bet fifty times at once across three processes.
+      - Submit the same bet fifty times at once across three processes, three rounds over.
     expected:
-      - One row, one entry, one debit; forty-nine responses with idempotentReplay true.
+      - One row, one DEBIT entry for the BET, one debit; forty-nine answers with idempotentReplay true, every one of them carrying the transaction id the single applied copy recorded.
+      - The counts are scoped to the BET: the wallet was opened with a positive balance, so it already holds its OPENING CREDIT at walletVersion 1 and ends with two entries at version 2.
     evidence: { testId: fifty-duplicates-one-debit, layer: concurrency }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: CONC-008
     priority: required
@@ -1431,13 +1441,14 @@ entries:
     enforcement:
       - One code path in the use case; reviewed order; FOR NO KEY UPDATE on the wallet; no network call under the lock.
     scenario:
-      - Mix reversals, bets and duplicates on one wallet from three processes for sixty seconds.
+      - Mix bets, duplicates of them and both reversal kinds naming the same targets, on one wallet, from three processes at once. The load is a fixed number of operations rather than a stretch of time, so a run means the same thing on every machine, and the evidence is PostgreSQL's own deadlocks counter for the database, read before and after.
     expected:
-      - No deadlock reported by PostgreSQL; every wallet consistent.
+      - The counter is unchanged, which is stronger than the absence of an error in the outcomes: a deadlock something retried would leave every outcome looking correct.
+      - Exactly one reversal per target is PROCESSED and the other is REJECTED with REFERENCE_ALREADY_REVERSED, the duplicates replay, and the wallet reconciles against its ledger.
     evidence: { testId: mixed-load-no-deadlock, layer: concurrency }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: CONC-009
     priority: required
@@ -1451,8 +1462,8 @@ entries:
       - With the repository's lock every pair serializes with consecutive versions and no error; the control reports deadlock detected (SQLSTATE 40P01) in every pair.
     evidence: { testId: reservation-then-lock-no-deadlock, layer: integration }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- SCHEMA
   - id: SCHEMA-001
@@ -2552,15 +2563,16 @@ entries:
     contract: recon.snapshot
     enforcement:
       - UnitOfWork.snapshot runs the report in one START TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY, with no FOR UPDATE anywhere in it, so both readings come from one snapshot and no write is even possible inside it.
-      - Implemented with ReconcileWallet and verified deterministically by reconciliation-snapshot-is-consistent, which commits a competing balance change between the two readings of one report: the report carries the state before that commit and the writer is never blocked. What is not yet run is this entry's own scenario, reconciliation under real parallel load, which belongs to the concurrency suite.
+      - Implemented with ReconcileWallet and verified deterministically by reconciliation-snapshot-is-consistent, which commits a competing balance change between the two readings of one report: the report carries the state before that commit and the writer is never blocked. This entry's own scenario adds the load, which is the only thing that can show the loop costing the betting nothing.
     scenario:
-      - Reconcile a wallet continuously while three processes bet on it.
+      - Reconcile one wallet continuously from the suite's process while three instances bet on it, then run the same load on a wallet nobody is reconciling as the cost to compare against.
     expected:
-      - Every report is consistent; bet latency is unaffected by the reconciliation loop.
+      - Every report is consistent, and the reports were taken while the balance was moving rather than all before or all after it: the entry counts they were taken over span the load.
+      - Every bet is PROCESSED, and the load under the reconciliation loop costs less than twice the same load without it. The bound catches a report that started taking a lock, since a loop of those would stand between every pair of bets; it is deliberately not set near the difference measured, which is noise.
     evidence: { testId: reconciliation-under-load, layer: concurrency }
     deliverySlice: concurrent-debits
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RECON-002
     priority: required
@@ -2600,7 +2612,7 @@ entries:
     enforcement:
       - Shared helper (test/helpers/wallet-reconciliation.ts) that rebuilds a wallet's balance in SQL, as the sum of credits minus debits and as the balanceAfter of the entry at the wallet's version, and compares both with the stored balance. It recomputes the sum in SQL rather than reusing the service's arithmetic, so a defect there cannot agree with itself.
       - The suites truncate between tests, so the sweep runs in afterEach over the wallets that test touched, before its rows are removed.
-      - Adopted by the suites that move money through a use case; each later slice adopts it with the suites it adds, which is why this entry is not yet green.
+      - Adopted by the suites that move money through a use case; each later slice adopts it with the suites it adds, which is why this entry is not yet green. The concurrency suite adopts it per scenario rather than per test, because a scenario that repeats rounds truncates between them: a sweep that waited for the test to end would find the rows of the last round alone.
       - TouchedWallets.forget drops a wallet from the sweep, for the fixtures of RECON-003 and RECON-005 alone: they corrupt a wallet on purpose to prove the report sees it, so the invariant the sweep asserts is the one such a case breaks.
     scenario:
       - Run the full suite.

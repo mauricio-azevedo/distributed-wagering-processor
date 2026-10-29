@@ -9,6 +9,18 @@ import type { CounterLabels, CounterName, Metrics } from '../../application/port
  * of OBS-002, read the same instance the use cases increment, and so that two applications started
  * in one process do not share totals.
  */
+/**
+ * The port for a caller that counts nothing: a test helper or a probe that builds an adapter
+ * directly, with no registry and no `/metrics` endpoint behind it. It is named and exported rather
+ * than written inline at each default, so a reader of a constructor sees that the fallback counts
+ * nothing instead of having to infer it, and so there is one place to look for who uses it.
+ *
+ * The service never uses it. What keeps that true is not the type — a mis-wired composition root
+ * would take it silently — but the suites that assert the counters through the composition root
+ * itself (CONC-002, MSG-010, RECON-003).
+ */
+export const uncountedMetrics: Metrics = { increment: () => undefined };
+
 export class CounterRegistry implements Metrics {
   private readonly counters = new Map<string, number>();
 

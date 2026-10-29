@@ -11,7 +11,7 @@ import { NestFactory } from '@nestjs/core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 
 import { AppModule } from '../../src/app.module';
-import { InboxPayloadConflictError } from '../../src/application/errors';
+import { InboxPayloadConflictError, ServiceUnavailableError } from '../../src/application/errors';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import {
   WAGER_TRANSACTIONS_DLQ,
@@ -809,4 +809,63 @@ describe('consumer-loop-drains-the-queue', () => {
     expect(await transactionsOf(walletId)).toMatchObject([{ status: 'PROCESSED' }]);
     expect(await queueContents()).toEqual([]);
   }, 20_000);
+});
+
+/**
+ * `conc.row-lock` on the queue (CONC-002): a lock wait longer than the ceiling is a transient
+ * failure here too, so the message comes back and a later receive of it succeeds. The same wait over
+ * HTTP is a `503` with `Retry-After`, in `bet-submission.test.ts`; what makes the two one rule is
+ * that neither entry point classifies anything — the unit of work does, once, for whichever of them
+ * opened the transaction.
+ *
+ * It belongs in this suite rather than beside the other two failure classes in
+ * `queue-retry-and-dead-letters.test.ts` because the consumer here is the one the composition root
+ * built: a counter raised through that wiring is evidence that the deployment raises it, which an
+ * instance assembled by a test could not give. The backoff a returned message comes back on, and the
+ * dispositions of the other classes, are that suite's (MSG-007 to MSG-009).
+ */
+describe('lock-timeout-is-transient', () => {
+  test('a message that cannot take the wallet lock is retried, and succeeds once it is released', async () => {
+    const walletId = await openWallet('500.00');
+    const conflicts = metrics.total('wager_lock_conflicts_total');
+
+    await send(betMessage(walletId), walletId);
+
+    // The wallet row, held by the migrator for as long as the first delivery takes: the lock the
+    // consumer then asks for is the one it cannot have. The reservation that precedes it is not
+    // blocked, because the `FOR KEY SHARE` its foreign key takes is compatible with this mode
+    // (ADR 0002) — so what gives up is the wallet lock and nothing earlier.
+    const holder = schema.em.fork();
+    await holder.begin();
+    let refused: DeliveryReport;
+
+    try {
+      await holder.execute('select "id" from "wallets" where "id" = ? for no key update', [
+        walletId,
+      ]);
+      refused = await pollUntilOne(20_000);
+    } finally {
+      await holder.rollback();
+    }
+
+    // Transient, not a business outcome: nothing about this delivery is terminal, so the message is
+    // returned to the queue rather than acknowledged or dead-lettered (`msg.classification`).
+    expect(refused).toMatchObject({ classification: 'transient', disposition: 'returned' });
+    expect(refused.classification === 'business' ? null : refused.error).toBeInstanceOf(
+      ServiceUnavailableError,
+    );
+    expect(metrics.total('wager_lock_conflicts_total')).toBe(conflicts + 1);
+
+    // Nothing was written, so the redelivery is a new operation and not a replay
+    // (`api.transient-failure`): the inbox row of a rolled-back delivery never committed either.
+    expect(await transactionsOf(walletId)).toEqual([]);
+    expect(await inboxRows()).toEqual([]);
+
+    const applied = await pollUntilOne(20_000);
+
+    expect(applied).toMatchObject({ classification: 'business', disposition: 'acknowledged' });
+    expect(applied.classification === 'business' && applied.outcome.absorbed).toBe(false);
+    expect(await transactionsOf(walletId)).toMatchObject([{ status: 'PROCESSED' }]);
+    expect(await balanceOf(walletId)).toEqual({ balance: '460.00', version: 2 });
+  }, 40_000);
 });

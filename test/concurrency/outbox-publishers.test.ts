@@ -153,7 +153,9 @@ class PublisherProcess {
   private readonly reading: Promise<void>;
 
   constructor(args: readonly string[]) {
-    this.child = Bun.spawn(['bun', 'run', PUBLISHER, ...args], {
+    // `process.execPath`, as every other helper process in the suites is spawned: a publisher runs
+    // the runtime this suite runs on rather than whichever `bun` the PATH of the moment resolves to.
+    this.child = Bun.spawn([process.execPath, 'run', PUBLISHER, ...args], {
       cwd: ROOT,
       env: process.env,
       stdout: 'pipe',

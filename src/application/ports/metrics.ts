@@ -11,7 +11,9 @@
  * with the behaviour that counts.
  */
 export type CounterName =
-  'wager_duplicates_detected_total' | 'wager_reconciliation_divergence_total';
+  | 'wager_duplicates_detected_total'
+  | 'wager_lock_conflicts_total'
+  | 'wager_reconciliation_divergence_total';
 
 /**
  * The labels a counted occurrence carries, which `obs.metrics` states per counter. They are a
@@ -21,7 +23,9 @@ export type CounterName =
  * `source` distinguishes where a duplicate was caught: `inbox` is a redelivery the inbox absorbed
  * (`msg.redelivery-safe`), `inbox-conflict` a message id reused for other content
  * (`msg.inbox-payload-conflict`). A counter with no labels is incremented without a second
- * argument.
+ * argument, which is what `wager_lock_conflicts_total` and
+ * `wager_reconciliation_divergence_total` are: a lock wait and a divergence are counted per
+ * instance and nothing about either distinguishes one occurrence's series from another's.
  */
 export interface CounterLabels {
   readonly source: 'inbox' | 'inbox-conflict';

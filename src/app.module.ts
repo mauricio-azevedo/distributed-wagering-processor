@@ -75,10 +75,14 @@ export class AppModule implements NestModule {
         PostgresHealthIndicator,
         SqsHealthIndicator,
         { provide: APP_FILTER, useClass: ProblemDetailsFilter },
+        CounterRegistry,
         {
           provide: MikroOrmUnitOfWork,
-          useFactory: (em: EntityManager) => new MikroOrmUnitOfWork(em, env.LOCK_TIMEOUT_MS),
-          inject: [EntityManager],
+          // The registry the use cases and the consumer increment, so a lock wait is counted on the
+          // instance that waited whichever entry point it arrived through (CONC-002).
+          useFactory: (em: EntityManager, metrics: CounterRegistry) =>
+            new MikroOrmUnitOfWork(em, env.LOCK_TIMEOUT_MS, metrics),
+          inject: [EntityManager, CounterRegistry],
         },
         {
           provide: OpenWallet,
@@ -101,7 +105,6 @@ export class AppModule implements NestModule {
           useFactory: (unitOfWork: MikroOrmUnitOfWork) => new GetWagerTransaction(unitOfWork),
           inject: [MikroOrmUnitOfWork],
         },
-        CounterRegistry,
         {
           provide: ReconcileWallet,
           useFactory: (unitOfWork: MikroOrmUnitOfWork, metrics: CounterRegistry) =>

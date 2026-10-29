@@ -110,6 +110,7 @@ Operational endpoints are `/health/live`, `/health/ready`, and `/metrics`. Logs 
 | `make test`                 | Run the tests against PostgreSQL and LocalStack                         |
 | `make test TESTS=test/unit` | Run a focused suite                                                     |
 | `make check`                | Check formatting, lint, types, tests, dependencies, and the image build |
+| `make drill`                | Break the wallet lock three ways and watch the tests catch it           |
 | `make logs`                 | Show recent stack logs                                                  |
 | `make down`                 | Remove the stack **and its local database volume**                      |
 | `make help`                 | List all commands                                                       |
@@ -126,12 +127,12 @@ bun run test:load
 
 Brings up three API instances and two workers, runs a 30-second measured load against them, and drains the backlog. It prints throughput, latency percentiles, error rate, lock conflicts, and outbox lag — the measured cost behind the guarantees above, not another correctness check.
 
-| Metric                 | Result                              |
-| ----------------------- | ------------------------------------ |
-| Throughput              | ~1,100–1,320 completed ops/s (HTTP) |
-| Latency (p50 / p95 / p99) | ~10 ms / ~85 ms / ~200 ms          |
-| Infrastructure errors   | 0 in 83,473 attempts                 |
-| Lost or duplicated money | None (reconciliation: 0 divergences) |
+| Metric                    | Result                               |
+| ------------------------- | ------------------------------------ |
+| Throughput                | ~1,100–1,320 completed ops/s (HTTP)  |
+| Latency (p50 / p95 / p99) | ~10 ms / ~85 ms / ~200 ms            |
+| Infrastructure errors     | 0 in 83,473 attempts                 |
+| Lost or duplicated money  | None (reconciliation: 0 divergences) |
 
 Full environment, methodology, and analysis: [docs/load-experiment.md](docs/load-experiment.md).
 

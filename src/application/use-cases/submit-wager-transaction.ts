@@ -8,23 +8,14 @@ import {
 } from '../../domain/idempotency';
 import { InboxMessage } from '../../domain/inbox-message';
 import {
-  type IntegrationEvent,
-  type ResolvedReference,
-  WagerTransactionProcessed,
-  WagerTransactionRejected,
-  WalletBalanceChanged,
+  WagerTransactionPendingReference,
   transactionIdentity,
 } from '../../domain/integration-events';
 import { Money } from '../../domain/money';
-import { OutboxMessage } from '../../domain/outbox-message';
+import { PendingReferenceSchedule } from '../../domain/pending-reference-schedule';
 import type { WagerOperationKind } from '../../domain/transaction-kind';
-import {
-  type RejectionCode,
-  WagerTransaction,
-  requiresReference,
-} from '../../domain/wager-transaction';
-import type { Wallet, WalletOperationOutcome } from '../../domain/wallet';
-import { isDebitOperation } from '../../domain/wallet-ledger-entry';
+import { WagerTransaction } from '../../domain/wager-transaction';
+import { ApplyWagerOperation, type AppliedWagerOperation } from '../apply-wager-operation';
 import { InboxPayloadConflictError, WalletNotFoundError, idempotencyConflict } from '../errors';
 import type { Clock } from '../ports/clock';
 import type { IdGenerator } from '../ports/id-generator';
@@ -99,25 +90,6 @@ interface PreparedSubmission {
   readonly correlationId: string;
 }
 
-/** What the rows of one recorded outcome are written from: the submission, the state it was decided against, the moment and the correlation id. */
-interface Application {
-  readonly submission: WagerTransaction;
-  readonly wallet: Wallet;
-  /** The id the entry of a balance change carries, minted before the transaction opened. */
-  readonly entryId: string;
-  readonly occurredAt: Date;
-  readonly correlationId: string;
-}
-
-/**
- * What the submission's reference resolved to under the lock: the transaction it names, `null` when
- * it carries none, or nothing yet, which is a wait rather than an outcome
- * (`rule.reference.missing-is-pending`).
- */
-type Resolution =
-  | { readonly resolved: true; readonly reference: WagerTransaction | null }
-  | { readonly resolved: false };
-
 /**
  * Applies one provider operation to a wallet, or replays the outcome a previous arrival of it
  * recorded. It is the financial core of the service and the one path both entry points take
@@ -143,20 +115,25 @@ type Resolution =
  *    effect does (`api.indeterminate-commit`).
  * 2. Wallet lock. `SELECT ... FOR NO KEY UPDATE` serializes the operations of one wallet and makes
  *    the balance the decision is taken against the true one (`conc.row-lock`).
- * 3. The decision, by the aggregate, under the lock. A refusal a provider caused comes back as a
- *    failure code to persist (ADR 0006) and never as an exception: the rejection is an outcome of
- *    the system, auditable and replayable, and the row and its event are its only effects
- *    (`rule.rejected.no-effect`).
- * 4. The writes: the outcome on the reserved row, the new balance under the version guard, the
- *    entry, then the events, and last the completion of the inbox row when the submission was
- *    delivered.
+ * 3. The decision, by the aggregate, under the lock, and the rows it is recorded in
+ *    (`ApplyWagerOperation`, the step the scheduler of a parked transaction shares). A refusal a
+ *    provider caused comes back as a failure code to persist (ADR 0006) and never as an exception:
+ *    the rejection is an outcome of the system, auditable and replayable, and the row and its event
+ *    are its only effects (`rule.rejected.no-effect`).
+ * 4. The wait, when the reference has not resolved: the parked row, its place in the scheduler's
+ *    claim list and the one event that announces it (`ref.parked-state`); and last, when the
+ *    submission was delivered, the completion of its inbox row.
  *
  * No network call happens while the lock is held, and nothing in the path reads a clock or mints an
  * id after the transaction opened its first statement, so the window the lock covers is the
  * database work alone.
  */
 export class SubmitWagerTransaction {
-  constructor(private readonly dependencies: SubmitWagerTransactionDependencies) {}
+  private readonly operations: ApplyWagerOperation;
+
+  constructor(private readonly dependencies: SubmitWagerTransactionDependencies) {
+    this.operations = new ApplyWagerOperation(dependencies.ids);
+  }
 
   /** The HTTP entry point: one submission, in one transaction of its own. */
   async execute(command: SubmitWagerTransactionCommand): Promise<SubmissionOutcome> {
@@ -256,169 +233,50 @@ export class SubmitWagerTransaction {
       throw new WalletNotFoundError(submission.walletId);
     }
 
-    await this.decide(repositories, {
+    const operation: AppliedWagerOperation = {
       submission,
       wallet,
       entryId,
       occurredAt: receivedAt,
       correlationId,
-    });
+    };
+
+    if ((await this.operations.apply(repositories, operation)) === 'unresolved-reference') {
+      await this.park(repositories, operation);
+    }
 
     return { transaction: submission, idempotentReplay: false };
   }
 
   /**
-   * The decision, taken under the lock, and the rows the outcome it reaches is written from. Every
-   * path ends in exactly one recorded outcome: the reference is resolved first, because a kind that
-   * applies to another transaction has nothing to decide until it knows which
-   * (`rule.reference.*`); then the aggregate decides the movement of the kinds that move money, and
-   * a `LOSS` is answered without one (`rule.loss.no-effect`).
-   */
-  private async decide(repositories: Repositories, application: Application): Promise<void> {
-    const { submission, wallet } = application;
-    const resolution = await this.resolveReference(repositories, submission);
-
-    if (!resolution.resolved) {
-      return this.park(repositories, application);
-    }
-
-    const reference = resolution.reference;
-    const refused = await this.refuseReference(repositories, submission, reference);
-
-    if (refused !== null) {
-      return this.recordRejection(repositories, application, refused, reference);
-    }
-
-    const movement = submission.movement(reference);
-
-    if (movement === null) {
-      const refusal = wallet.refuseUnmoved(submission);
-
-      return refusal === null
-        ? this.recordWithoutMovement(repositories, application, reference)
-        : this.recordRejection(repositories, application, refusal, reference);
-    }
-
-    const request = {
-      transactionId: submission.id,
-      entryId: application.entryId,
-      playerId: submission.playerId,
-      money: submission.money,
-      occurredAt: application.occurredAt,
-    };
-    const outcome = isDebitOperation(movement)
-      ? wallet.debit({ ...request, operation: movement })
-      : wallet.credit({ ...request, operation: movement });
-
-    return outcome.applied
-      ? this.applyBalanceChange(repositories, application, outcome, reference)
-      : this.recordRejection(repositories, application, outcome.failureCode, reference);
-  }
-
-  /**
-   * The transaction this submission references, read under the lock the decision is taken with.
-   *
-   * The read is after the lock on purpose. A reference belongs to the same wallet
-   * (`rule.reference.same-context`), so the wallet lock is what serializes every reversal of one
-   * target: what this read and the reversed-once check below see is everything that committed
-   * about that target, rather than a state another instance is still about to change
-   * (`conc.lock-order`, `conc.no-unguarded-rmw`).
-   */
-  private async resolveReference(
-    repositories: Repositories,
-    submission: WagerTransaction,
-  ): Promise<Resolution> {
-    const externalTransactionId = submission.referenceExternalTransactionId;
-
-    if (externalTransactionId === null) {
-      return { resolved: true, reference: null };
-    }
-
-    const reference = await repositories.transactions.findByProviderTransaction({
-      providerId: submission.providerId,
-      externalTransactionId,
-    });
-
-    return reference?.isTerminal() === true ? { resolved: true, reference } : { resolved: false };
-  }
-
-  /**
-   * The failure code a resolved reference is refused with, or `null` when none refuses it. The
-   * domain decides everything one pair of transactions settles (RULE-020); this adds the single
-   * rule that is about rows elsewhere in the table — a target is reversed at most once, whatever
-   * the reversal kind, so a `REFUND` and a `ROLLBACK` of one `BET` cannot both credit it
-   * (`rule.reference.reversed-once`).
-   */
-  private async refuseReference(
-    repositories: Repositories,
-    submission: WagerTransaction,
-    reference: WagerTransaction | null,
-  ): Promise<RejectionCode | null> {
-    if (reference === null) {
-      return null;
-    }
-
-    const refusal = submission.refuseReference(reference);
-
-    if (refusal !== null || !requiresReference(submission.kind)) {
-      return refusal;
-    }
-
-    return (await repositories.transactions.hasProcessedReversal(reference.id))
-      ? 'REFERENCE_ALREADY_REVERSED'
-      : null;
-  }
-
-  /**
    * `rule.reference.missing-is-pending`: the referenced transaction has not arrived, or has not
    * reached an outcome yet, so the submission is parked with the balance it observed and answered
-   * `202` (`ref.parked-state`, `api.location-on-pending`). Nothing else is written: no balance
-   * moved and no reference was resolved.
+   * `202` (`ref.parked-state`, `api.location-on-pending`). No balance moved and no reference was
+   * resolved, so the row, its schedule and its event are everything this writes.
    *
-   * Reprocessing a parked transaction is the scheduler's, which this slice does not build (#15):
-   * the schedule row, the backoff, the sixty-minute window, the expiry as `REFERENCE_NOT_FOUND` and
-   * `WagerTransactionPendingReference` all arrive with it, so a transaction parked here waits for an
-   * attempt that nothing triggers yet.
+   * The schedule row is what hands the transaction to the scheduler (ADR 0011): it carries the
+   * attempts, the next one and the window, all counted from this receipt, and it commits with the
+   * parked row, so a transaction is never parked without being claimable and never claimable
+   * without being parked. The event is emitted here and only here, because this is the one arrival
+   * that makes a transaction pending; the attempts that follow emit nothing
+   * (`event.pending-reference-when`).
    */
-  private async park(repositories: Repositories, application: Application): Promise<void> {
-    const { submission, wallet } = application;
+  private async park(repositories: Repositories, operation: AppliedWagerOperation): Promise<void> {
+    const { submission, occurredAt, correlationId } = operation;
 
-    submission.markPendingReference({ observedBalance: wallet.balance });
+    await this.operations.park(repositories, operation);
 
-    await repositories.transactions.recordOutcome(submission);
-  }
+    const schedule = PendingReferenceSchedule.open(submission);
 
-  /**
-   * `rule.loss.no-effect`: a `LOSS` is `PROCESSED` against the balance it observed, and that is
-   * the whole of it — the wallet is never written, so its balance and its version stand
-   * (`wallet.version-increments-on-balance-change`), and no entry exists to write
-   * (`ledger.no-entry-without-effect`). `WagerTransactionProcessed` is its one event, because there
-   * was no balance change for `WalletBalanceChanged` to report (`event.balance-changed-when`).
-   */
-  private async recordWithoutMovement(
-    repositories: Repositories,
-    application: Application,
-    reference: WagerTransaction | null,
-  ): Promise<void> {
-    const { submission, wallet, occurredAt, correlationId } = application;
-
-    submission.markProcessed({
-      observedBalance: wallet.balance,
-      processedAt: occurredAt,
-      ...resolvedBy(reference),
-    });
-
-    await repositories.transactions.recordOutcome(submission);
-    await this.enqueue(repositories, [
-      WagerTransactionProcessed.record({
+    await repositories.pendingReferences.insert(schedule);
+    await this.operations.enqueue(repositories, [
+      WagerTransactionPendingReference.record({
         eventId: this.dependencies.ids.next(),
         correlationId,
         occurredAt,
         identity: transactionIdentity(submission),
-        balanceAfter: wallet.balance,
-        walletVersion: wallet.version,
-        processedAt: occurredAt,
-        reference: reportedReference(reference),
+        referenceExternalTransactionId: awaitedReference(submission),
+        expiresAt: schedule.expiresAt,
       }),
     ]);
   }
@@ -447,113 +305,21 @@ export class SubmitWagerTransaction {
       createdAt: receivedAt,
     });
   }
-
-  /**
-   * The applied operation: the outcome on the reserved row, the balance it produced under the
-   * version the lock read (`conc.version-guard`), the single entry that mirrors it
-   * (`wallet.ledger-mirror`) and the two events every processed balance change emits
-   * (`event.processed-when`, `event.balance-changed-when`).
-   *
-   * The observed balance is the entry's `balanceAfter`, which is what every replay of this outcome
-   * reports however far the balance moves afterwards (`tx.observed-balance`).
-   */
-  private async applyBalanceChange(
-    repositories: Repositories,
-    application: Application,
-    outcome: Extract<WalletOperationOutcome, { applied: true }>,
-    reference: WagerTransaction | null,
-  ): Promise<void> {
-    const { submission, wallet, occurredAt, correlationId } = application;
-
-    submission.markProcessed({
-      observedBalance: outcome.entry.balanceAfter,
-      processedAt: occurredAt,
-      ...resolvedBy(reference),
-    });
-
-    await repositories.transactions.recordOutcome(submission);
-    await repositories.wallets.update(outcome.wallet, wallet.version);
-    await repositories.ledger.insert(outcome.entry);
-    await this.enqueue(repositories, [
-      WagerTransactionProcessed.record({
-        eventId: this.dependencies.ids.next(),
-        correlationId,
-        occurredAt,
-        identity: transactionIdentity(submission),
-        balanceAfter: outcome.wallet.balance,
-        walletVersion: outcome.wallet.version,
-        processedAt: occurredAt,
-        reference: reportedReference(reference),
-      }),
-      WalletBalanceChanged.record({
-        eventId: this.dependencies.ids.next(),
-        correlationId,
-        occurredAt,
-        entry: outcome.entry,
-      }),
-    ]);
-  }
-
-  /**
-   * The refusal the wallet decided, as the outcome the contract persists: the row, its stable
-   * failure code and the balance observed when it was taken, with `WagerTransactionRejected` as its
-   * only other effect (`rule.rejected.no-effect`, `event.rejected-when`). The wallet is never
-   * written, so "balance, ledger and version are unchanged" holds by construction: a refusal hands
-   * back no wallet to write (ADR 0006).
-   */
-  private async recordRejection(
-    repositories: Repositories,
-    application: Application,
-    failureCode: RejectionCode,
-    reference: WagerTransaction | null,
-  ): Promise<void> {
-    const { submission, wallet, occurredAt, correlationId } = application;
-
-    submission.reject({
-      failureCode,
-      observedBalance: wallet.balance,
-      ...resolvedBy(reference),
-    });
-
-    await repositories.transactions.recordOutcome(submission);
-    await this.enqueue(repositories, [
-      WagerTransactionRejected.record({
-        eventId: this.dependencies.ids.next(),
-        correlationId,
-        occurredAt,
-        identity: transactionIdentity(submission),
-        failureCode,
-        observedBalance: wallet.balance,
-        rejectedAt: occurredAt,
-        referenceExternalTransactionId: submission.referenceExternalTransactionId,
-      }),
-    ]);
-  }
-
-  /** The events of one outcome, enqueued in the transaction that produced it, never published. */
-  private async enqueue(
-    repositories: Repositories,
-    events: readonly IntegrationEvent[],
-  ): Promise<void> {
-    for (const event of events) {
-      await repositories.outbox.insert(OutboxMessage.enqueue(event));
-    }
-  }
 }
 
 /**
- * The service id of the reference an outcome resolved, as the member the transitions take only when
- * one exists: a transaction that resolved nothing records nothing about a reference, and one that
- * resolved one records it whether the outcome applied or refused it, so the row says which
- * transaction the decision was taken against (`tx.row-append-only`).
+ * The reference a parked transaction is waiting for. A transaction that carried none cannot be
+ * parked — `markPendingReference` refuses it (`tx.reference-matrix`) — so the absence here is a
+ * defect rather than an event with a missing member.
  */
-function resolvedBy(reference: WagerTransaction | null): { referenceTransactionId?: string } {
-  return reference === null ? {} : { referenceTransactionId: reference.id };
-}
+function awaitedReference(submission: WagerTransaction): string {
+  const reference = submission.referenceExternalTransactionId;
 
-/** `event.processed-when`: the reference a processed outcome resolved, as its event reports it. */
-function reportedReference(reference: WagerTransaction | null): ResolvedReference | null {
-  return reference === null
-    ? null
-    : { transactionId: reference.id, externalTransactionId: reference.externalTransactionId };
+  if (reference === null) {
+    throw new Error(
+      `transaction ${submission.id} is parked without a reference to wait for (tx.reference-matrix)`,
+    );
+  }
+
+  return reference;
 }

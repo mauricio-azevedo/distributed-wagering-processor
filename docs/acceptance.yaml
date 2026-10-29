@@ -637,15 +637,15 @@ entries:
     requirement: FAILED is reachable only from the scheduler on a permanent error, carries PROCESSING_FAILED, is auditable and replays as 500.
     contract: [tx.failed-semantics, ref.permanent-failure]
     enforcement:
-      - ReprocessPendingReference marks FAILED only after an error classified as permanent; the controller maps a FAILED outcome to 500 with the outcome body.
+      - ReprocessPendingReference marks FAILED only after an error classified as permanent, and is the only writer of that status; the DTO maps a FAILED outcome to 500 with the outcome body.
     scenario:
-      - Park a ROLLBACK; make the reprocessing hit a permanent infrastructure error; replay the original request over HTTP.
+      - Park a ROLLBACK; make the reprocessing hit a permanent failure; read the transaction and replay the original request over HTTP.
     expected:
-      - Status FAILED with PROCESSING_FAILED, readable through both GET endpoints, no event, no dead-letter message; the replay answers 500 with the outcome body, failureCode PROCESSING_FAILED and idempotentReplay true.
-    evidence: { testId: failed-status-semantics, layer: integration }
+      - Status FAILED with PROCESSING_FAILED, its observed balance and no processed time, no event and no later sweep attempting it; the read endpoint serves it; the replay answers 500 with the outcome body, failureCode PROCESSING_FAILED and idempotentReplay true.
+    evidence: { testId: pending-reference-failure-classes, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: TX-010
     priority: required
@@ -1024,8 +1024,8 @@ entries:
       - 202 with status PENDING_REFERENCE; a schedule row exists; WagerTransactionPendingReference emitted once.
     evidence: { testId: missing-reference-is-parked, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RULE-015
     priority: required
@@ -1214,14 +1214,15 @@ entries:
     contract: idem.replay-follows-persisted-outcome
     enforcement:
       - Status, failure code and observed balance read from the row at replay time.
+      - The pending half is driven by the pending-reference suite (missing-reference-is-parked, rollback-before-bet-resolves): a parked transaction replays as 202 with the balance it observed, and as its frozen outcome once an attempt settles it.
     scenario:
-      - Park a ROLLBACK (202); replay (202); let the reference arrive and the scheduler apply it; replay again; move the balance with another bet; replay once more.
+      - Park a ROLLBACK (202); replay (202); let the reference arrive and the scheduler apply it; move the balance with another bet; replay once more.
     expected:
       - 202, 202, then 200 with the balance observed when applied, unchanged by the later bet.
     evidence: { testId: replay-after-wallet-change, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-007
     priority: required
@@ -1905,15 +1906,16 @@ entries:
     requirement: Submission outcomes share one body across 200, 202, 422 and 500.
     contract: api.outcome-shape
     enforcement:
-      - One TransactionOutcome DTO.
+      - One TransactionOutcome DTO, with the status read off the recorded outcome.
+      - The 202 and the 500 bodies are asserted by the pending-reference suite (missing-reference-is-parked, pending-reference-failure-classes); the 200, its replay and the 422 by outcome-shape-is-uniform.
     scenario:
       - Obtain a processed, a pending, a rejected and a failed (replayed) outcome.
     expected:
       - Same fields; failureCode present only on the rejected and the failed ones.
     evidence: { testId: outcome-shape-is-uniform, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-004
     priority: required
@@ -1935,15 +1937,15 @@ entries:
     requirement: A 202 carries the Location of the transaction.
     contract: api.location-on-pending
     enforcement:
-      - Controller sets Location for PENDING_REFERENCE outcomes.
+      - The controller sets Location for PENDING_REFERENCE outcomes, first arrival and replay alike, and for no other status.
     scenario:
-      - Park a ROLLBACK.
+      - Park a ROLLBACK, follow its Location, and replay the submission.
     expected:
-      - Location is /wagering/transactions/{transactionId} and the URL resolves.
-    evidence: { testId: pending-has-location, layer: integration }
+      - Location is /wagering/transactions/{transactionId} on both answers and resolves to that transaction; it is absent once the transaction is terminal.
+    evidence: { testId: missing-reference-is-parked, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-006
     priority: required
@@ -2423,15 +2425,16 @@ entries:
         event.failed-no-event,
       ]
     enforcement:
-      - Event emission in the use case keyed on outcome and affectsBalance().
+      - Event emission in ApplyWagerOperation, keyed on the outcome recorded and on whether it moved money; the pending event belongs to the arrival that parks a transaction, so a retry attempt emits nothing.
+      - The parked, applied, expired and FAILED branches are asserted by the case that produces each one in test/integration/pending-reference.test.ts; the rest by events-fire-when-specified.
     scenario:
       - Drive OPENING, BET, LOSS, rejected BET, parked ROLLBACK (then applied), expired reference, and a FAILED reprocessing.
     expected:
       - Processed for OPENING, BET, LOSS and the applied ROLLBACK; BalanceChanged for OPENING, BET and the ROLLBACK only; Rejected for the rejected BET and the expiry; PendingReference once; nothing for FAILED.
     evidence: { testId: events-fire-when-specified, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-012
     priority: required
@@ -2454,14 +2457,15 @@ entries:
     requirement: An unresolved reference parks the transaction, answers 202 or acknowledges, and emits the pending event once.
     contract: [ref.parked-state, rule.reference.missing-is-pending]
     enforcement:
-      - PENDING_REFERENCE status, schedule row, single WagerTransactionPendingReference.
+      - PENDING_REFERENCE status, schedule row and a single WagerTransactionPendingReference, all committed by the arrival that parked the transaction.
+      - The HTTP half is implemented and asserted; the queue acknowledges a parked submission by the classification of msg.classification, and no case drives one through the consumer yet, which is why this entry is not yet green.
     scenario:
-      - Submit a REFUND before its BET over HTTP and through the queue.
+      - Submit a ROLLBACK and a REFUND before their BET over HTTP, then sweep the scheduler once with the reference still missing.
     expected:
-      - 202 and acknowledgement; one schedule row each; one pending event each.
-    evidence: { testId: reference-parked, layer: integration }
+      - 202 with Location; one schedule row at attempts 0, due a second after the receipt and expiring an hour after it; one pending event, and none from the retry attempt.
+    evidence: { testId: missing-reference-is-parked, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: REF-002
@@ -2469,15 +2473,16 @@ entries:
     requirement: The scheduler claims due rows exclusively and survives crashes.
     contract: ref.scheduler
     enforcement:
-      - SELECT ... FOR UPDATE SKIP LOCKED on pending_reference_schedule.
+      - SELECT ... FOR UPDATE SKIP LOCKED on pending_reference_schedule, one row claimed per database transaction, joined with the transaction status so a settled transaction leaves the claim list (ADR 0011).
+      - The attempts counter of a schedule row is the evidence of exclusivity: a row two workers reprocessed would carry two attempts, and a wallet credited twice would fail the ledger reconciliation of RECON-004.
     scenario:
-      - 500 parked transactions due at once; three workers; kill one mid-batch.
+      - Three parked ROLLBACKs with a worker in a process of its own holding the claim on one of them: sweep from another worker, then kill the holder mid-attempt and drain. Then six parked ROLLBACKs drained by three worker processes at once.
     expected:
-      - Each transaction is reprocessed exactly once; the killed worker's rows are picked by the others.
+      - The held row is skipped while it is claimed and is PROCESSED after the holder is killed; every transaction is reprocessed exactly once, each schedule row carries one attempt, and every wallet reconciles.
     evidence: { testId: scheduler-exclusive-claims, layer: concurrency }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: REF-003
     priority: required
@@ -2491,52 +2496,53 @@ entries:
       - 1s, 2s, 4s, ..., 256s, then 300s for every later attempt.
     evidence: { testId: pending-reference-backoff, layer: unit }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: REF-004
     priority: required
     requirement: A pending reference expires after sixty minutes with REFERENCE_NOT_FOUND and its event.
     contract: [ref.ttl, ref.expiry]
     enforcement:
-      - expires_at = first receipt + 60m; the scheduler rejects past expiry.
+      - expires_at = first receipt + 60m, fixed when the transaction is parked and rewritten by no attempt; the scheduler rejects an attempt that ran and still found the reference missing (interpretation 17).
     scenario:
-      - Park a ROLLBACK; advance the clock past sixty minutes; run the scheduler.
+      - Park a ROLLBACK; sweep with a clock past sixty minutes. Then park one whose reference did arrive and sweep with the same clock.
     expected:
-      - REJECTED with REFERENCE_NOT_FOUND; WagerTransactionRejected emitted; balance unchanged.
+      - REJECTED with REFERENCE_NOT_FOUND, its observed balance and WagerTransactionRejected, with balance, version and ledger unchanged, replaying as 422 and claimed by no later sweep; the one whose reference arrived is applied instead.
     evidence: { testId: pending-reference-expires, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: REF-005
     priority: required
     requirement: Once the referenced transaction is processed, the next attempt applies the parked one under the normal rules.
     contract: ref.resolution-on-arrival
     enforcement:
-      - Reprocessing reuses SubmitWagerTransaction with the stored command.
+      - Reprocessing reuses ApplyWagerOperation, the step a submission applies, on the stored row (ADR 0011), so every reference rule and every event is the one a first arrival would have produced.
     scenario:
-      - Deliver a ROLLBACK before its BET; deliver the BET; run the scheduler.
+      - Deliver a ROLLBACK before its BET; deliver the BET; sweep the scheduler. Separately, let the BET be reversed by a REFUND first and sweep again.
     expected:
-      - The ROLLBACK is PROCESSED with the inverse entry; the final balance equals the balance before the BET; ledger consistent.
+      - The arrival of the BET changes nothing by itself; the next attempt records PROCESSED with the inverse entry, the balance before the BET and the resolved reference id; the reversed target is REJECTED with REFERENCE_ALREADY_REVERSED; the ledger reconciles.
     evidence: { testId: rollback-before-bet-resolves, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: REF-006
     priority: required
     requirement: Transient failures during reprocessing only reschedule; permanent ones mark FAILED.
     contract: [ref.transient-failure, ref.permanent-failure]
     enforcement:
-      - Error classification in ReprocessPendingReference; transient errors reschedule per ref.backoff without touching the transaction; permanent errors mark FAILED.
+      - Error classification in ReprocessPendingReference: ServiceUnavailableError, which the unit of work raises for every database failure a retry can clear, and anything nobody classified are transient and only reschedule; any other ApplicationError or a DomainError is permanent and marks FAILED (ADR 0011).
+      - The counters wager_retries_total{component="scheduler"} and wager_transactions_total{status="FAILED"} arrive with the metrics (#20), which is why this entry is not yet green; the permanent failure is already logged at error level through the Logger port.
     scenario:
-      - Park two transactions. Make the first fail transiently five times, then succeed. Make the second hit a permanent infrastructure error.
+      - Park a transaction whose reference has arrived and make the attempt fail transiently, then sweep again cleanly. Park another and make its attempt hit a permanent failure, then replay the original request.
     expected:
-      - The first stays PENDING_REFERENCE through the five failures, with wager_retries_total{component="scheduler"} incremented five times and its expiry untouched, then is PROCESSED; the second is FAILED with PROCESSING_FAILED, logged at error level, wager_transactions_total{status="FAILED"} incremented.
+      - The transient failure records nothing at all, counts one attempt and leaves expires_at where it was, and the next attempt applies the transaction; the permanent one is FAILED with PROCESSING_FAILED, emits no event, is logged with its transaction id and replays as 500.
     evidence: { testId: pending-reference-failure-classes, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   # ---------------------------------------------------------------- RECON

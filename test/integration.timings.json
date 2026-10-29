@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "files": {
+    "test/integration/queue-retry-and-dead-letters.test.ts": 81821,
+    "test/integration/queue-submission.test.ts": 53360,
+    "test/integration/outbox-publication.test.ts": 44440,
+    "test/integration/graceful-shutdown.test.ts": 37045,
+    "test/integration/runtime-roles.test.ts": 32920,
+    "test/integration/wallet-lock.test.ts": 10209,
+    "test/integration/pending-reference.test.ts": 3249,
+    "test/integration/bet-submission.test.ts": 1533,
+    "test/integration/schema.test.ts": 852,
+    "test/integration/reversals-references.test.ts": 810,
+    "test/integration/read-endpoints.test.ts": 633,
+    "test/integration/observability.test.ts": 473,
+    "test/integration/stack-isolation.test.ts": 413,
+    "test/integration/infrastructure.test.ts": 364,
+    "test/integration/wallet-opening.test.ts": 347,
+    "test/integration/wallet-http.test.ts": 294,
+    "test/integration/idempotency.test.ts": 258,
+    "test/integration/persistence.test.ts": 245,
+    "test/integration/wallet-ledger-chain.test.ts": 234,
+    "test/integration/wallet-reconciliation.test.ts": 205,
+    "test/integration/authentication.test.ts": 182,
+    "test/integration/status-classes.test.ts": 152,
+    "test/integration/migrations.test.ts": 109,
+    "test/integration/bet-atomicity.test.ts": 101,
+    "test/integration/compose-stack.test.ts": 92
+  }
+}

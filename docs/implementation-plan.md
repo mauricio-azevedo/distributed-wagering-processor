@@ -107,3 +107,18 @@ Scope: `make demo` installing the dependencies and writing `.env` itself, as the
 Acceptance: OPS-011, OPS-012, OPS-013.
 
 Exit evidence: `make demo` in a fresh clone of this repository, from `git clone` to the eight demonstrations in one command; `make drill` catching all three mutations and leaving no file changed.
+
+## 12. parallel-ci-gate — The gate as four jobs instead of one
+
+Scope: `ci` split into `static` (`fmt-check`, `lint`, `typecheck`, `audit`, `build`), `fast`
+(`test/unit` and `test/contract`), `integration` (`test/integration`, sharded three ways by
+Bun's `--shard`, balanced with a committed `test/integration.timings.json`) and `concurrency`
+(`test/concurrency`); a fifth job, `ci`, depending on all four with nothing of its own, so the
+`main` ruleset's required context never changes; ADR 0016.
+
+Acceptance: OPS-014.
+
+Exit evidence: before/after wall-clock time from the Actions API for an equivalent change, both
+numbers in the PR body; one test broken in each of the four kinds, confirming the gate fails and
+names the job; a PR merged through the four-job workflow with the ruleset still gating on `ci`
+alone.

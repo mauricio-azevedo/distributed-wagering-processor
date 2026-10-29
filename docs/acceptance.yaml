@@ -2953,6 +2953,25 @@ entries:
     implementationStatus: implemented
     verificationStatus: passing
 
+  - id: OPS-014
+    priority: required
+    requirement: The gate's wall-clock time is the longest of its parallel jobs, not their sum, and the required check stays one context.
+    contract: ops.parallel-gate
+    enforcement:
+      - .github/workflows/ci.yml with static, fast, integration (a three-way bun test --shard matrix balanced by test/integration.timings.json) and concurrency as independent jobs, each starting its own PostgreSQL and LocalStack through make infra; a ci job depending on all four with no step of its own, named to match the main ruleset's required context (ADR 0016).
+    scenario:
+      - Run the workflow on a PR and read the wall-clock time of each job and of ci against the 451s single-job baseline recorded for PR #60.
+      - Break one test in each of static, fast, integration and concurrency, one at a time.
+      - Re-run a single failed integration shard through the Actions UI, without re-running the other jobs.
+    expected:
+      - No job shares a database or a queue with another; the longest job is materially under 451s; the required checks the main ruleset names are still exactly ci and pr-title.
+      - Each broken test fails only the job it runs in and ci, naming that job.
+      - The re-run shard turns green on its own and ci turns green once it does, with the other three jobs untouched.
+    evidence: { testId: parallel-ci-gate, layer: manual }
+    deliverySlice: parallel-ci-gate
+    implementationStatus: implemented
+    verificationStatus: not-run
+
   # ---------------------------------------------------------------- AUTH
   - id: AUTH-001
     priority: required

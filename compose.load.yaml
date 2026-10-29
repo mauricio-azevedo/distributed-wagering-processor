@@ -1,0 +1,28 @@
+# The topology the load experiment measures (OPS-008): the stack of compose.yaml with three `api`
+# instances instead of one. `bun run test:load` brings it up with both files, and `make load` does
+# the same with this checkout's ports already exported:
+#
+#   docker compose --file compose.yaml --file compose.load.yaml up --detach --wait
+#
+# It is an overlay rather than a second stack because of what the report claims. The numbers have to
+# describe the configuration this repository deploys, so the only difference allowed here is the
+# instance count and the host ports those instances need: a knob tuned for the experiment — a longer
+# lock timeout, a larger outbox batch — would make the report a measurement of something nobody
+# runs. `compose-load-stack` in test/integration/compose-stack.test.ts asserts that, by comparing
+# every other resolved field of both roles with the base stack's.
+#
+# The two `worker` instances are the ones the stack already runs: the queue consumer, the outbox
+# publisher and the pending-reference scheduler stay as deployed, so the queue half of the
+# experiment measures the deployed worker count (`ops.compose`).
+services:
+  api:
+    # Three containers cannot share one host port, and `!override` is needed because Compose merges
+    # port lists by appending: without it the single port of compose.yaml would survive beside the
+    # range and collide with it. LOAD_API_PORTS is one variable and not two, so the range can never
+    # be assembled out of one overridden end and one default end; `make stack` prints the value for
+    # this checkout, and Compose hands each instance a free port from it in no particular order —
+    # which is why the experiment asks Compose which port each instance got.
+    ports: !override
+      - '${LOAD_API_PORTS:-3000-3002}:3000'
+    deploy:
+      replicas: 3

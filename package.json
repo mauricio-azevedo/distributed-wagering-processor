@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Wallet and wagering transaction service for multi-provider game integrations",
+  "scripts": {
+    "test:load": "bun run test/load/main.ts"
+  },
   "engines": {
     "bun": ">=1.4.4 <2"
   },

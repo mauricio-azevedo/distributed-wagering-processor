@@ -21,6 +21,11 @@ ifeq ($(STACK_SLOT),0)
 HTTP_PORT ?= 3000
 POSTGRES_PORT ?= 5433
 LOCALSTACK_PORT ?= 4566
+# The host ports the load topology publishes for its three api instances (compose.load.yaml,
+# OPS-008). Slot 0 publishes three fixed ports rather than a block, and the two next to 3000 are
+# free of the other defaults, so the range starts where the single instance already publishes: one
+# of the three instances always answers on the address a reviewer knows.
+LOAD_API_PORTS ?= $(HTTP_PORT)-$(shell expr $(HTTP_PORT) + 2)
 else
 # A block of ten per worktree, with room for the ports the next slices publish, inside a band that
 # common services and the ephemeral range both leave alone: shifting the defaults by the slot
@@ -29,8 +34,11 @@ STACK_PORT_BASE := $(shell expr 24000 + 10 \* $(STACK_SLOT))
 HTTP_PORT ?= $(STACK_PORT_BASE)
 POSTGRES_PORT ?= $(shell expr $(STACK_PORT_BASE) + 1)
 LOCALSTACK_PORT ?= $(shell expr $(STACK_PORT_BASE) + 2)
+# Inside the same block of ten, after the three ports the stack itself publishes, so a worktree
+# running the load experiment still collides with nothing another checkout published.
+LOAD_API_PORTS ?= $(shell expr $(STACK_PORT_BASE) + 3)-$(shell expr $(STACK_PORT_BASE) + 5)
 endif
-export COMPOSE_PROJECT_NAME STACK_IMAGE HTTP_PORT POSTGRES_PORT LOCALSTACK_PORT
+export COMPOSE_PROJECT_NAME STACK_IMAGE HTTP_PORT POSTGRES_PORT LOCALSTACK_PORT LOAD_API_PORTS
 
 # Where the suites run, which is never where the stack runs (`ops.suite-isolation`). One set of
 # containers serves both: docker/postgres creates wagering_test beside wagering and
@@ -48,10 +56,13 @@ TEST_QUEUE_PREFIX ?= test-
 help: ## List the targets
 	@awk 'BEGIN { FS = ":.*## " } /^[a-zA-Z_-]+:.*## / { printf "  %-10s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
+# The load experiment reads this output instead of recomputing the arithmetic above, so the ports
+# it drives are the ports this checkout publishes and there is one place that decides them.
 stack: ## Print this checkout's Compose project, image, published ports and suite addresses
 	@printf '%s=%s\n' COMPOSE_PROJECT_NAME '$(COMPOSE_PROJECT_NAME)' STACK_SLOT '$(STACK_SLOT)' \
 	  STACK_IMAGE '$(STACK_IMAGE)' HTTP_PORT '$(HTTP_PORT)' POSTGRES_PORT '$(POSTGRES_PORT)' \
-	  LOCALSTACK_PORT '$(LOCALSTACK_PORT)' TEST_DATABASE_URL '$(TEST_DATABASE_URL)' \
+	  LOCALSTACK_PORT '$(LOCALSTACK_PORT)' LOAD_API_PORTS '$(LOAD_API_PORTS)' \
+	  TEST_DATABASE_URL '$(TEST_DATABASE_URL)' \
 	  TEST_MIGRATION_DATABASE_URL '$(TEST_MIGRATION_DATABASE_URL)' \
 	  TEST_QUEUE_PREFIX '$(TEST_QUEUE_PREFIX)'
 

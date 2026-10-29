@@ -15,6 +15,7 @@
 #   scenario / expected   the proving scenario and its observable outcome
 #   evidence.testId       stable identifier of the test that carries the evidence
 #   evidence.layer        unit | schema | integration | concurrency | contract | manual
+#   evidence.document     where a `manual` entry's evidence is recorded, when it is a document
 #   deliverySlice         slice id from docs/implementation-plan.md
 #   implementationStatus  planned | in-progress | implemented | deferred
 #   verificationStatus    not-run | passing | failing (passing requires implemented)
@@ -23,11 +24,15 @@
 #
 # Release report
 #   Every `required` entry is `implemented` and `passing`: the named test exists, runs in
-#   `make check` and carries the evidence of that entry. The three `optional` entries —
-#   LEDGER-010 (double-entry bookkeeping), OPS-008 (a load-test report) and OPS-009 (OpenTelemetry
-#   tracing) — are extensions this version deliberately does not build, not gaps in it; each one
-#   names, in its own `enforcement`, what building it would add. Nothing else is outstanding.
-#   The demonstrations of docs/demonstrations.md walk the same guarantees against a running stack.
+#   `make check` and carries the evidence of that entry. Of the three `optional` entries, OPS-008
+#   (a load-test report) was built afterwards as an extension: `bun run test:load` and the two
+#   recorded runs of docs/load-experiment.md are its evidence, and it is the one entry whose
+#   evidence is a document rather than a suite in `make check`, because a throughput is a
+#   measurement and not an assertion. LEDGER-010 (double-entry bookkeeping) and OPS-009
+#   (OpenTelemetry tracing) are extensions this version deliberately does not build, not gaps in
+#   it; each names, in its own `enforcement`, what building it would add. Nothing else is
+#   outstanding. The demonstrations of docs/demonstrations.md walk the same guarantees against a
+#   running stack.
 
 version: 1
 entries:
@@ -2639,6 +2644,7 @@ entries:
       - Adopted by every suite that moves money through a use case, the crash-recovery drill of test/concurrency/crash-recovery.test.ts included, which is the last one to adopt it. test/integration/schema.test.ts is the one suite that writes money and does not, because every case in it is direct SQL asserting a refusal: it never reaches a use case and the rows it leaves are the ones a constraint rejected.
       - The concurrency suites adopt it per scenario rather than per test, because a scenario that repeats rounds truncates between them: a sweep that waited for the test to end would find the rows of the last round alone.
       - TouchedWallets.forget drops a wallet from the sweep, for the fixtures of RECON-003 and RECON-005 alone: they corrupt a wallet on purpose to prove the report sees it, so the invariant the sweep asserts is the one such a case breaks.
+      - The load experiment of OPS-008 ends with the same invariant, over every wallet it touched: the SQL rebuild above, run against the stack's own database, and the POST /wallets/{walletId}/reconciliation endpoint for each wallet. It is evidence beside the suites and not a substitute for them — 94,160 ledger entries written by three api and two worker instances under contention, with no divergence (docs/load-experiment.md).
     scenario:
       - Run the full suite.
     expected:
@@ -2852,15 +2858,20 @@ entries:
     requirement: A load test reports throughput, latency percentiles, error rate, lock conflicts and outbox lag.
     contract: [conc.multi-instance, obs.metrics, outbox.lag-metrics]
     enforcement:
-      - Not scheduled; would be exposed as make load-test with a written methodology.
+      - bun run test:load (test/load/main.ts) drives HTTP submissions and queue messages against the Compose stack of compose.load.yaml, which overlays compose.yaml with three api instances and changes nothing else; compose-load-stack compares every other resolved field of both roles with the base stack, so the numbers describe the deployed configuration.
+      - Throughput counts completed unique operations over a measured window that excludes a warm-up; submitted attempts, idempotent replays and business rejections are counted apart from it, and the error rate is infrastructure errors (503, other 5xx, transport) over every attempt in the window, per entry point.
+      - Latency percentiles are nearest-rank over the generator's own measurements and, as a second source, wager_processing_duration_seconds read as Prometheus reads a histogram; lock conflicts, duplicates, retries, dead letters and the two outbox gauges are deltas between a scrape of all five instances at each end of the window, counters summed across instances and gauges taken as the highest reading.
+      - Queue latency starts at the broker's acknowledgement and ends at the operation's recorded timestamp, which is the service's receipt because the use case reads its clock once per submission; the processing it excludes is the queue entrypoint histogram, reported beside it.
+      - After load stops the input queue, the run's non-terminal rows and the outbox are drained within LOAD_DRAIN_TIMEOUT_MS; anything still pending is reported as pending and never counted as completed.
+      - The arithmetic is unit-tested apart from the stack (test/unit/load-measure.test.ts); the scenario asserts no number of its own and exits non-zero on a divergence, a FAILED outcome, a request the service refused to read, or a drain that timed out.
     scenario:
-      - Run the load test against the Compose stack with three api instances.
+      - Run bun run test:load against the Compose stack with three api instances, twice, and reconcile afterwards.
     expected:
-      - A report with environment, methodology, p50, p95, p99, error rate, lock conflicts and outbox lag.
-    evidence: { testId: load-test-report, layer: manual }
+      - A report with environment, methodology, throughput, p50, p95, p99, error rate, lock conflicts and outbox lag, pending work after the drain, and reconciliation for every wallet touched.
+    evidence: { testId: load-test-report, layer: manual, document: docs/load-experiment.md }
     deliverySlice: http-observability-shutdown
-    implementationStatus: deferred
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OPS-009
     priority: optional

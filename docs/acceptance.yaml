@@ -1524,7 +1524,7 @@ entries:
     requirement: The schema admits only known kinds, statuses, failure codes, directions and event types, and enforces the reference matrix.
     contract: [tx.kinds, tx.reference-matrix]
     enforcement:
-      - One CHECK per vocabulary column, on a TEXT column rather than an enumerated type, so a vocabulary change is a migration and not a type rewrite; CHECK on kind versus reference_external_transaction_id.
+      - One CHECK per vocabulary column, on a TEXT column rather than an enumerated type, so a vocabulary changes by replacing one constraint; CHECK on kind versus reference_external_transaction_id.
     scenario:
       - Insert kind SPLIT, status SETTLED, an unknown failure code, a ledger direction SIDEWAYS, a ledger entry of kind LOSS and an unknown outbox event type.
       - Insert a REFUND and a ROLLBACK without a reference; insert a BET with one; insert an OPENING with one; insert a WIN with one and a WIN without one.

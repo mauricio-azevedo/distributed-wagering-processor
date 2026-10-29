@@ -63,8 +63,9 @@ Checks:
   that the rest of the schema admits the value.
 - The closed vocabularies are checks too, on `TEXT` columns rather than enumerated types: kind, status and
   failure code on `wager_transactions`, kind and direction on `wallet_ledger_entries`, event type on
-  `outbox_messages`. A vocabulary then grows by a migration that replaces one constraint instead of by an
-  `ALTER TYPE` that the table and every dependent view have to follow.
+  `outbox_messages`. A vocabulary then changes by a migration that replaces one constraint, where an
+  enumerated type cannot drop a value without being recreated and cannot have one added and used in the same
+  transaction.
 
 Immutability:
 

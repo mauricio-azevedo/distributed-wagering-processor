@@ -1,4 +1,4 @@
-import { SQSClient } from '@aws-sdk/client-sqs';
+import { GetQueueUrlCommand, SQSClient } from '@aws-sdk/client-sqs';
 import type { Provider } from '@nestjs/common';
 
 import type { Env } from '../config/env';
@@ -17,5 +17,35 @@ export function sqsClientProvider(env: Env): Provider {
         region: env.AWS_REGION,
         ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
       }),
+  };
+}
+
+/**
+ * The URL of a queue, resolved once per process and remembered: the name is contract
+ * (`msg.queues`) and the URL is deployment, so nothing in the service spells one out.
+ *
+ * A failed resolution is not remembered, so a consumer that started before the broker was
+ * reachable resolves on its next poll instead of holding the failure for the life of the process.
+ */
+export function queueUrlResolver(sqs: SQSClient, queueName: string): () => Promise<string> {
+  let resolved: Promise<string> | null = null;
+
+  return () => {
+    resolved ??= sqs
+      .send(new GetQueueUrlCommand({ QueueName: queueName }))
+      .then(({ QueueUrl }) => {
+        if (QueueUrl === undefined) {
+          throw new Error(`SQS answered no URL for queue ${queueName}`);
+        }
+
+        return QueueUrl;
+      })
+      .catch((error: unknown) => {
+        resolved = null;
+
+        throw error;
+      });
+
+    return resolved;
   };
 }

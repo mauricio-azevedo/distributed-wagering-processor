@@ -1283,8 +1283,8 @@ entries:
       - The message is acknowledged as a replay; one debit; duplicates metric incremented.
     evidence: { testId: idempotency-across-entry-points, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-011
     priority: required
@@ -2085,8 +2085,8 @@ entries:
       - wager-transactions.fifo, wager-transactions-dlq.fifo and wager-integration-events.fifo exist; the redrive policy points at the dead-letter queue with maxReceiveCount 5.
     evidence: { testId: queues-bootstrapped, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-002
     priority: required
@@ -2100,7 +2100,7 @@ entries:
       - Each lands in the dead-letter queue immediately; nothing persisted.
     evidence: { testId: message-contract-validated, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: MSG-003
@@ -2115,8 +2115,8 @@ entries:
       - Identical outcomes, rows and events.
     evidence: { testId: consumer-uses-same-use-case, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-004
     priority: required
@@ -2130,8 +2130,8 @@ entries:
       - The resend is acknowledged as a duplicate; one transaction exists.
     evidence: { testId: inbox-keyed-by-body-message-id, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-005
     priority: required
@@ -2145,7 +2145,7 @@ entries:
       - The second goes to the dead-letter queue; the first transaction is untouched; the inbox-conflict metric increments.
     evidence: { testId: inbox-payload-conflict, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: MSG-006
@@ -2160,8 +2160,8 @@ entries:
       - One debit, one entry, one set of events; the redelivery is acknowledged; duplicates metric increments.
     evidence: { testId: killed-after-commit-before-ack, layer: concurrency }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-007
     priority: required
@@ -2175,7 +2175,7 @@ entries:
       - Acknowledged, retried, dead-lettered respectively.
     evidence: { testId: consumer-outcome-classification, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: MSG-008
@@ -2250,8 +2250,8 @@ entries:
       - Logs and events carry the given correlationId, or the messageId when absent.
     evidence: { testId: message-correlation, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- OUTBOX
   - id: OUTBOX-001

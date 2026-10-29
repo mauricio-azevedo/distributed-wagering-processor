@@ -1,9 +1,12 @@
+import type { CanonicalValue } from '../../domain/canonical-json';
 import {
   type Sha256Hex,
   type SubmittedOperation,
   classifyReservationConflict,
+  contentHashOf,
   payloadHashOf,
 } from '../../domain/idempotency';
+import { InboxMessage } from '../../domain/inbox-message';
 import {
   type IntegrationEvent,
   type ResolvedReference,
@@ -22,7 +25,7 @@ import {
 } from '../../domain/wager-transaction';
 import type { Wallet, WalletOperationOutcome } from '../../domain/wallet';
 import { isDebitOperation } from '../../domain/wallet-ledger-entry';
-import { WalletNotFoundError, idempotencyConflict } from '../errors';
+import { InboxPayloadConflictError, WalletNotFoundError, idempotencyConflict } from '../errors';
 import type { Clock } from '../ports/clock';
 import type { IdGenerator } from '../ports/id-generator';
 import type { Repositories, UnitOfWork } from '../ports/unit-of-work';
@@ -46,6 +49,21 @@ export interface SubmitWagerTransactionCommand {
 }
 
 /**
+ * What one queue message is as a delivery, which is the only thing the queue entry point adds to a
+ * submission (`msg.inbox-identity`): the consumer that received it, the producer-assigned message
+ * id, and the content the delivery hash is taken over — the `data` of the message
+ * (`msg.inbox-payload-conflict`, ADR 0010).
+ *
+ * The broker's receipt id is deliberately absent: it changes on every delivery and on every
+ * producer resend, so it is diagnostic and can never be an identity.
+ */
+export interface MessageDelivery {
+  readonly consumerName: string;
+  readonly messageId: string;
+  readonly content: CanonicalValue;
+}
+
+/**
  * What the submission answers with: the transaction row carrying the outcome, and whether that
  * outcome was recorded now or read back from a previous arrival (`idem.replay-same-outcome`). The
  * status, the failure code and the observed balance all come off the row, so the adapters answer
@@ -57,11 +75,28 @@ export interface SubmissionOutcome {
   readonly idempotentReplay: boolean;
 }
 
+/**
+ * What one delivery of a message amounted to: the outcome it recorded or replayed, or nothing at
+ * all because the inbox already held that delivery (`msg.redelivery-safe`). The second case exists
+ * on the queue alone, which is why it is the result of `deliver` and not of `execute`: an HTTP
+ * request has no delivery identity and therefore nothing that could already be absorbed.
+ */
+export type DeliveryOutcome =
+  { readonly absorbed: true } | ({ readonly absorbed: false } & SubmissionOutcome);
+
 export interface SubmitWagerTransactionDependencies {
   readonly unitOfWork: UnitOfWork;
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly sha256Hex: Sha256Hex;
+}
+
+/** What one submission is prepared as before its transaction opens (`prepare`). */
+interface PreparedSubmission {
+  readonly submission: WagerTransaction;
+  readonly entryId: string;
+  readonly receivedAt: Date;
+  readonly correlationId: string;
 }
 
 /** What the rows of one recorded outcome are written from: the submission, the state it was decided against, the moment and the correlation id. */
@@ -93,10 +128,15 @@ type Resolution =
  * the outbox rows that announce it. Nothing is published from here — the publisher reads committed
  * rows (`outbox.publish-after-commit`).
  *
- * The order inside the transaction is the fixed one of ADR 0002 (`conc.lock-order`):
+ * The queue adds one thing and only one: a delivery identity. `deliver` claims the inbox row of
+ * the message in the same transaction and completes it with the same commit (ADR 0010), and runs
+ * the same financial body `execute` runs, so no rule can come to exist in one entry point alone.
  *
- * 1. Reservation. The transaction row is inserted before anything else, so the two unique keys of
- *    the submission are claimed by the database rather than by a look-then-write two arrivals
+ * The order inside the transaction is the fixed one of ADR 0002 (`conc.lock-order`), with the
+ * inbox claim of a delivered submission before all of it:
+ *
+ * 1. Reservation. The transaction row is inserted before any operation work, so the two unique keys
+ *    of the submission are claimed by the database rather than by a look-then-write two arrivals
  *    would both pass. A duplicate waits on the unique index, reads the committed row and replays
  *    without ever reaching the wallet (`idem.persistent`, `conc.duplicate-storm`). It is also the
  *    recovery from an unknown commit outcome, because the key commits exactly when the financial
@@ -108,7 +148,8 @@ type Resolution =
  *    the system, auditable and replayable, and the row and its event are its only effects
  *    (`rule.rejected.no-effect`).
  * 4. The writes: the outcome on the reserved row, the new balance under the version guard, the
- *    entry, then the events.
+ *    entry, then the events, and last the completion of the inbox row when the submission was
+ *    delivered.
  *
  * No network call happens while the lock is held, and nothing in the path reads a clock or mints an
  * id after the transaction opened its first statement, so the window the lock covers is the
@@ -117,40 +158,113 @@ type Resolution =
 export class SubmitWagerTransaction {
   constructor(private readonly dependencies: SubmitWagerTransactionDependencies) {}
 
+  /** The HTTP entry point: one submission, in one transaction of its own. */
   async execute(command: SubmitWagerTransactionCommand): Promise<SubmissionOutcome> {
-    const receivedAt = this.dependencies.clock.now();
-    const submission = this.record(command, receivedAt);
-    const entryId = this.dependencies.ids.next();
+    const prepared = this.prepare(command);
+
+    return this.dependencies.unitOfWork.transactional((repositories) =>
+      this.apply(repositories, prepared),
+    );
+  }
+
+  /**
+   * The queue entry point: the same submission, plus the inbox row that makes a redelivery of it
+   * harmless (`msg.inbox-identity`, ADR 0010).
+   *
+   * The claim is the first statement of the transaction, before the reservation
+   * (`conc.lock-order`): the delivery is decided before any operation work, so a reused message id
+   * is reported as what it is instead of surfacing as the idempotency conflict its changed content
+   * would also cause. A claim and not a lookup, because two deliveries of one message id can be in
+   * flight at once and both would pass a look-then-write; the second waits on the primary key and
+   * then reads what the first committed.
+   *
+   * Absorbing writes nothing: the lost claim wrote no row, so the transaction has nothing to
+   * commit and the consumer deletes the message (`msg.redelivery-safe`). A conflicting claim
+   * throws, and the rollback is what leaves the first delivery's effects untouched
+   * (`msg.inbox-payload-conflict`).
+   */
+  async deliver(
+    command: SubmitWagerTransactionCommand,
+    delivery: MessageDelivery,
+  ): Promise<DeliveryOutcome> {
+    const prepared = this.prepare(command);
+    const received = InboxMessage.receive({
+      consumerName: delivery.consumerName,
+      messageId: delivery.messageId,
+      payloadHash: contentHashOf(delivery.content, this.dependencies.sha256Hex),
+      receivedAt: prepared.receivedAt,
+    });
 
     return this.dependencies.unitOfWork.transactional(async (repositories) => {
-      const reservation = await repositories.transactions.reserve(submission);
+      const claim = await repositories.inbox.claim(received);
 
-      if (!reservation.reserved) {
-        const decision = classifyReservationConflict(reservation.keyHolder, submission.payloadHash);
-
-        if (!decision.replay) {
-          throw idempotencyConflict(decision.code, submission);
+      if (!claim.claimed) {
+        if (!claim.stored.matchesPayload(received.payloadHash)) {
+          throw new InboxPayloadConflictError(delivery.consumerName, delivery.messageId);
         }
 
-        return { transaction: decision.stored, idempotentReplay: true };
+        return { absorbed: true };
       }
 
-      const wallet = await repositories.wallets.lockById(submission.walletId);
+      const outcome = await this.apply(repositories, prepared);
 
-      if (wallet === null) {
-        throw new WalletNotFoundError(submission.walletId);
-      }
+      received.markProcessed(prepared.receivedAt);
+      await repositories.inbox.complete(received);
 
-      await this.decide(repositories, {
-        submission,
-        wallet,
-        entryId,
-        occurredAt: receivedAt,
-        correlationId: command.correlationId,
-      });
-
-      return { transaction: submission, idempotentReplay: false };
+      return { absorbed: false, ...outcome };
     });
+  }
+
+  /**
+   * Everything one submission needs before its transaction opens: the moment it was received, the
+   * row that will carry its outcome and the id of the entry it may write. Neither clock nor id
+   * mint is read again once the first statement has been issued, so the window the wallet lock
+   * covers is the database work alone.
+   */
+  private prepare(command: SubmitWagerTransactionCommand): PreparedSubmission {
+    const receivedAt = this.dependencies.clock.now();
+
+    return {
+      submission: this.record(command, receivedAt),
+      entryId: this.dependencies.ids.next(),
+      receivedAt,
+      correlationId: command.correlationId,
+    };
+  }
+
+  /** The financial body both entry points run, inside the transaction one of them opened. */
+  private async apply(
+    repositories: Repositories,
+    prepared: PreparedSubmission,
+  ): Promise<SubmissionOutcome> {
+    const { submission, entryId, receivedAt, correlationId } = prepared;
+    const reservation = await repositories.transactions.reserve(submission);
+
+    if (!reservation.reserved) {
+      const decision = classifyReservationConflict(reservation.keyHolder, submission.payloadHash);
+
+      if (!decision.replay) {
+        throw idempotencyConflict(decision.code, submission);
+      }
+
+      return { transaction: decision.stored, idempotentReplay: true };
+    }
+
+    const wallet = await repositories.wallets.lockById(submission.walletId);
+
+    if (wallet === null) {
+      throw new WalletNotFoundError(submission.walletId);
+    }
+
+    await this.decide(repositories, {
+      submission,
+      wallet,
+      entryId,
+      occurredAt: receivedAt,
+      correlationId,
+    });
+
+    return { transaction: submission, idempotentReplay: false };
   }
 
   /**

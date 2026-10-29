@@ -105,6 +105,28 @@ export class ServiceUnavailableError extends ApplicationError {
 }
 
 /**
+ * `msg.inbox-payload-conflict`: the `messageId` was used before for a message with other content.
+ * Raised inside the delivery's transaction, so the rollback is what leaves the first delivery's
+ * effects untouched, and the consumer classifies it as permanent (ADR 0010).
+ *
+ * It is the one refusal of a use case that carries no `ErrorCode`, because it has no caller to
+ * answer: `ErrorCode` enumerates what a provider receives from an HTTP request
+ * (`failure.request-errors`), and a message id is not part of any request. Giving it a code would
+ * add one to that enumeration that no status table could ever map.
+ */
+export class InboxPayloadConflictError extends Error {
+  constructor(
+    readonly consumerName: string,
+    readonly messageId: string,
+  ) {
+    super(
+      `Message ${messageId} of consumer ${consumerName} was first delivered with different content.`,
+    );
+    this.name = 'InboxPayloadConflictError';
+  }
+}
+
+/**
  * The conflict a lost reservation is, as the error that carries it (IDEM-012). The domain decides
  * which of the two codes a taken key means (`classifyReservationConflict`); this is the one place
  * each code becomes the refusal a caller receives, so neither entry point can answer one of them

@@ -1,6 +1,7 @@
 import { Body, Controller, Post, Res } from '@nestjs/common';
 
 import { SubmitWagerTransaction } from '../../application/use-cases/submit-wager-transaction';
+import { submittedOperationOf } from '../transport/wager-operation.dto';
 import { CorrelationId } from './correlation-id';
 import { ZodValidationPipe } from './request-validation';
 import {
@@ -8,7 +9,6 @@ import {
   type SubmitWagerTransactionRequest,
   statusOfOutcome,
   submitWagerTransactionRequestSchema,
-  submittedOperationOf,
   transactionOutcomeResponse,
 } from './wager-transaction.dto';
 

@@ -28,6 +28,20 @@ const serviceSchema = z.object({
   OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(50),
   OUTBOX_PUBLISH_TIMEOUT_MS: z.coerce.number().int().min(1).default(5000),
   OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(1).default(1000),
+  /**
+   * Long polling: how long one receive waits for a message before answering empty. The SQS
+   * maximum, 20 seconds, is the default because an idle consumer should cost one request every
+   * twenty seconds rather than a spin; a suite that drives `poll` itself sets it low so an empty
+   * queue answers at once.
+   */
+  SQS_WAIT_TIME_SECONDS: z.coerce.number().int().min(0).max(20).default(20),
+  /**
+   * How long a received message stays invisible to other consumers, which is the time this one has
+   * to commit it (`msg.ack-after-commit`). It bounds how long a redelivery takes after a consumer
+   * died mid-message, so it is a deployment setting: long enough to cover a financial transaction,
+   * short enough that a crash does not park the message.
+   */
+  SQS_VISIBILITY_TIMEOUT_SECONDS: z.coerce.number().int().min(0).max(43200).default(30),
 });
 
 const migrationSchema = z.object({

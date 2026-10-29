@@ -81,6 +81,20 @@ describe('rehydrate-trusts-stored-state', () => {
   });
 });
 
+/**
+ * `msg.inbox-payload-conflict`: a message id that arrives again either carries what it carried the
+ * first time, and is a redelivery, or it does not, and the delivery is refused (ADR 0010).
+ */
+describe('delivery-identity-compares-content', () => {
+  test('the same content under one identity is a redelivery', () => {
+    expect(received().matchesPayload(PAYLOAD_HASH)).toBe(true);
+  });
+
+  test('another hash under one identity is not the same delivery', () => {
+    expect(received().matchesPayload(`sha256:${'f'.repeat(64)}`)).toBe(false);
+  });
+});
+
 describe('inbox-completion-is-explicit', () => {
   test('a completed row exposes its completion, so a redelivery can be absorbed', () => {
     const message = received();
@@ -115,6 +129,11 @@ describe('inbox-completion-is-explicit', () => {
 
     expect(assignProcessedAt).toThrow(TypeError);
     expect(message.processedAt).toBeNull();
-    expect(surface.toSorted()).toEqual(['isProcessed', 'markProcessed', 'processedAt']);
+    expect(surface.toSorted()).toEqual([
+      'isProcessed',
+      'markProcessed',
+      'matchesPayload',
+      'processedAt',
+    ]);
   });
 });

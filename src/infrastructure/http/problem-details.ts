@@ -32,7 +32,13 @@ interface ProblemType {
   readonly title: string;
 }
 
-const PROBLEM_TYPES: Record<ErrorCode, ProblemType> = {
+/**
+ * It is exported for one reader: the contract suite that compares the enumerations and the status
+ * mapping with the tables of the system contract (API-012). Being a `Record` over `ErrorCode` makes
+ * it exhaustive by the type, so what that suite reads is every code the service has and nothing
+ * else.
+ */
+export const PROBLEM_TYPES: Record<ErrorCode, ProblemType> = {
   VALIDATION_FAILED: { status: 400, title: 'Validation failed' },
   IDEMPOTENCY_KEY_REQUIRED: { status: 400, title: 'Idempotency key required' },
   INVALID_CURSOR: { status: 400, title: 'Invalid cursor' },

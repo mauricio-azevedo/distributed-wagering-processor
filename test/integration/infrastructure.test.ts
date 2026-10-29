@@ -95,6 +95,54 @@ describe('readiness-tracks-dependencies', () => {
   });
 });
 
+/**
+ * `api.health-open` and `auth.open-endpoints`: the operator's three endpoints answer a caller that
+ * presents nothing, and readiness is the one of them that speaks for the dependencies (API-009,
+ * AUTH-002). The guard exemption these routes carry is proven against an identifying implementation
+ * in `authentication.test.ts`; what this suite holds is the surface itself.
+ */
+describe('health-endpoints', () => {
+  const get = async (app: INestApplication, path: string) => {
+    const response = await fetch(`${await app.getUrl()}${path}`);
+
+    return { status: response.status, contentType: response.headers.get('content-type') ?? '' };
+  };
+
+  test('liveness, readiness and metrics answer 200 with no credentials', async () => {
+    const app = await start();
+
+    try {
+      expect(await get(app, '/health/live')).toMatchObject({ status: 200 });
+      expect(await get(app, '/health/ready')).toMatchObject({ status: 200 });
+
+      const metrics = await get(app, '/metrics');
+
+      expect(metrics.status).toBe(200);
+      expect(metrics.contentType).toStartWith('text/plain');
+    } finally {
+      await app.close();
+    }
+  });
+
+  test('a dependency that is gone takes readiness down and leaves liveness and metrics up', async () => {
+    const unreachable = await start({ SQS_ENDPOINT: 'http://127.0.0.1:1' });
+
+    try {
+      expect(await probe(unreachable, 'ready')).toMatchObject({
+        status: 503,
+        body: { status: 'error', details: { sqs: { status: 'down' } } },
+      });
+      // Liveness is about the process and metrics are about this instance, so neither follows a
+      // dependency: an instance that cannot reach SQS is still the instance an operator debugs
+      // (`obs.health-split`).
+      expect(await get(unreachable, '/health/live')).toMatchObject({ status: 200 });
+      expect(await get(unreachable, '/metrics')).toMatchObject({ status: 200 });
+    } finally {
+      await unreachable.close();
+    }
+  });
+});
+
 describe('queues-bootstrapped', () => {
   const sqs = new SQSClient({
     region: env.AWS_REGION,

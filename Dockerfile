@@ -10,6 +10,9 @@ COPY --from=dependencies /app/node_modules ./node_modules
 # tsconfig.json stays: Bun reads the decorator settings from it at run time.
 COPY package.json tsconfig.json ./
 COPY src ./src
+# api.contract-document: the image carries the HTTP contract it serves at /docs-json, so the
+# document a caller fetches from a deployment is the document that deployment was built from.
+COPY docs/openapi.yaml ./docs/openapi.yaml
 USER bun
 EXPOSE 3000
 CMD ["bun", "run", "src/main.ts"]

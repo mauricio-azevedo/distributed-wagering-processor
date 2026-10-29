@@ -27,9 +27,10 @@ type ProblemResponse = ServerResponse & {
  * framework could not parse.
  *
  * Nothing else is caught. An error this filter does not recognise is not a refusal of the request
- * but a defect or an unavailable dependency, and answering it as a problem would claim a status
- * class the contract reserves for something else; it reaches the framework's own handler instead,
- * until the transient classification of API-006 gives it `503 SERVICE_UNAVAILABLE`.
+ * but a defect, and answering it as a problem would claim a status class the contract reserves for
+ * something else; it reaches the framework's own handler as a `500` instead. An unavailable
+ * dependency is not in that set: the unit of work classifies it as `ServiceUnavailableError`, which
+ * arrives here as the `503` of `api.transient-failure` like any other refusal a use case raises.
  */
 @Catch(ApplicationError, RequestValidationError, BadRequestException)
 export class ProblemDetailsFilter implements ExceptionFilter {

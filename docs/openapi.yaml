@@ -33,8 +33,9 @@ info:
       with a letter or digit. The provider id `system` is reserved for the internal `OPENING`
       transaction and is refused on submission (`tx.opening-internal`).
     - **Strict input, tolerant output.** A body or parameter that violates this document is
-      `400 VALIDATION_FAILED`; unknown members are violations. Response bodies may gain members in
-      later versions; clients ignore members they do not know.
+      `400 VALIDATION_FAILED`; unknown members are violations. The one exception is
+      `X-Correlation-Id`, below. Response bodies may gain members in later versions; clients ignore
+      members they do not know.
     - **Errors.** Request-level errors (`400`, `404`, `409`, `503`) are RFC 9457 problem details with
       a stable `code` and persist nothing (`api.problem-details`, `api.validation-stateless`). A
       business rejection is `422` with a persisted transaction outcome carrying a `failureCode`; a
@@ -42,7 +43,9 @@ info:
       code tables, each with the action expected from the caller, are in the system contract
       (sections 9.1 and 9.2).
     - **Correlation.** `X-Correlation-Id` may be sent on any request and is present on every
-      response; when absent it is generated (`api.correlation-header`).
+      response; when absent, or malformed, it is generated — the one parameter a violation of this
+      document does not refuse, because it names the request for an operator and decides nothing
+      about the operation (`api.correlation-header`).
     - **Idempotency.** `POST /wagering/transactions` requires `Idempotency-Key`. The same key with
       the same payload replays the stored outcome; the same key with another payload is `409`.
     - **Authentication** is deferred (`auth.deferred`): no request carries credentials in this
@@ -879,7 +882,8 @@ components:
       description: >-
         Caller-chosen correlation id, propagated to every log line and every event produced while
         handling the request (`api.correlation-header`, `obs.correlation-propagation`). Generated
-        when absent; always echoed in the response header of the same name.
+        when absent or malformed, rather than refused; the id that was used is always in the
+        response header of the same name.
       schema:
         $ref: '#/components/schemas/CorrelationId'
     IdempotencyKey:

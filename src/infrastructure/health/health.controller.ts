@@ -1,9 +1,16 @@
 import { Controller, Get } from '@nestjs/common';
 import { HealthCheck, HealthCheckService } from '@nestjs/terminus';
 
+import { OpenEndpoint } from '../http/open-endpoint';
 import { PostgresHealthIndicator } from './postgres.health';
 import { SqsHealthIndicator } from './sqs.health';
 
+/**
+ * The two probes of `obs.health-split`. They answer an orchestrator, which presents no credentials
+ * and must not be made to: both stay open whatever the authentication setting
+ * (`api.health-open`, `auth.open-endpoints`).
+ */
+@OpenEndpoint()
 @Controller('health')
 export class HealthController {
   constructor(

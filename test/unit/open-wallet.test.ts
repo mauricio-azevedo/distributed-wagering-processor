@@ -43,6 +43,9 @@ function fakeUnitOfWork(options: { readonly rejectWallet?: Error } = {}): {
 } {
   const committed = empty();
   const unitOfWork: UnitOfWork = {
+    snapshot() {
+      throw new Error('opening a wallet writes, so it must not run in a read-only snapshot');
+    },
     async transactional(work) {
       const staged = empty();
       const result = await work(repositoriesOver(staged, options));
@@ -92,6 +95,7 @@ function repositoriesOver(staged: Committed, options: { rejectWallet?: Error }):
         return Promise.resolve();
       },
       findByTransactionId: unreachable('ledger lookup'),
+      summarize: unreachable('ledger summary'),
     },
     inbox: {
       insert: unreachable('inbox'),

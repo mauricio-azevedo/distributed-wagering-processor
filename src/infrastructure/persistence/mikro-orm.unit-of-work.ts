@@ -1,4 +1,4 @@
-import type { EntityManager } from '@mikro-orm/postgresql';
+import { type EntityManager, IsolationLevel } from '@mikro-orm/postgresql';
 
 import type { Repositories, UnitOfWork } from '../../application/ports/unit-of-work';
 import { MikroOrmInboxRepository } from './repositories/inbox.repository';
@@ -26,6 +26,22 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
     return this.em
       .fork({ clear: true })
       .transactional((transactional) => work(repositoriesOf(transactional)));
+  }
+
+  /**
+   * `START TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`, which is `recon.snapshot` spelt
+   * in SQL: PostgreSQL fixes the snapshot at the first statement and serves every later one from
+   * it, and refuses any write with SQLSTATE `25006` instead of trusting the caller not to try.
+   * Neither property is weakened by a second instance reconciling the same wallet, because both
+   * belong to the transaction and not to the process.
+   */
+  snapshot<T>(work: (repositories: Repositories) => Promise<T>): Promise<T> {
+    return this.em
+      .fork({ clear: true })
+      .transactional((transactional) => work(repositoriesOf(transactional)), {
+        isolationLevel: IsolationLevel.REPEATABLE_READ,
+        readOnly: true,
+      });
   }
 }
 

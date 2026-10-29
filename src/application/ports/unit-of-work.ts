@@ -32,4 +32,20 @@ export interface UnitOfWork {
    * caller unchanged.
    */
   transactional<T>(work: (repositories: Repositories) => Promise<T>): Promise<T>;
+
+  /**
+   * Runs `work` in one `REPEATABLE READ`, read-only transaction, taking no lock (`recon.snapshot`).
+   *
+   * It is a boundary of its own rather than an option on `transactional` because it guarantees the
+   * opposite things: every statement inside it sees one committed state of the database, however
+   * many tables it reads and however much is committed meanwhile, and none of them may write. That
+   * is what lets reconciliation compare a wallet row with its ledger and conclude something about
+   * the pair — under `READ COMMITTED` the two readings could straddle a balance change and invent a
+   * divergence — and what makes `recon.divergence-handling`'s "never corrects a balance" a property
+   * of the transaction instead of a promise about the code inside it.
+   *
+   * An operation that reads a single row needs neither: `transactional` is the boundary for a
+   * financial operation, which writes and therefore locks.
+   */
+  snapshot<T>(work: (repositories: Repositories) => Promise<T>): Promise<T>;
 }

@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 
 import { AppModule } from '../../src/app.module';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
+import { CounterRegistry } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
@@ -32,6 +33,17 @@ const RFC_3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 /** `wallet.read-shape`: the members a wallet is returned as, and no others. */
 const WALLET_MEMBERS = ['balance', 'createdAt', 'id', 'playerId', 'updatedAt', 'version'];
+
+/** `recon.report-shape`: the members a reconciliation is returned as, and no others. */
+const REPORT_MEMBERS = [
+  'calculatedBalance',
+  'checkedAt',
+  'checkedEntries',
+  'consistent',
+  'difference',
+  'storedBalance',
+  'walletId',
+];
 
 const touched = new TouchedWallets();
 
@@ -77,6 +89,13 @@ interface Body {
   readonly version?: number;
   readonly createdAt?: string;
   readonly updatedAt?: string;
+  readonly walletId?: string;
+  readonly storedBalance?: { readonly amount: string; readonly currency: string };
+  readonly calculatedBalance?: { readonly amount: string; readonly currency: string };
+  readonly difference?: { readonly amount: string; readonly currency: string };
+  readonly consistent?: boolean;
+  readonly checkedEntries?: number;
+  readonly checkedAt?: string;
   readonly type?: string;
   readonly title?: string;
   readonly status?: number;
@@ -144,6 +163,24 @@ async function openWallet(
   }
 
   return answer;
+}
+
+/**
+ * A stored balance that disagrees with its ledger, which only the owner of the tables can write:
+ * SCHEMA-023 means no write the service issues leaves one behind. The commit-time mirror is disabled
+ * for the single statement and re-enabled whatever happens, so the next test faces the real schema,
+ * and the wallet leaves the RECON-004 sweep because the invariant it asserts is the one this breaks.
+ */
+async function divergeStoredBalance(walletId: string, balance: string): Promise<void> {
+  touched.forget(walletId);
+  const owner = schema.em.getConnection();
+
+  await owner.execute(`alter table "wallets" disable trigger "wallets_mirror_ledger_head"`);
+  try {
+    await owner.execute(`update "wallets" set "balance" = ? where "id" = ?`, [balance, walletId]);
+  } finally {
+    await owner.execute(`alter table "wallets" enable trigger "wallets_mirror_ledger_head"`);
+  }
 }
 
 describe('wallet-create-endpoint', () => {
@@ -270,6 +307,72 @@ describe('wallet-read-endpoint', () => {
 
   test('an id that is not a UUID answers 400 naming the path parameter', async () => {
     const answer = await request('GET', '/wallets/not-a-uuid');
+
+    expect(answer.status).toBe(400);
+    expect(answer.body).toMatchObject({
+      code: 'VALIDATION_FAILED',
+      errors: [{ path: '/path/walletId', message: 'must be a lowercase UUID' }],
+    });
+  });
+});
+
+describe('reconciliation-endpoint', () => {
+  test('a consistent wallet answers 200 with the report', async () => {
+    const created = await openWallet(brl('500.00'));
+
+    const answer = await request('POST', `/wallets/${String(created.body.id)}/reconciliation`, {
+      correlationId: CORRELATION_ID,
+    });
+
+    expect(answer.status).toBe(200);
+    expect(answer.contentType).toStartWith('application/json');
+    expect(answer.correlationId).toBe(CORRELATION_ID);
+    expect(Object.keys(answer.body).sort()).toEqual(REPORT_MEMBERS);
+    expect(answer.body).toMatchObject({
+      walletId: created.body.id,
+      storedBalance: brl('500.00'),
+      calculatedBalance: brl('500.00'),
+      difference: brl('0.00'),
+      consistent: true,
+      checkedEntries: 1,
+    });
+    expect(answer.body.checkedAt).toMatch(RFC_3339);
+  });
+
+  test('a diverged wallet answers 200 with consistent false, the signed difference and one divergence counted', async () => {
+    const created = await openWallet(brl('500.00'));
+    const walletId = String(created.body.id);
+    const counters = app.get(CounterRegistry);
+    const counted = counters.total('wager_reconciliation_divergence_total');
+    await divergeStoredBalance(walletId, '460.00');
+
+    const answer = await request('POST', `/wallets/${walletId}/reconciliation`);
+
+    expect(answer.status).toBe(200);
+    expect(answer.body).toMatchObject({
+      storedBalance: brl('460.00'),
+      calculatedBalance: brl('500.00'),
+      difference: brl('-40.00'),
+      consistent: false,
+      checkedEntries: 1,
+    });
+    expect(counters.total('wager_reconciliation_divergence_total')).toBe(counted + 1);
+
+    // Reported, never repaired: the wallet is still as divergent as the report said it was.
+    const unchanged = await request('GET', `/wallets/${walletId}`);
+    expect(unchanged.body.balance).toEqual(brl('460.00'));
+  });
+
+  test('an unknown wallet answers 404 WALLET_NOT_FOUND', async () => {
+    const answer = await request('POST', `/wallets/${UNKNOWN_WALLET_ID}/reconciliation`);
+
+    expect(answer.status).toBe(404);
+    expect(answer.contentType).toStartWith('application/problem+json');
+    expect(answer.body).toMatchObject({ code: 'WALLET_NOT_FOUND', status: 404 });
+  });
+
+  test('an id that is not a UUID answers 400 naming the path parameter', async () => {
+    const answer = await request('POST', '/wallets/not-a-uuid/reconciliation');
 
     expect(answer.status).toBe(400);
     expect(answer.body).toMatchObject({

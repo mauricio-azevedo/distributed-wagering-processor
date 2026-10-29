@@ -32,6 +32,16 @@ export class TouchedWallets {
     return walletId;
   }
 
+  /**
+   * Drops a wallet from the sweep. The one legitimate caller is a fixture that corrupts a wallet on
+   * purpose, to prove that reconciliation reports the divergence (RECON-003, RECON-005): the
+   * invariant the sweep asserts is exactly the one such a case breaks, so leaving the wallet in
+   * would fail the test that demonstrates the breakage is seen.
+   */
+  forget(walletId: string): void {
+    this.ids.delete(walletId);
+  }
+
   /** Reconciles every wallet the suite touched and forgets them, so a later sweep is independent. */
   async expectReconciled(orm: MikroORM): Promise<void> {
     const walletIds = [...this.ids];

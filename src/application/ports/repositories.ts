@@ -9,6 +9,7 @@
  * the order the use case wrote them, which is what fixes the lock order of ADR 0002.
  */
 import type { InboxMessage } from '../../domain/inbox-message';
+import type { Money } from '../../domain/money';
 import type { OutboxMessage } from '../../domain/outbox-message';
 import type { WagerTransaction } from '../../domain/wager-transaction';
 import type { Wallet } from '../../domain/wallet';
@@ -61,6 +62,26 @@ export interface WagerTransactionRepository {
   findById(transactionId: string): Promise<WagerTransaction | null>;
 }
 
+/** Which wallet's ledger to account for, and the version whose entry the head is (`atVersion`). */
+export interface LedgerSummaryQuery {
+  readonly walletId: string;
+  /** The wallet's currency: the ledger of a wallet is in it alone (`ledger.currency-matches-wallet`). */
+  readonly currency: string;
+  readonly atVersion: number;
+}
+
+/**
+ * What the ledger says a wallet holds, independently of the wallet row (`recon.calculation`): the
+ * sum of credits minus debits, how many entries it was taken over, and the balance the entry at
+ * `atVersion` left behind — `null` when no entry carries that version, which is itself a divergence
+ * for a wallet that has a ledger.
+ */
+export interface LedgerSummary {
+  readonly calculatedBalance: Money;
+  readonly checkedEntries: number;
+  readonly headBalance: Money | null;
+}
+
 export interface LedgerRepository {
   /** Appends one entry; the ledger is never updated or deleted (`ledger.immutable`). */
   insert(entry: WalletLedgerEntry): Promise<void>;
@@ -70,6 +91,18 @@ export interface LedgerRepository {
    * when the transaction moved no money (`ledger.no-entry-without-effect`).
    */
   findByTransactionId(transactionId: string): Promise<WalletLedgerEntry | null>;
+
+  /**
+   * The ledger's own account of a wallet, which is what reconciliation compares the stored balance
+   * with (`recon.calculation`).
+   *
+   * The sum is the database's, over `NUMERIC(20,2)`, so it is exact however long the ledger is and
+   * nothing materializes it (ADR 0001); the adapter rebuilds the result with the domain parser,
+   * which is what refuses a stored `NaN` instead of letting it compare equal to itself
+   * (`money.finite-in-database`, RECON-005). It takes no lock, so the ledger of a wallet can be
+   * accounted for while that wallet is being written (`recon.snapshot`).
+   */
+  summarize(query: LedgerSummaryQuery): Promise<LedgerSummary>;
 }
 
 /** `msg.inbox-identity`: the body message id, scoped to the consumer that received it. */

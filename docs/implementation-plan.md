@@ -32,7 +32,7 @@ Exit evidence: unit suites green without any I/O; a round-trip test per entity a
 
 Scope: constraints, indexes, triggers and the per-table privileges of ADR 0003, on the two roles the stack bootstraps; reversible migrations; `OpenWallet` use case with the opening credit; `GET /wallets/{walletId}`; `ReconcileWallet` and its endpoint; problem details for request errors.
 
-Acceptance: SCHEMA-001 through SCHEMA-019, SCHEMA-021 through SCHEMA-026, OPS-002, OPS-004, WALLET-001, WALLET-002, WALLET-003, WALLET-005, WALLET-008, WALLET-009, WALLET-010, LEDGER-001, LEDGER-002, LEDGER-006, LEDGER-009, MONEY-007, API-002, API-007, API-008, RECON-002, RECON-003, RECON-004.
+Acceptance: SCHEMA-001 through SCHEMA-019, SCHEMA-021 through SCHEMA-026, OPS-002, OPS-004, WALLET-001, WALLET-002, WALLET-003, WALLET-005, WALLET-008, WALLET-009, WALLET-010, LEDGER-001, LEDGER-002, LEDGER-006, LEDGER-009, MONEY-007, API-002, API-007, API-008, RECON-002, RECON-003, RECON-004, RECON-005.
 
 Exit evidence: one direct-SQL violation test per schema guarantee, executed as the runtime role; migrations applied up, down and up again on a clean database.
 

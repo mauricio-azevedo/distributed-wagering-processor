@@ -6,9 +6,20 @@ Every balance change has an immutable ledger entry. Duplicate messages, concurre
 
 Built with Bun, TypeScript, NestJS, MikroORM, PostgreSQL, and SQS.
 
+## Contents
+
+- [Run it](#run-it)
+- [How it works](#how-it-works)
+- [The operations](#the-operations)
+- [Why retries and races are safe](#why-retries-and-races-are-safe)
+- [Connect a provider](#connect-a-provider)
+- [Check a wallet](#check-a-wallet)
+- [Everyday commands](#everyday-commands)
+- [Scope and design](#scope-and-design)
+
 ## Run it
 
-You need **Bun 1.4.4**, **Docker with Compose v2**, **Make**, and **Bash**.
+You need **Bun** at the version pinned in [.bun-version](.bun-version), **Docker with Compose v2**, **Make**, and **Bash**.
 
 From the repository root:
 
@@ -18,11 +29,25 @@ make demo
 
 This installs dependencies, creates a missing `.env`, runs migrations, and starts one API instance and two workers, backed by PostgreSQL and LocalStack. No AWS account or AWS CLI is needed.
 
-The walkthrough places bets, retries them, handles reversals, and checks the ledger. It also kills and restarts both workers during processing, then checks that each bet was applied once.
+The [walkthrough](demo/walkthrough.ts) places bets, retries them, handles reversals, and checks the ledger. It also kills and restarts both workers during processing, then checks that each bet was applied once.
 
 The stack stays running afterward. Open the [API reference](http://localhost:3000/docs) to explore it.
 
 If port `3000` is occupied, `make` selects another port. `make stack` shows the `HTTP_PORT` to use instead.
+
+## How it works
+
+```mermaid
+flowchart TD
+    HTTP["HTTP API"] --> Core["Shared financial use case"]
+    Queue["SQS requests"] --> Worker["Queue worker"]
+    Worker --> Core
+    Core -->|One commit| DB[("PostgreSQL")]
+    DB -->|Committed outbox rows| Publisher["Publisher worker"]
+    Publisher --> Events["SQS integration events"]
+```
+
+Financial changes and outgoing events are saved together. Queue messages are acknowledged only after commit.
 
 ## The operations
 
@@ -36,30 +61,22 @@ If port `3000` is occupied, `make` selects another port. `make stack` shows the 
 
 There is one wallet per player and currency. A positive starting balance creates an internal `OPENING` credit with a ledger entry.
 
-References use the provider's transaction ID and must match the provider, player, wallet, currency, and round. Reversals cover the full amount. Each transaction can be reversed once, by either refund or rollback. A rollback cannot itself be reversed.
+References use the provider's transaction ID and must match the provider, player, wallet, currency, and round. Reversals cover the full amount. Each transaction can be [reversed once](test/integration/reversals-references.test.ts#L701), by either refund or rollback. A rollback cannot itself be reversed.
 
 Rejections leave the balance and ledger unchanged, including when a reversal would make the balance negative.
 
 ## Why retries and races are safe
 
-- **Exact money.** Amounts are strings such as `"25.00"`. The domain uses `bigint` minor units; PostgreSQL uses `NUMERIC(20,2)`. Inputs require two decimal places. Nothing is rounded.
-- **A lock per wallet.** Operations on the same wallet take turns in PostgreSQL. Different wallets proceed independently. Version checks guard balance updates too.
-- **One commit.** An operation commits all its changes together: the outcome, balance movement, ledger entry, events, and queue inbox record where applicable. Database constraints and triggers also enforce balance and ledger consistency.
-- **Persistent idempotency.** The same provider key and business payload return the stored outcome, including the balance originally observed for a terminal transaction. Changing the payload under that key returns `409`.
-
-Two simultaneous bets of **80.00 BRL** against **100.00 BRL** therefore produce one debit, one rejection, and a final balance of **20.00 BRL**.
-
-### A reference arrives late
-
-The dependent operation waits as `PENDING_REFERENCE`, without moving money. HTTP returns `202` and a `Location` URL to check progress.
-
-Workers retry with exponential backoff, capped at five minutes. After a one-hour window, the next attempt rejects any still-unresolved reference with `REFERENCE_NOT_FOUND`.
-
-### A worker stops
-
-Messages are acknowledged only after commit. The persistent inbox absorbs redelivery if a worker dies before acknowledgment.
-
-Committed events wait in the outbox. Multiple publishers claim separate rows, and another worker can take over after a crash. Consumers deduplicate events by `eventId` and use `walletVersion` to order balance changes: publication is at least once, with no global ordering across publishers.
+| Guarantee | How it works | Proof |
+| --- | --- | --- |
+| Exact money | Amounts are strings such as `"25.00"`, with exactly two decimal places. The domain uses `bigint` minor units; PostgreSQL uses `NUMERIC(20,2)`. Nothing is rounded. | [Exact arithmetic](test/unit/money.test.ts#L75) |
+| Concurrent bets | PostgreSQL serializes balance changes and checks the wallet version. Two simultaneous bets of **80.00 BRL** against **100.00 BRL** produce one debit, one rejection, and a final balance of **20.00 BRL**. | [Competing bets](test/concurrency/wallet-contention.test.ts#L500) |
+| Independent wallets | Locks belong to individual wallets. Holding one wallet does not stop another from committing. | [Independent wallets](test/concurrency/wallet-contention.test.ts#L884) |
+| One commit | Outcomes, balance movements, ledger entries, events, and queue inbox records commit together. PostgreSQL also enforces ledger immutability and balance consistency. | [Atomic writes](test/integration/bet-atomicity.test.ts#L265); [immutable ledger](test/integration/schema.test.ts#L738); [ledger consistency](test/integration/wallet-ledger-chain.test.ts#L306) |
+| Persistent idempotency | The same provider key and business payload return the stored outcome. Terminal replays keep the original observed balance. Changing the payload under that key returns `409`. | [Replay after restart](test/integration/bet-submission.test.ts#L995); [50 copies, one debit](test/concurrency/wallet-contention.test.ts#L564) |
+| Late references | An operation waits as `PENDING_REFERENCE`, without moving money. HTTP returns `202` and a `Location` URL to check progress. Workers retry with exponential backoff, capped at five minutes. After a one-hour window, the next attempt rejects any still-unresolved reference with `REFERENCE_NOT_FOUND`. | [Rollback before bet](test/integration/pending-reference.test.ts#L464) |
+| Worker recovery | Messages are acknowledged only after commit. If a worker dies before acknowledgment, the persistent inbox absorbs redelivery. | [Crash before acknowledgment](test/integration/queue-submission.test.ts#L753) |
+| Event recovery | Committed events wait in the outbox. Publishers claim separate rows, and crashes release their claims. Delivery is at least once, with no global ordering. Consumers deduplicate by `eventId` and order balance changes by `walletVersion`. | [Concurrent publishers](test/concurrency/outbox-publishers.test.ts#L228); [claim recovery](test/concurrency/outbox-publishers.test.ts#L265); [worker and publisher crash recovery](test/concurrency/crash-recovery.test.ts#L419) |
 
 ## Connect a provider
 
@@ -81,7 +98,7 @@ curl -sS "http://localhost:3000/wallets/$WALLET_ID"
 curl -sS -X POST "http://localhost:3000/wallets/$WALLET_ID/reconciliation"
 ```
 
-Look for `consistent: true` and a difference of `0.00`. Reconciliation reports, logs, and counts divergences; it never changes the balance.
+Look for `consistent: true` and a difference of `0.00`. Reconciliation [reports, logs, and counts divergences without changing the balance](test/integration/wallet-reconciliation.test.ts#L528).
 
 Operational endpoints are `/health/live`, `/health/ready`, and `/metrics`. Logs are JSON; HTTP responses carry `X-Correlation-Id`.
 
@@ -114,4 +131,5 @@ For more detail:
 - [Business rules](docs/system-contract.md) — detailed behavior and failure codes.
 - [Decisions](docs/decisions) — the reasoning behind the design.
 - [Walkthrough](docs/demonstrations.md) — each demonstration explained.
+- [Test map](docs/acceptance.yaml) — the full mapping from rules to test scenarios.
 - [Contributing](CONTRIBUTING.md) — development conventions.

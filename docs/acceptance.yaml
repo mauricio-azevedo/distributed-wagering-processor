@@ -96,14 +96,16 @@ entries:
     contract: model.framework-free-domain
     enforcement:
       - Dependency rule checked by a test over the import graph of src/domain.
+      - Persistence maps row classes of the infrastructure layer, so no mapping reaches into the domain (ADR 0008).
     scenario:
       - Collect every import under src/domain.
     expected:
-      - None resolves to @nestjs, @mikro-orm, @aws-sdk or node:http.
+      - No import names a package at all, so none resolves to @nestjs, @mikro-orm, @aws-sdk or node:http.
+      - No relative import leaves src/domain, so the layer reaches no other layer either.
     evidence: { testId: domain-import-graph-is-clean, layer: unit }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MODEL-006
     priority: required
@@ -263,15 +265,17 @@ entries:
     requirement: Amounts persist exactly through the ORM mapping.
     contract: money.exact-persistence
     enforcement:
-      - Custom MoneyType maps NUMERIC(20,2) text to Money and back.
+      - MoneyType keeps the NUMERIC(20,2) column exact as a decimal string in both directions and refuses a value that is not a string.
+      - The mapping pairs it with the currency column of the row and rebuilds Money with the domain parser (ADR 0008).
     scenario:
       - Persist a wallet with balance "999999999999999999.99", the bound, and read it back in a new unit of work.
+      - Do the same with "0.00", "0.01", "1.50", "40.00", "100000000000.10" and with a wallet in another currency.
     expected:
-      - The balance equals the original to the cent and the column holds 999999999999999999.99.
+      - Every balance equals the original to the cent, trailing zeros included, and the column holds 999999999999999999.99.
     evidence: { testId: money-round-trips-through-postgres, layer: integration }
     deliverySlice: domain-money-transitions
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MONEY-011
     priority: required
@@ -1729,15 +1733,15 @@ entries:
     requirement: Money columns are NUMERIC(20,2) and round-trip exactly through the mapping.
     contract: money.exact-persistence
     enforcement:
-      - Column types in the migration; MoneyType mapping test.
+      - Column types in the migration, with MoneyType as the single declaration of numeric(20,2) in the mapping.
     scenario:
       - Inspect information_schema for every money column; persist and read 0.01 and 999999999999999999.99; store 1000000000000000000.00 by SQL.
     expected:
-      - All columns are numeric(20,2); both values read back unchanged; the oversized value fails with numeric field overflow.
+      - The numeric columns of the schema are exactly the money columns, all numeric(20,2); both values read back unchanged; the oversized value fails with numeric field overflow.
     evidence: { testId: schema-money-columns, layer: schema }
-    deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    deliverySlice: domain-money-transitions
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-021
     priority: required
@@ -2679,14 +2683,14 @@ entries:
     requirement: Migrations are versioned and reversible.
     contract: ops.migrations-reversible
     enforcement:
-      - MikroORM migrations with up and down.
+      - MikroORM migrations with up and down. The first one, creating the tables, is in place; the ones carrying the constraints, triggers and privileges arrive with them, and the test covers every migration at once.
     scenario:
       - On a clean database run up, down, up.
     expected:
       - Each step succeeds; the schema after the second up equals the schema after the first.
     evidence: { testId: migrations-up-down-up, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: OPS-003

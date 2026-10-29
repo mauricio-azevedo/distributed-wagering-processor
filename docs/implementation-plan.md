@@ -22,17 +22,17 @@ Exit evidence: `make up` answers `200` on `/health/ready` with both entries up; 
 
 ## 2. domain-money-transitions — Domain model and persistence mapping
 
-Scope: `Money` over `bigint` minor units; `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage` with private constructors, factories and `rehydrate`; the status machine; `IntegrationEvent` and its four subclasses; MikroORM `EntitySchema` mappings and the `MoneyType`; the first migration creating the tables.
+Scope: `Money` over `bigint` minor units; `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage` with private constructors, factories and `rehydrate`; the status machine; `IntegrationEvent` and its four subclasses; the row mappings of ADR 0008 with the `MoneyType`; the persistence ports and their MikroORM adapters, reachable only through a `UnitOfWork` that forks an entity manager per operation; the first migration creating the tables.
 
-Acceptance: MODEL-001, MODEL-002, MODEL-003, MODEL-004, MODEL-005, MONEY-001, MONEY-002, MONEY-003, MONEY-004, MONEY-005, MONEY-008, MONEY-009, MONEY-010, MONEY-012, WALLET-011, WALLET-012, TX-003, TX-005, TX-006, TX-008, LEDGER-003, LEDGER-004, OUTBOX-010.
+Acceptance: MODEL-001, MODEL-002, MODEL-003, MODEL-004, MODEL-005, MONEY-001, MONEY-002, MONEY-003, MONEY-004, MONEY-005, MONEY-008, MONEY-009, MONEY-010, MONEY-012, WALLET-011, WALLET-012, TX-003, TX-005, TX-006, TX-008, LEDGER-003, LEDGER-004, SCHEMA-020, OUTBOX-010.
 
-Exit evidence: unit suites green without any I/O; a mapping round-trip test against PostgreSQL proves exact money persistence.
+Exit evidence: unit suites green without any I/O; a round-trip test per entity against PostgreSQL proves exact money persistence and rehydration into the state the factories produced.
 
 ## 3. schema-wallet-opening — Schema enforcement, wallet opening, reconciliation
 
 Scope: constraints, indexes, triggers and the per-table privileges of ADR 0003, on the two roles the stack bootstraps; reversible migrations; `OpenWallet` use case with the opening credit; `GET /wallets/{walletId}`; `ReconcileWallet` and its endpoint; problem details for request errors.
 
-Acceptance: SCHEMA-001 through SCHEMA-025, OPS-002, OPS-004, WALLET-001, WALLET-002, WALLET-003, WALLET-005, WALLET-008, WALLET-009, WALLET-010, LEDGER-001, LEDGER-002, LEDGER-006, LEDGER-009, MONEY-007, API-002, API-007, API-008, RECON-002, RECON-003, RECON-004.
+Acceptance: SCHEMA-001 through SCHEMA-019, SCHEMA-021 through SCHEMA-026, OPS-002, OPS-004, WALLET-001, WALLET-002, WALLET-003, WALLET-005, WALLET-008, WALLET-009, WALLET-010, LEDGER-001, LEDGER-002, LEDGER-006, LEDGER-009, MONEY-007, API-002, API-007, API-008, RECON-002, RECON-003, RECON-004.
 
 Exit evidence: one direct-SQL violation test per schema guarantee, executed as the runtime role; migrations applied up, down and up again on a clean database.
 

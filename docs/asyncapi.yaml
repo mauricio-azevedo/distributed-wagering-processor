@@ -216,7 +216,9 @@ operations:
       (`msg.permanent-to-dlq`). `MessageGroupId` and `MessageDeduplicationId` are copied from the
       received message, so a redelivery after a crash between the forward and the delete
       dead-letters the same body again; the broker deduplicates it within its window and operators
-      recognise it by `messageId` otherwise.
+      recognise it by `messageId` otherwise. Because the send precedes the delete, a send this
+      queue refuses deletes nothing: the message stays in the input queue and the redrive policy
+      dead-letters it after its five receives.
     messages:
       - $ref: '#/channels/wagerTransactionsDeadLetter/messages/wagerTransactionRequested'
   publishIntegrationEvents:

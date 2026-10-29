@@ -30,6 +30,7 @@ import { WageringController } from './infrastructure/http/wagering.controller';
 import { WalletsController } from './infrastructure/http/wallets.controller';
 import { uuidV7IdGenerator } from './infrastructure/id-generator';
 import {
+  WAGER_TRANSACTIONS_DLQ,
   WAGER_TRANSACTIONS_QUEUE,
   queueUrlResolver,
   sqsClientProvider,
@@ -146,12 +147,17 @@ export class AppModule implements NestModule {
             new WagerTransactionsConsumer({
               sqs,
               queueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_QUEUE),
+              deadLetterQueueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_DLQ),
               submit,
               metrics,
               logger: nestLogger(WAGER_TRANSACTIONS_CONSUMER),
               consumerName: WAGER_TRANSACTIONS_CONSUMER,
               waitTimeSeconds: env.SQS_WAIT_TIME_SECONDS,
               visibilityTimeoutSeconds: env.SQS_VISIBILITY_TIMEOUT_SECONDS,
+              retryBackoff: {
+                baseSeconds: env.SQS_RETRY_BACKOFF_BASE_SECONDS,
+                maxSeconds: env.SQS_RETRY_BACKOFF_MAX_SECONDS,
+              },
             }),
           inject: [SQSClient, SubmitWagerTransaction, CounterRegistry],
         },

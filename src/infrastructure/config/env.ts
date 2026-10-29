@@ -42,6 +42,19 @@ const serviceSchema = z.object({
    * short enough that a crash does not park the message.
    */
   SQS_VISIBILITY_TIMEOUT_SECONDS: z.coerce.number().int().min(0).max(43200).default(30),
+  /**
+   * `msg.transient-backoff`: the schedule a transiently failed message comes back on, as the first
+   * delay and the ceiling the doubling stops at. They are a deployment's trade between how soon a
+   * retry happens and how much load a dependency that is still down takes, and neither changes what
+   * is guaranteed: the queue's redrive policy, not this backoff, is what ends the sequence.
+   *
+   * Five minutes is the ceiling the outbox publisher already retries under (ADR 0005), so an
+   * operator reads one number for how late the service can be about work it is holding. The two are
+   * validated independently and the backoff clamps the base to the ceiling, so a deployment that
+   * sets a base above it gets the ceiling rather than a refusal to start.
+   */
+  SQS_RETRY_BACKOFF_BASE_SECONDS: z.coerce.number().int().min(0).max(43200).default(2),
+  SQS_RETRY_BACKOFF_MAX_SECONDS: z.coerce.number().int().min(0).max(43200).default(300),
 });
 
 const migrationSchema = z.object({

@@ -2102,8 +2102,8 @@ entries:
       - Each lands in the dead-letter queue immediately; nothing persisted.
     evidence: { testId: message-contract-validated, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-003
     priority: required
@@ -2147,8 +2147,8 @@ entries:
       - The second goes to the dead-letter queue; the first transaction is untouched; the inbox-conflict metric increments.
     evidence: { testId: inbox-payload-conflict, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-006
     priority: required
@@ -2170,45 +2170,45 @@ entries:
     requirement: Outcomes are classified as business, transient or permanent before acting.
     contract: msg.classification
     enforcement:
-      - OutcomeClassifier mapping use case results and errors to ack, retry or dead-letter.
+      - WagerTransactionsConsumer classifies every delivery before it acts, and the class alone decides whether the message is deleted, returned or forwarded; an error no rule classifies is transient.
     scenario:
-      - Drive a rejected bet, a database outage and a malformed message through the consumer.
+      - Drive a rejected bet, a database outage and a malformed message through the consumer as one batch.
     expected:
-      - Acknowledged, retried, dead-lettered respectively.
+      - Acknowledged, returned with a backoff, dead-lettered respectively; the rejection is persisted, the outage persists nothing, and neither changes what happens to the others.
     evidence: { testId: consumer-outcome-classification, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-008
     priority: required
     requirement: Transient failures back off through visibility and exhaust into the dead-letter queue.
     contract: msg.transient-backoff
     enforcement:
-      - ChangeMessageVisibility with exponential backoff; redrive maxReceiveCount 5.
+      - ChangeMessageVisibility with the base doubled per receive and capped by SQS_RETRY_BACKOFF_MAX_SECONDS; redrive maxReceiveCount 5 ends the sequence, so the consumer counts nothing; wager_retries_total arrives with OBS-003.
     scenario:
-      - Keep PostgreSQL down for the whole retry sequence of one message.
+      - Keep the database unreachable for one message's whole retry sequence, and poll past the receives the redrive policy allows.
     expected:
-      - Receive count grows with increasing visibility timeouts; the message reaches the dead-letter queue after five receives; wager_retries_total increments.
+      - The visibility asked for grows with the receive count and stops at the ceiling; the sixth receive finds the message in the dead-letter queue instead of in the input queue; nothing was persisted and nothing was acknowledged.
     evidence: { testId: transient-backoff-then-dlq, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-009
     priority: required
     requirement: Permanent failures go straight to the dead-letter queue, including unknown wallets.
     contract: [msg.permanent-to-dlq, msg.unknown-wallet-permanent]
     enforcement:
-      - Consumer sends to the dead-letter queue, then deletes from the input queue.
+      - Consumer sends the body unchanged to the dead-letter queue, then deletes from the input queue; a forward the broker refuses deletes nothing and leaves the message to the redrive policy; wager_dlq_messages_total arrives with OBS-003.
     scenario:
-      - Send a message for a wallet that does not exist.
+      - Send a message for a wallet that does not exist, and send one again with the forward aimed at a queue that does not exist.
     expected:
-      - The message is in the dead-letter queue after one receive; wager_dlq_messages_total increments.
+      - The message is in the dead-letter queue after one receive and gone from the input queue, with nothing persisted; the refused forward leaves it in the input queue and the dead-letter queue empty.
     evidence: { testId: permanent-failure-to-dlq, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-010
     priority: required
@@ -2230,15 +2230,15 @@ entries:
     requirement: Correctness does not depend on FIFO ordering or broker deduplication.
     contract: msg.broker-features-optional
     enforcement:
-      - Invariants enforced by the database; the suite also runs against a standard queue.
+      - Invariants enforced by the database: the inbox row absorbs a duplicate and an unresolvable reference is parked, neither depending on the order of delivery.
     scenario:
-      - Run the consumer suite against a non-FIFO queue with duplicates and reordering injected.
+      - Deliver a reversal before the operation it reverses, then the same operation twice with deduplication ids the broker has not seen, so it filters neither.
     expected:
-      - Same final state as with the FIFO queue; every wallet consistent.
+      - The reversal is parked and acknowledged, the operation is applied once, the duplicate is absorbed, and the wallet reconciles against its ledger.
     evidence: { testId: correct-without-fifo, layer: integration }
     deliverySlice: sqs-inbox-dlq
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: MSG-012
     priority: required

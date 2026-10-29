@@ -13,7 +13,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { AppModule } from '../../src/app.module';
 import { InboxPayloadConflictError } from '../../src/application/errors';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
-import { WAGER_TRANSACTIONS_QUEUE } from '../../src/infrastructure/messaging/sqs';
+import {
+  WAGER_TRANSACTIONS_DLQ,
+  WAGER_TRANSACTIONS_QUEUE,
+} from '../../src/infrastructure/messaging/sqs';
 import { MessageContractError } from '../../src/infrastructure/messaging/wager-transaction-message.dto';
 import {
   type DeliveryReport,
@@ -57,7 +60,7 @@ const TABLES = [
 
 const touched = new TouchedWallets();
 
-/** Whether the test that just ran left a message the consumer did not acknowledge. */
+/** Whether the test that just ran left a message in the input queue, invisible for its window. */
 let messagesLeftInFlight = false;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -70,6 +73,7 @@ let consumer: WagerTransactionsConsumer;
 let metrics: CounterRegistry;
 let sqs: SQSClient;
 let queueUrl: string;
+let deadLetterQueueUrl: string;
 
 beforeAll(async () => {
   schema = await MikroORM.init(ormConfig(migrationEnv.MIGRATION_DATABASE_URL));
@@ -87,17 +91,13 @@ beforeAll(async () => {
     region: env.AWS_REGION,
     ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
   });
-  const resolved = await sqs.send(new GetQueueUrlCommand({ QueueName: WAGER_TRANSACTIONS_QUEUE }));
-
-  if (resolved.QueueUrl === undefined) {
-    throw new Error(`the stack has no queue ${WAGER_TRANSACTIONS_QUEUE}`);
-  }
-
-  queueUrl = resolved.QueueUrl;
+  queueUrl = await urlOf(WAGER_TRANSACTIONS_QUEUE);
+  deadLetterQueueUrl = await urlOf(WAGER_TRANSACTIONS_DLQ);
 });
 
 afterAll(async () => {
   await drainQueue({ inFlight: messagesLeftInFlight });
+  await drainDeadLetterQueue();
   await app.close();
   await runtime.close(true);
   await schema.close(true);
@@ -112,6 +112,9 @@ beforeEach(async () => {
   // expires, so the next test waits that out before draining: it is the cost of the behaviour under
   // test, and the alternative — leaving it — would hand another test a message of its own.
   await drainQueue({ inFlight: messagesLeftInFlight });
+  // A permanent failure is forwarded before it is deleted (`msg.permanent-to-dlq`), so a test that
+  // drove one left a body in the dead-letter queue for the next one to find.
+  await drainDeadLetterQueue();
   messagesLeftInFlight = false;
 }, 20_000);
 
@@ -120,6 +123,43 @@ beforeEach(async () => {
 afterEach(async () => {
   await touched.expectReconciled(runtime);
 });
+
+async function urlOf(queueName: string): Promise<string> {
+  const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
+
+  if (QueueUrl === undefined) {
+    throw new Error(`the stack has no queue ${queueName}`);
+  }
+
+  return QueueUrl;
+}
+
+/** The dead-letter queue holds nothing invisible, so one empty receive is the whole drain. */
+async function drainDeadLetterQueue(): Promise<void> {
+  for (;;) {
+    const { Messages } = await sqs.send(
+      new ReceiveMessageCommand({
+        QueueUrl: deadLetterQueueUrl,
+        MaxNumberOfMessages: 10,
+        WaitTimeSeconds: 1,
+        VisibilityTimeout: CONSUMER_ENV.SQS_VISIBILITY_TIMEOUT_SECONDS,
+      }),
+    );
+
+    if (Messages === undefined || Messages.length === 0) {
+      return;
+    }
+
+    for (const message of Messages) {
+      await sqs.send(
+        new DeleteMessageCommand({
+          QueueUrl: deadLetterQueueUrl,
+          ReceiptHandle: message.ReceiptHandle,
+        }),
+      );
+    }
+  }
+}
 
 /**
  * Receives and deletes whatever is in the queue, so one test never sees another's message. A
@@ -290,7 +330,9 @@ function reportOf(reports: readonly DeliveryReport[]): DeliveryReport {
     throw new Error(`expected one message to be processed, got ${reports.length.toString()}`);
   }
 
-  messagesLeftInFlight = messagesLeftInFlight || !report.acknowledged;
+  // Both an acknowledgement and a forward end with the delete, so only the other two dispositions
+  // leave the input queue holding something the next test has to wait out.
+  messagesLeftInFlight ||= report.disposition === 'returned' || report.disposition === 'retained';
 
   return report;
 }
@@ -356,22 +398,44 @@ const eventsOf = (transactionId: string) =>
  * asserted against. It long polls, so an empty answer is not a short poll that looked away, and it
  * returns the visibility it took, so asking does not hide a message from the next question.
  */
-const queueContents = async (): Promise<string[]> => {
+const queueContents = () => contentsOf(queueUrl);
+
+/**
+ * The same of the dead-letter queue, which is where a permanently failed message is asserted
+ * against: the forward is the consumer's own and precedes the delete (`msg.permanent-to-dlq`), so a
+ * test reads both queues to see the message moved rather than lost.
+ */
+const deadLetterContents = () => contentsOf(deadLetterQueueUrl);
+
+const contentsOf = async (url: string): Promise<string[]> => {
   const { Messages } = await sqs.send(
     new ReceiveMessageCommand({
-      QueueUrl: queueUrl,
+      QueueUrl: url,
       MaxNumberOfMessages: 10,
       WaitTimeSeconds: 1,
       VisibilityTimeout: 0,
     }),
   );
 
-  return (Messages ?? []).map((message) => {
-    const body = JSON.parse(message.Body ?? '{}') as { messageId?: string };
-
-    return body.messageId ?? 'unparsable';
-  });
+  return (Messages ?? []).map(({ Body }) => messageIdOf(Body));
 };
+
+/**
+ * How a queued body is named in an assertion: by its message id, and by the body itself when there
+ * is none to read. A dead letter is forwarded unchanged, so the queue holds bodies that never
+ * parsed — validation failure being one of the permanent classes.
+ */
+function messageIdOf(body: string | undefined): string {
+  if (body === undefined) {
+    return 'unparsable';
+  }
+
+  try {
+    return (JSON.parse(body) as { messageId?: string }).messageId ?? body;
+  } catch {
+    return body;
+  }
+}
 
 describe('consumer-uses-same-use-case', () => {
   test('a submitted message produces the effects the HTTP path produces for the same payload', async () => {
@@ -387,7 +451,7 @@ describe('consumer-uses-same-use-case', () => {
 
     expect(await submitOverHttp(submittedOverHttp, 'provider-acme:acme-tx-000124')).toBe(200);
 
-    expect(report).toMatchObject({ classification: 'business', acknowledged: true });
+    expect(report).toMatchObject({ classification: 'business', disposition: 'acknowledged' });
     expect(report.classification === 'business' && report.outcome.absorbed).toBe(false);
 
     const [queued] = await transactionsOf(overQueue);
@@ -425,7 +489,7 @@ describe('consumer-uses-same-use-case', () => {
     await send(betMessage(walletId), walletId);
     const report = await pollOne();
 
-    expect(report).toMatchObject({ classification: 'business', acknowledged: true });
+    expect(report).toMatchObject({ classification: 'business', disposition: 'acknowledged' });
     expect(await transactionsOf(walletId)).toMatchObject([
       { status: 'REJECTED', failure_code: 'INSUFFICIENT_BALANCE', observed_balance: '30.00' },
     ]);
@@ -439,9 +503,11 @@ describe('consumer-uses-same-use-case', () => {
 
     const report = await pollOne();
 
-    expect(report).toMatchObject({ classification: 'permanent', acknowledged: false });
+    expect(report).toMatchObject({ classification: 'permanent', disposition: 'dead-lettered' });
     expect(await transactionsOf(UNKNOWN_WALLET_ID)).toEqual([]);
     expect(await inboxRows()).toEqual([]);
+    expect(await deadLetterContents()).toEqual(['acme-msg-000123']);
+    expect(await queueContents()).toEqual([]);
   });
 });
 
@@ -464,13 +530,17 @@ describe('message-contract-validated', () => {
       const report = await pollOne();
 
       expect(report.classification).toBe('permanent');
-      expect(report.acknowledged).toBe(false);
+      expect(report.disposition).toBe('dead-lettered');
       expect(report.classification === 'business' ? null : report.error).toBeInstanceOf(
         MessageContractError,
       );
       expect(report.messageId).toBeNull();
       expect(await transactionsOf(walletId)).toEqual([]);
       expect(await inboxRows()).toEqual([]);
+      // The body an operator has to read is in the dead-letter queue, unchanged and therefore as
+      // invalid as it arrived: validation failure is one of the permanent classes.
+      expect(await deadLetterContents()).toHaveLength(1);
+      expect(await queueContents()).toEqual([]);
     });
   }
 
@@ -515,7 +585,7 @@ describe('inbox-keyed-by-body-message-id', () => {
 
     expect(firstReceipt).not.toBe(secondReceipt);
     expect(first.classification === 'business' && first.outcome.absorbed).toBe(false);
-    expect(second).toMatchObject({ classification: 'business', acknowledged: true });
+    expect(second).toMatchObject({ classification: 'business', disposition: 'acknowledged' });
     expect(second.classification === 'business' && second.outcome.absorbed).toBe(true);
     expect(second.messageId).toBe('acme-msg-000123');
 
@@ -579,7 +649,7 @@ describe('inbox-payload-conflict', () => {
     );
     const report = await pollOne();
 
-    expect(report).toMatchObject({ classification: 'permanent', acknowledged: false });
+    expect(report).toMatchObject({ classification: 'permanent', disposition: 'dead-lettered' });
     expect(report.classification === 'business' ? null : report.error).toBeInstanceOf(
       InboxPayloadConflictError,
     );
@@ -593,6 +663,10 @@ describe('inbox-payload-conflict', () => {
     expect(await entriesOf(walletId)).toHaveLength(1);
     expect(await balanceOf(walletId)).toEqual({ balance: '460.00', version: 2 });
     expect((await inboxRows()).map((row) => row.message_id)).toEqual(['acme-msg-000123']);
+
+    // The conflicting delivery is the one in the dead-letter queue; the first is acknowledged.
+    expect(await deadLetterContents()).toEqual(['acme-msg-000123']);
+    expect(await queueContents()).toEqual([]);
   });
 });
 
@@ -635,7 +709,7 @@ describe('idempotency-across-entry-points', () => {
     await send(betMessage(walletId), walletId);
     const report = await pollOne();
 
-    expect(report).toMatchObject({ classification: 'business', acknowledged: true });
+    expect(report).toMatchObject({ classification: 'business', disposition: 'acknowledged' });
     expect(
       report.classification === 'business' && !report.outcome.absorbed
         ? report.outcome.idempotentReplay
@@ -700,7 +774,7 @@ describe('killed-after-commit-before-ack', () => {
     // The dead process never deleted the message, so it comes back when its visibility expires.
     const redelivery = await pollUntilOne(10_000);
 
-    expect(redelivery).toMatchObject({ classification: 'business', acknowledged: true });
+    expect(redelivery).toMatchObject({ classification: 'business', disposition: 'acknowledged' });
     expect(redelivery.classification === 'business' && redelivery.outcome.absorbed).toBe(true);
     expect(metrics.total('wager_duplicates_detected_total', { source: 'inbox' })).toBe(
       duplicates + 1,

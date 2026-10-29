@@ -17,6 +17,8 @@ const DEFAULTS = {
   OUTBOX_POLL_INTERVAL_MS: 1000,
   SQS_WAIT_TIME_SECONDS: 20,
   SQS_VISIBILITY_TIMEOUT_SECONDS: 30,
+  SQS_RETRY_BACKOFF_BASE_SECONDS: 2,
+  SQS_RETRY_BACKOFF_MAX_SECONDS: 300,
 };
 
 describe('config-validation', () => {
@@ -65,6 +67,27 @@ describe('config-validation', () => {
     expect(() => loadEnv({ ...complete, OUTBOX_BATCH_SIZE: '0' })).toThrow(/OUTBOX_BATCH_SIZE/);
     expect(() => loadEnv({ ...complete, OUTBOX_POLL_INTERVAL_MS: 'often' })).toThrow(
       /OUTBOX_POLL_INTERVAL_MS/,
+    );
+  });
+
+  test('the consumer backoff is read from the environment, and refused by name', () => {
+    expect(
+      loadEnv({
+        ...complete,
+        SQS_RETRY_BACKOFF_BASE_SECONDS: '1',
+        SQS_RETRY_BACKOFF_MAX_SECONDS: '4',
+      }),
+    ).toEqual({
+      ...complete,
+      ...DEFAULTS,
+      SQS_RETRY_BACKOFF_BASE_SECONDS: 1,
+      SQS_RETRY_BACKOFF_MAX_SECONDS: 4,
+    });
+    expect(() => loadEnv({ ...complete, SQS_RETRY_BACKOFF_BASE_SECONDS: 'soon' })).toThrow(
+      /SQS_RETRY_BACKOFF_BASE_SECONDS/,
+    );
+    expect(() => loadEnv({ ...complete, SQS_RETRY_BACKOFF_MAX_SECONDS: '43201' })).toThrow(
+      /SQS_RETRY_BACKOFF_MAX_SECONDS/,
     );
   });
 

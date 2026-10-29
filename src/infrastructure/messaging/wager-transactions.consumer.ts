@@ -1,8 +1,11 @@
 import {
+  ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
   type Message,
+  type MessageSystemAttributeName,
   ReceiveMessageCommand,
   type SQSClient,
+  SendMessageCommand,
 } from '@aws-sdk/client-sqs';
 
 import {
@@ -22,6 +25,7 @@ import {
   deliveryOf,
   wagerTransactionRequestedOf,
 } from './wager-transaction-message.dto';
+import { type VisibilityBackoff, visibilityBackoffSeconds } from './visibility-backoff';
 
 /**
  * The queue entry point: `wager-transactions.fifo` into the same `SubmitWagerTransaction` the
@@ -30,17 +34,28 @@ import {
  * message has to look like, and the inbox row the use case writes is what makes a redelivery
  * harmless (ADR 0010).
  *
- * A message is deleted only after the transaction that recorded it committed
- * (`msg.ack-after-commit`), which is the whole acknowledgement protocol: `deliver` resolves when
- * the commit returned, and the delete is the next statement. A crash in between leaves the message
- * in the queue, and its redelivery is absorbed by the inbox (`msg.redelivery-safe`).
+ * Every delivery is classified before anything is done to the message (`msg.classification`), and
+ * the class alone decides the action:
  *
- * What this consumer does not do yet, and #17 adds: act on the two failure classes. A transient or
- * permanent failure is classified, counted and logged here, and the message is left in the queue,
- * so it becomes visible again after the visibility timeout and the queue's own redrive policy
- * dead-letters it after five receives. The visibility backoff of `msg.transient-backoff` and the
- * direct forward of `msg.permanent-to-dlq` are that issue's scope. Starting and stopping the loop
- * is `run` and `stop`; which process runs it, and how it drains on `SIGTERM`, is #19's.
+ * - business — the use case answered, whatever the answer was. The message is deleted, and only
+ *   after the transaction that recorded it committed (`msg.ack-after-commit`): `deliver` resolves
+ *   when the commit returned, and the delete is the next statement. A crash in between leaves the
+ *   message in the queue, and its redelivery is absorbed by the inbox (`msg.redelivery-safe`).
+ * - transient — a later delivery of the same body can still succeed, so the message is returned
+ *   with a visibility derived from the receive count (`msg.transient-backoff`) and the queue's own
+ *   redrive policy dead-letters it once the receives are exhausted.
+ * - permanent — no delivery of this body can succeed, so it is forwarded to the dead-letter queue
+ *   and then deleted, without waiting out five receives of a failure nobody can fix
+ *   (`msg.permanent-to-dlq`).
+ *
+ * None of it depends on the queue being FIFO or on the broker's deduplication window
+ * (`msg.broker-features-optional`): the order deliveries arrive in decides nothing here, and a
+ * duplicate the broker did not filter is absorbed by the inbox row rather than by this consumer.
+ *
+ * A broker call that fails leaves the message where it is instead of failing the batch, so one
+ * refused call cannot starve the messages behind it and nothing is ever deleted on the strength of
+ * a call that did not happen. Starting and stopping the loop is `run` and `stop`; which process
+ * runs it, and how it drains on `SIGTERM`, is #19's.
  */
 
 /** `msg.inbox-identity`: the consumer half of every inbox identity this consumer writes. */
@@ -54,29 +69,71 @@ export const WAGER_TRANSACTIONS_CONSUMER = 'wager-transactions-consumer';
 const MAX_MESSAGES_PER_RECEIVE = 10;
 
 /**
- * What one delivery amounted to (`msg.classification`). A business class is terminal for the
- * message and acknowledged; the two failure classes are not, and this slice leaves them to the
- * queue. The report carries what a test and a log line need and nothing else: the body message id
- * when the body parsed, because the broker's receipt id is never an identity.
+ * The delivery attributes this consumer reads. The receive count drives the transient backoff; the
+ * group and deduplication ids are copied onto a forwarded message, so a dead letter keeps the
+ * routing its producer gave it (`msg.permanent-to-dlq`). The broker's own message id is not asked
+ * for because it arrives with every message anyway, and is never an identity.
+ */
+const DELIVERY_ATTRIBUTES: readonly MessageSystemAttributeName[] = [
+  'ApproximateReceiveCount',
+  'MessageGroupId',
+  'MessageDeduplicationId',
+];
+
+/**
+ * A delivery the use case answered, whatever the answer was: the outcome is terminal for the
+ * message, so the body parsed and its message id is known.
+ */
+interface BusinessDelivery {
+  readonly classification: 'business';
+  readonly messageId: string;
+  readonly outcome: DeliveryOutcome;
+}
+
+/**
+ * A delivery that failed, as one of the two failure classes. The message id is what the body
+ * carried, and `null` when the body never parsed; the broker's receipt id is never an identity.
+ */
+interface FailedDelivery<Class extends 'transient' | 'permanent'> {
+  readonly classification: Class;
+  readonly messageId: string | null;
+  readonly error: unknown;
+}
+
+/** A delivery as its class, before anything has been done about it (`msg.classification`). */
+type ClassifiedDelivery =
+  BusinessDelivery | FailedDelivery<'transient'> | FailedDelivery<'permanent'>;
+
+/**
+ * What one delivery amounted to, with what was done about it. The report carries what a test and a
+ * log line need and nothing else, the class deciding which of the three shapes it is.
+ *
+ * The `disposition` names the state of the message in the input queue and nothing else, so a report
+ * never claims a broker call that was refused:
+ *
+ * - `acknowledged` — deleted, the committed outcome being terminal for the message.
+ * - `returned` — visibility set to the transient backoff, so it comes back on that schedule.
+ * - `dead-lettered` — forwarded to the dead-letter queue and then deleted.
+ * - `retained` — still in the input queue, because the broker refused the call that would have
+ *   moved it. The broker redelivers it, and nothing was lost: an acknowledgement that failed is a
+ *   redelivery the inbox absorbs, and a forward that failed is a message the redrive policy
+ *   dead-letters once its receives are exhausted.
  */
 export type DeliveryReport =
-  | {
-      readonly classification: 'business';
-      readonly messageId: string;
-      readonly outcome: DeliveryOutcome;
-      readonly acknowledged: true;
-    }
-  | {
-      readonly classification: 'transient' | 'permanent';
-      readonly messageId: string | null;
-      readonly error: unknown;
-      readonly acknowledged: false;
-    };
+  | (BusinessDelivery & { readonly disposition: 'acknowledged' | 'retained' })
+  | (FailedDelivery<'transient'> & {
+      /** The backoff asked of the broker, which `retained` means it did not accept. */
+      readonly visibilitySeconds: number;
+      readonly disposition: 'returned' | 'retained';
+    })
+  | (FailedDelivery<'permanent'> & { readonly disposition: 'dead-lettered' | 'retained' });
 
 export interface WagerTransactionsConsumerDependencies {
   readonly sqs: SQSClient;
   /** The input queue's URL; the name is contract, the URL is deployment (`msg.queues`). */
   readonly queueUrl: () => Promise<string>;
+  /** `wager-transactions-dlq.fifo`, resolved the same way and only when a message needs it. */
+  readonly deadLetterQueueUrl: () => Promise<string>;
   readonly submit: SubmitWagerTransaction;
   readonly metrics: Metrics;
   readonly logger: Logger;
@@ -85,6 +142,8 @@ export interface WagerTransactionsConsumerDependencies {
   readonly waitTimeSeconds: number;
   /** How long a received message stays invisible, which is how long processing it may take. */
   readonly visibilityTimeoutSeconds: number;
+  /** `msg.transient-backoff`: the schedule a returned message comes back on. */
+  readonly retryBackoff: VisibilityBackoff;
 }
 
 export class WagerTransactionsConsumer {
@@ -105,20 +164,14 @@ export class WagerTransactionsConsumer {
         MaxNumberOfMessages: MAX_MESSAGES_PER_RECEIVE,
         WaitTimeSeconds: this.dependencies.waitTimeSeconds,
         VisibilityTimeout: this.dependencies.visibilityTimeoutSeconds,
-        MessageSystemAttributeNames: ['ApproximateReceiveCount'],
+        MessageSystemAttributeNames: [...DELIVERY_ATTRIBUTES],
       }),
     );
 
     const reports: DeliveryReport[] = [];
 
     for (const message of received.Messages ?? []) {
-      const report = await this.deliver(message);
-
-      if (report.acknowledged) {
-        await this.acknowledge(queueUrl, message);
-      }
-
-      reports.push(report);
+      reports.push(await this.act(queueUrl, message, await this.deliver(message)));
     }
 
     return reports;
@@ -146,8 +199,8 @@ export class WagerTransactionsConsumer {
     return this.polling;
   }
 
-  /** One message: validated, delivered to the use case, and reported as what it amounted to. */
-  private async deliver(message: Message): Promise<DeliveryReport> {
+  /** One message: validated, delivered to the use case, and classified by what came back. */
+  private async deliver(message: Message): Promise<ClassifiedDelivery> {
     let messageId: string | null = null;
 
     try {
@@ -165,21 +218,134 @@ export class WagerTransactionsConsumer {
         });
       }
 
-      return { classification: 'business', messageId, outcome, acknowledged: true };
+      return { classification: 'business', messageId, outcome };
     } catch (error) {
       return this.failure(error, messageId, message);
     }
+  }
+
+  /** The action the class decides, and the report of what the broker made of it. */
+  private async act(
+    queueUrl: string,
+    message: Message,
+    delivery: ClassifiedDelivery,
+  ): Promise<DeliveryReport> {
+    if (delivery.classification === 'business') {
+      return { ...delivery, disposition: await this.acknowledge(queueUrl, message) };
+    }
+
+    if (delivery.classification === 'permanent') {
+      return { ...delivery, disposition: await this.deadLetter(queueUrl, message) };
+    }
+
+    const visibilitySeconds = visibilityBackoffSeconds(
+      receiveCountOf(message),
+      this.dependencies.retryBackoff,
+    );
+
+    return {
+      ...delivery,
+      visibilitySeconds,
+      disposition: await this.returnToQueue(queueUrl, message, visibilitySeconds),
+    };
   }
 
   /**
    * `msg.ack-after-commit`: the delete, issued once the transaction that recorded the message
    * committed. The receipt handle identifies the delivery to the broker and nothing else; the
    * identity that survives a redelivery is the body `messageId` the inbox row holds.
+   *
+   * A refused delete is the window the inbox exists for, so it is logged and not raised: the
+   * message is redelivered and absorbed, which is cheaper than failing the rest of the batch over
+   * an effect that is already committed.
    */
-  private async acknowledge(queueUrl: string, message: Message): Promise<void> {
-    await this.dependencies.sqs.send(
-      new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }),
-    );
+  private async acknowledge(
+    queueUrl: string,
+    message: Message,
+  ): Promise<'acknowledged' | 'retained'> {
+    try {
+      await this.dependencies.sqs.send(
+        new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }),
+      );
+
+      return 'acknowledged';
+    } catch (error) {
+      this.brokerRefused('wager.message.not-acknowledged', error, message);
+
+      return 'retained';
+    }
+  }
+
+  /**
+   * `msg.transient-backoff`: the message handed back with the delay its receive count earned. The
+   * redrive policy, not this call, is what ends the sequence — after five receives the broker moves
+   * the message to the dead-letter queue instead of delivering it again — so this consumer counts
+   * nothing and gives up on nothing.
+   *
+   * A refused visibility change leaves the message with the visibility its receive was granted,
+   * which is a shorter wait and not a lost message, so it is logged and the report says the backoff
+   * did not take.
+   */
+  private async returnToQueue(
+    queueUrl: string,
+    message: Message,
+    visibilitySeconds: number,
+  ): Promise<'returned' | 'retained'> {
+    try {
+      await this.dependencies.sqs.send(
+        new ChangeMessageVisibilityCommand({
+          QueueUrl: queueUrl,
+          ReceiptHandle: message.ReceiptHandle,
+          VisibilityTimeout: visibilitySeconds,
+        }),
+      );
+
+      return 'returned';
+    } catch (error) {
+      this.brokerRefused('wager.message.not-returned', error, message);
+
+      return 'retained';
+    }
+  }
+
+  /**
+   * `msg.permanent-to-dlq`: the forward, then the delete, in that order and never the other way
+   * round. A forward that failed therefore leaves the message in the input queue, where the redrive
+   * policy will dead-letter it after its receives: nothing is lost when the broker refuses the
+   * send, which is the one ordering this method exists to fix.
+   *
+   * The body is forwarded unchanged, so an operator reads the message as it arrived — a dead letter
+   * may well violate the message schema, validation failure being one of the permanent classes —
+   * and the group and deduplication ids are copied, so a redelivery after a crash between the
+   * forward and the delete dead-letters the same body and the broker deduplicates it.
+   */
+  private async deadLetter(
+    queueUrl: string,
+    message: Message,
+  ): Promise<'dead-lettered' | 'retained'> {
+    const deduplicationId = attributeOf(message, 'MessageDeduplicationId');
+
+    try {
+      await this.dependencies.sqs.send(
+        new SendMessageCommand({
+          QueueUrl: await this.dependencies.deadLetterQueueUrl(),
+          MessageBody: message.Body,
+          // A FIFO queue always carries a group; the consumer's own name stands in for one the
+          // broker did not report, because order in a queue nothing consumes decides nothing.
+          MessageGroupId: attributeOf(message, 'MessageGroupId') ?? this.dependencies.consumerName,
+          // Absent, the dead-letter queue deduplicates on the body it was handed.
+          ...(deduplicationId !== undefined && { MessageDeduplicationId: deduplicationId }),
+        }),
+      );
+    } catch (error) {
+      this.brokerRefused('wager.message.not-dead-lettered', error, message);
+
+      return 'retained';
+    }
+
+    return (await this.acknowledge(queueUrl, message)) === 'acknowledged'
+      ? 'dead-lettered'
+      : 'retained';
   }
 
   /**
@@ -188,7 +354,11 @@ export class WagerTransactionsConsumer {
    * for nothing else (`msg.inbox-identity`). The log carries the failure, never the body: a message
    * an operator has to read is the one in the dead-letter queue (`obs.no-sensitive-data`).
    */
-  private failure(error: unknown, messageId: string | null, message: Message): DeliveryReport {
+  private failure(
+    error: unknown,
+    messageId: string | null,
+    message: Message,
+  ): FailedDelivery<'transient'> | FailedDelivery<'permanent'> {
     const classification = classificationOf(error);
 
     if (error instanceof InboxPayloadConflictError) {
@@ -201,11 +371,22 @@ export class WagerTransactionsConsumer {
       classification,
       messageId,
       receiptId: message.MessageId ?? null,
-      failure: error instanceof Error ? error.name : 'unknown',
-      reason: error instanceof Error ? error.message : String(error),
+      ...describe(error),
     });
 
-    return { classification, messageId, error, acknowledged: false };
+    return { classification, messageId, error };
+  }
+
+  /**
+   * A broker call that did not happen, as the operational event it is: the message is still in the
+   * input queue and the broker will deliver it again, so this is a line for an operator watching a
+   * dependency and never a reason to stop the batch.
+   */
+  private brokerRefused(event: string, error: unknown, message: Message): void {
+    this.dependencies.logger.error(event, {
+      receiptId: message.MessageId ?? null,
+      ...describe(error),
+    });
   }
 }
 
@@ -217,9 +398,12 @@ export class WagerTransactionsConsumer {
  * database, a lock wait and a serialization failure (`api.transient-failure`), and it is matched
  * before `ApplicationError`, which it extends. Every other refusal a use case raises is a
  * provider's mistake — a validation failure, a reused message id, an unknown wallet, an
- * idempotency conflict — and delivering the same body again cannot change it. Anything else is
- * unclassified and treated as transient, so nothing becomes terminal because nobody classified it;
- * #17 is where that rule and the actions behind all three classes are completed.
+ * idempotency conflict — and delivering the same body again cannot change it.
+ *
+ * Anything else is unclassified and treated as transient, which is the rule that keeps a defect
+ * from becoming terminal: an error nobody classified is retried and, its receives exhausted, kept
+ * in the dead-letter queue by the broker, so it is never discarded and never acknowledged as if it
+ * had been applied (`ref.permanent-failure`).
  */
 function classificationOf(error: unknown): 'transient' | 'permanent' {
   if (error instanceof ServiceUnavailableError) {
@@ -232,4 +416,30 @@ function classificationOf(error: unknown): 'transient' | 'permanent' {
     error instanceof ApplicationError;
 
   return permanent ? 'permanent' : 'transient';
+}
+
+/** The two fields every failure is logged by: what it was and what it said. */
+function describe(error: unknown): { readonly failure: string; readonly reason: string } {
+  return {
+    failure: error instanceof Error ? error.name : 'unknown',
+    reason: error instanceof Error ? error.message : String(error),
+  };
+}
+
+/**
+ * How often the broker has delivered this message, counting this delivery. An attribute it did not
+ * report, or one this consumer cannot read as a count, leaves the backoff at its base.
+ */
+function receiveCountOf(message: Message): number {
+  return Number(message.Attributes?.ApproximateReceiveCount ?? Number.NaN);
+}
+
+/** One delivery attribute, with the empty string read as the absence it stands for. */
+function attributeOf(
+  message: Message,
+  name: 'MessageGroupId' | 'MessageDeduplicationId',
+): string | undefined {
+  const value = message.Attributes?.[name];
+
+  return value === undefined || value === '' ? undefined : value;
 }

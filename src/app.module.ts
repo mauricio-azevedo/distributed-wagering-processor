@@ -12,6 +12,7 @@ import { TerminusModule } from '@nestjs/terminus';
 import { sha256Hex } from './application/sha256';
 import { GetWallet } from './application/use-cases/get-wallet';
 import { OpenWallet } from './application/use-cases/open-wallet';
+import { ReconcileWallet } from './application/use-cases/reconcile-wallet';
 import { systemClock } from './infrastructure/clock';
 import type { Env } from './infrastructure/config/env';
 import { HealthController } from './infrastructure/health/health.controller';
@@ -22,6 +23,8 @@ import { ProblemDetailsFilter } from './infrastructure/http/problem-details.filt
 import { WalletsController } from './infrastructure/http/wallets.controller';
 import { uuidV7IdGenerator } from './infrastructure/id-generator';
 import { sqsClientProvider } from './infrastructure/messaging/sqs';
+import { nestLogger } from './infrastructure/observability/logger';
+import { CounterRegistry } from './infrastructure/observability/metrics';
 import { ormConfig } from './infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm.unit-of-work';
 
@@ -62,6 +65,18 @@ export class AppModule implements NestModule {
           provide: GetWallet,
           useFactory: (unitOfWork: MikroOrmUnitOfWork) => new GetWallet(unitOfWork),
           inject: [MikroOrmUnitOfWork],
+        },
+        CounterRegistry,
+        {
+          provide: ReconcileWallet,
+          useFactory: (unitOfWork: MikroOrmUnitOfWork, metrics: CounterRegistry) =>
+            new ReconcileWallet({
+              unitOfWork,
+              clock: systemClock,
+              logger: nestLogger('reconciliation'),
+              metrics,
+            }),
+          inject: [MikroOrmUnitOfWork, CounterRegistry],
         },
       ],
     };

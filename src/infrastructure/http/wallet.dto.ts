@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import type { ReconciliationReport } from '../../application/use-cases/reconcile-wallet';
 import { AMOUNT_PATTERN, CURRENCY_PATTERN, type MoneyProps } from '../../domain/money';
 import type { Wallet } from '../../domain/wallet';
 
@@ -62,5 +63,35 @@ export function walletResponse(wallet: Wallet): WalletResponse {
     version: wallet.version,
     createdAt: wallet.createdAt.toISOString(),
     updatedAt: wallet.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * `ReconciliationReport`: the comparison as `recon.report-shape` spells it. `difference` is the
+ * contract's `SignedMoneyProps`, the one member of the whole API whose amount may carry a sign
+ * (`money.signed-difference-only`); the money formatter never produces `-0.00`, so the pattern that
+ * excludes it needs nothing here to hold.
+ */
+export interface ReconciliationReportResponse {
+  readonly walletId: string;
+  readonly storedBalance: MoneyProps;
+  readonly calculatedBalance: MoneyProps;
+  readonly difference: MoneyProps;
+  readonly consistent: boolean;
+  readonly checkedEntries: number;
+  readonly checkedAt: string;
+}
+
+export function reconciliationReportResponse(
+  report: ReconciliationReport,
+): ReconciliationReportResponse {
+  return {
+    walletId: report.walletId,
+    storedBalance: report.storedBalance.toJSON(),
+    calculatedBalance: report.calculatedBalance.toJSON(),
+    difference: report.difference.toJSON(),
+    consistent: report.consistent,
+    checkedEntries: report.checkedEntries,
+    checkedAt: report.checkedAt.toISOString(),
   };
 }

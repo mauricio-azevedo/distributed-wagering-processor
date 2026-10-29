@@ -1988,8 +1988,8 @@ entries:
       - 200 with consistent true; 200 with consistent false; 404 WALLET_NOT_FOUND.
     evidence: { testId: reconciliation-endpoint, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-009
     priority: required
@@ -2542,14 +2542,15 @@ entries:
     requirement: Reconciliation is consistent under concurrent writes and never blocks them.
     contract: recon.snapshot
     enforcement:
-      - REPEATABLE READ transaction without FOR UPDATE.
+      - UnitOfWork.snapshot runs the report in one START TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY, with no FOR UPDATE anywhere in it, so both readings come from one snapshot and no write is even possible inside it.
+      - Implemented with ReconcileWallet and verified deterministically by reconciliation-snapshot-is-consistent, which commits a competing balance change between the two readings of one report: the report carries the state before that commit and the writer is never blocked. What is not yet run is this entry's own scenario, reconciliation under real parallel load, which belongs to the concurrency suite.
     scenario:
       - Reconcile a wallet continuously while three processes bet on it.
     expected:
       - Every report is consistent; bet latency is unaffected by the reconciliation loop.
     evidence: { testId: reconciliation-under-load, layer: concurrency }
     deliverySlice: concurrent-debits
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: RECON-002
@@ -2557,15 +2558,16 @@ entries:
     requirement: The report compares the stored balance with the ledger sum and the latest entry.
     contract: [recon.calculation, recon.report-shape]
     enforcement:
-      - SUM over credits minus debits plus the entry at walletVersion = version.
+      - LedgerRepository.summarize answers one aggregate over the (wallet_id, wallet_version) index: SUM over credits minus debits, the number of entries it was taken over, and the balanceAfter of the entry at walletVersion = version. The sum is the database's, over NUMERIC(20,2), so it is exact however long the ledger is and nothing materializes it (ADR 0001).
+      - The head comparison is not a restatement of the sum: a wallet whose version has drifted off its ledger sums correctly and is still reported divergent.
     scenario:
       - Reconcile a wallet with two entries and one with none.
     expected:
       - checkedEntries 2 and 0; difference 0.00; consistent true; all fields present.
     evidence: { testId: reconciliation-calculation, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RECON-003
     priority: required
@@ -2579,8 +2581,8 @@ entries:
       - consistent false with the signed difference; one error log line; wager_reconciliation_divergence_total incremented; the stored balance unchanged.
     evidence: { testId: reconciliation-divergence, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: RECON-004
     priority: required
@@ -2590,6 +2592,7 @@ entries:
       - Shared helper (test/helpers/wallet-reconciliation.ts) that rebuilds a wallet's balance in SQL, as the sum of credits minus debits and as the balanceAfter of the entry at the wallet's version, and compares both with the stored balance. It recomputes the sum in SQL rather than reusing the service's arithmetic, so a defect there cannot agree with itself.
       - The suites truncate between tests, so the sweep runs in afterEach over the wallets that test touched, before its rows are removed.
       - Adopted by the suites that move money through a use case; each later slice adopts it with the suites it adds, which is why this entry is not yet green.
+      - TouchedWallets.forget drops a wallet from the sweep, for the fixtures of RECON-003 and RECON-005 alone: they corrupt a wallet on purpose to prove the report sees it, so the invariant the sweep asserts is the one such a case breaks.
     scenario:
       - Run the full suite.
     expected:
@@ -2604,14 +2607,15 @@ entries:
     contract: [recon.calculation, money.finite-in-database, money.exact-persistence]
     enforcement:
       - Stored amounts are rebuilt through the same parser that refuses NaN, so a corrupted row fails to rehydrate instead of comparing equal to itself. The equality of recon.calculation cannot carry this guarantee: in SQL a NaN stored balance equals a NaN derived sum.
+      - Both sides of the comparison pass through it: the wallet row through its mapper, and the ledger sum because it is returned as text and parsed back, NaN propagating through addition into the aggregate. ReconcileWallet turns any such refusal into the error record and the divergence count of recon.divergence-handling and re-raises it, so the run ends without a report rather than with a consistent one.
     scenario:
       - As the migrator role, drop the exclusion from the ledger amount and the wallet balance, store a NaN entry and a NaN stored balance for one wallet, restore both constraints NOT VALID, then reconcile that wallet.
     expected:
       - The wallet is never reported consistent; the failure is logged at error level with the walletId and the stored balance is left unchanged.
     evidence: { testId: reconciliation-rejects-non-finite-data, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- OBS
   - id: OBS-001

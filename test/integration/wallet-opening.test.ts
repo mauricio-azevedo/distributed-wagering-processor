@@ -115,6 +115,7 @@ async function rejection(promise: Promise<unknown>): Promise<unknown> {
  */
 function failingAfterTheTransactionInsert(over: UnitOfWork): UnitOfWork {
   return {
+    snapshot: (work) => over.snapshot(work),
     transactional: (work) =>
       over.transactional((repositories) =>
         work({

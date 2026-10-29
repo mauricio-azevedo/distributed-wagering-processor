@@ -118,7 +118,7 @@ Bun's `--shard`, balanced with a committed `test/integration.timings.json`) and 
 
 Acceptance: OPS-014.
 
-Exit evidence: before/after wall-clock time from the Actions API for an equivalent change, both
-numbers in the PR body; one test broken in each of the four kinds, confirming the gate fails and
+Exit evidence: measured on PR #68's own Actions run — 451s → 164s (-64%), longest job
+`integration (3)` at 154s; one test broken in each of the four kinds, confirming the gate fails and
 names the job; a PR merged through the four-job workflow with the ruleset still gating on `ci`
 alone.

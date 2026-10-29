@@ -101,10 +101,12 @@ file and not a branch protection setting.
 
 ### Confirmation
 
-Acceptance entry OPS-014 in [acceptance.yaml](../acceptance.yaml). Before/after wall-clock time
-from the Actions API for an equivalent change, both numbers in the PR body; one test deliberately
-broken in each of the four kinds, confirming the gate fails and names which job; a PR merged
-through the four-job workflow, confirming the `main` ruleset still gates on `ci` alone.
+Acceptance entry OPS-014 in [acceptance.yaml](../acceptance.yaml). Measured on PR #68's own
+[Actions run](https://github.com/mauricio-azevedo/distributed-wagering-processor/actions/runs/40947075523):
+451s → 164s, a 64% reduction against the PR #60 baseline, with the longest individual job
+(`integration (3)`) at 154s. One test deliberately broken in each of the four kinds, confirming the
+gate fails and names which job; a PR merged through the four-job workflow, confirming the `main`
+ruleset still gates on `ci` alone.
 
 ## Pros and Cons of the Options
 

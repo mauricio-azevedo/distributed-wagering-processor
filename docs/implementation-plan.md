@@ -70,16 +70,16 @@ Exit evidence: a worker killed after commit and before acknowledgement leads to 
 
 ## 8. outbox-publisher — Concurrent publication and recovery
 
-Scope: the outbox publisher of ADR 0005; two publishers on one outbox; crash between publish and commit; backoff on broker failure; lag and pending metrics; the integration events queue.
+Scope: the outbox publisher of ADR 0005; two publishers on one outbox; a publisher killed while holding a claim; a lost commit after a send; backoff on broker failure; the integration events queue with its group and deduplication ids; the consumer-facing ordering contract. The pending and lag metrics move to slice 9 with the rest of the observability surface, so this slice reports a stalled row through the log and OUTBOX-008 is green there.
 
-Acceptance: OUTBOX-003, OUTBOX-005, OUTBOX-006, OUTBOX-007, OUTBOX-008, OUTBOX-009, OUTBOX-012.
+Acceptance: OUTBOX-002, OUTBOX-003, OUTBOX-004, OUTBOX-005, OUTBOX-006, OUTBOX-007, OUTBOX-009, OUTBOX-012.
 
-Exit evidence: two publishers drain one outbox without losing a row; a publisher killed after sending and before committing leaves a row that is published again with the same `eventId` and applied once by a reference consumer.
+Exit evidence: two publishers drain one outbox without losing a row; a publisher killed while holding a claimed batch leaves its rows to the next instance; a publication whose commit is lost is published again with the same `eventId` and applied once by a reference consumer.
 
 ## 9. http-observability-shutdown — Remaining surface and operations
 
 Scope: consistent status classes across every endpoint; `docs/openapi.yaml` served at `/docs` and `/docs-json`; structured logs with redaction; metrics; the remaining configuration variables; graceful shutdown of every role; the authentication extension point; acceptance statuses updated with the evidence of every slice.
 
-Acceptance: API-001, API-009, API-011, API-012, MODEL-006, OBS-001, OBS-002, OBS-003, OBS-005, OPS-003, OPS-005, OPS-007, AUTH-001, AUTH-002. Optional extensions tracked but not scheduled: LEDGER-010, OPS-008, OPS-009.
+Acceptance: API-001, API-009, API-011, API-012, MODEL-006, OBS-001, OBS-002, OBS-003, OBS-005, OUTBOX-008, OPS-003, OPS-005, OPS-007, AUTH-001, AUTH-002. Optional extensions tracked but not scheduled: LEDGER-010, OPS-008, OPS-009.
 
 Exit evidence: `make check` green with every required entry `implemented` and `passing`; the acceptance plan is the release report.

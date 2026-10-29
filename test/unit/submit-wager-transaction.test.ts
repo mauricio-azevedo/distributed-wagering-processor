@@ -192,6 +192,8 @@ function repositoriesOver(staged: Committed, calls: string[], ports: Ports): Rep
         return Promise.resolve();
       },
       findByEventId: unreachable('outbox lookup'),
+      claimPending: unreachable('outbox claim'),
+      recordAttempt: unreachable('publication attempt'),
     },
   };
 }

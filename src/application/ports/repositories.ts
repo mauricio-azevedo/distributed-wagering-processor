@@ -179,10 +179,35 @@ export interface InboxRepository {
   findByIdentity(identity: InboxMessageIdentity): Promise<InboxMessage | null>;
 }
 
+/** How much of the outbox one publisher cycle takes on: the rows due at `dueAt`, at most `limit`. */
+export interface OutboxClaim {
+  readonly dueAt: Date;
+  readonly limit: number;
+}
+
 export interface OutboxRepository {
   /** Enqueues a committed fact, in the transaction that produced it (`outbox.single-transaction`). */
   insert(message: OutboxMessage): Promise<void>;
 
   /** The row of an event id, the identity every publication of it carries (`outbox.stable-event-id`). */
   findByEventId(eventId: string): Promise<OutboxMessage | null>;
+
+  /**
+   * Takes exclusive hold of the pending rows that are due, for the rest of the transaction
+   * (ADR 0005, `outbox.concurrent-publishers`): the claim is the lock, so two publishers never
+   * receive the same row and a publisher that dies releases its rows without a reaper
+   * (`outbox.crash-recovery`).
+   *
+   * Only committed rows can be claimed, which is `outbox.publish-after-commit` as a property of
+   * the database rather than a rule the publisher follows, and a row whose next attempt is still
+   * in the future is left alone (`outbox.retry-backoff`).
+   */
+  claimPending(claim: OutboxClaim): Promise<OutboxMessage[]>;
+
+  /**
+   * Writes what a publication attempt decided about a claimed row: its publication, or its new
+   * attempt count and schedule. Nothing else of the row is writable — the envelope, the event id
+   * and the aggregate are what every publication of it repeats (`outbox.duplicate-safe`).
+   */
+  recordAttempt(message: OutboxMessage): Promise<void>;
 }

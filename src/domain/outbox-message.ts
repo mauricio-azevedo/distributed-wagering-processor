@@ -20,6 +20,14 @@ export interface OutboxMessageState {
 /** `outbox.retry-backoff`: the cap of the exponential backoff, five minutes. */
 const MAX_BACKOFF_SECONDS = 300;
 
+/**
+ * `outbox.retry-backoff`: the failure count at which a row stops being an ordinary retry and
+ * becomes something an operator has to look at. It lives here, beside the backoff it shares a rule
+ * with, because the threshold is part of the contract and not a knob of whichever publisher
+ * happens to observe it.
+ */
+const ALERT_AFTER_ATTEMPTS = 10;
+
 const MILLISECONDS_PER_SECOND = 1000;
 
 /**
@@ -92,6 +100,19 @@ export class OutboxMessage implements OutboxMessageState {
 
   isPublished(): boolean {
     return this.sentAt !== null;
+  }
+
+  /**
+   * Whether this row has failed often enough that retrying is no longer the whole story
+   * (`outbox.retry-backoff`): ten attempts mean the broker has been refusing this event for at
+   * least seventeen minutes of backoff, which is an operational condition and not a hiccup.
+   *
+   * It is a question and not a state: nothing changes when a row crosses the threshold, the
+   * retries continue unchanged, and the row keeps answering `true` until it is published. The
+   * publisher is what turns the answer into an alert.
+   */
+  hasStalled(): boolean {
+    return this.failedAttempts >= ALERT_AFTER_ATTEMPTS;
   }
 
   /**

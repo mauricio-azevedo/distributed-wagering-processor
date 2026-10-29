@@ -113,6 +113,8 @@ function repositoriesOver(staged: Committed, options: { rejectWallet?: Error }):
         return Promise.resolve();
       },
       findByEventId: unreachable('outbox lookup'),
+      claimPending: unreachable('outbox claim'),
+      recordAttempt: unreachable('publication attempt'),
     },
   };
 }

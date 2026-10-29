@@ -80,9 +80,9 @@ servers:
     protocol: sqs
     description: >-
       LocalStack started by Docker Compose (`SQS_ENDPOINT`); the three FIFO queues are created at
-      startup with content-based deduplication and the redrive policy below. Region and
-      credentials are configuration; on AWS the host is the regional SQS endpoint and the pathname
-      the account id.
+      startup with content-based deduplication and the redrive policy below. The port is the one a
+      single checkout publishes; `make stack` prints the one in force. Region and credentials are
+      configuration; on AWS the host is the regional SQS endpoint and the pathname the account id.
 channels:
   wagerTransactions:
     address: wager-transactions.fifo

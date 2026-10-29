@@ -51,6 +51,7 @@ Use cases receive plain commands and return plain results; controllers and consu
 - Any number of instances per role. The concurrency suites run at least three processes against one database and one queue.
 - Two PostgreSQL roles: `wagering_migrator` owns the schema and runs migrations at deploy time; `wagering_app` is the runtime role with no DDL and no `UPDATE` or `DELETE` on the ledger.
 - Docker Compose brings PostgreSQL, LocalStack with the three queues, a migration step, one `api` and two `worker` instances.
+- One Compose stack per checkout: `docker/stack.sh` names and numbers it, the `Makefile` exports the project, the image and the published ports, and `.env` builds the service URLs from the same ports. A single clone publishes `3000`, `5433` and `4566`; every linked worktree gets a block of ten from `24000`, so two of them run the gate at the same time and `make down` in one leaves the other up.
 
 ## 6. Decisions
 

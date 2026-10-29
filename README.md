@@ -27,8 +27,9 @@ Docker is required: the dependencies run in Compose and the image is part of the
 bun install --frozen-lockfile   # install the toolchain
 cp .env.example .env            # addresses of the Compose dependencies, read by Bun and by Compose
 make                            # list the targets
+make stack                      # this checkout's Compose project, image and published ports
 make dev                        # start PostgreSQL and LocalStack, apply migrations, run the service with reload
-make up                         # the whole stack in containers: dependencies, migrations, the service on :3000
+make up                         # the whole stack in containers: dependencies, migrations, the service on HTTP_PORT
 make down                       # stop the stack and drop its data
 make migrate                    # apply pending migrations as the migrator role
 make test                       # the test suites, against the Compose dependencies
@@ -37,6 +38,8 @@ make fmt                        # rewrite files with Prettier
 ```
 
 `GET /health/live` answers while the process serves HTTP; `GET /health/ready` answers `200` only when PostgreSQL and SQS are reachable, with one entry per dependency.
+
+A single clone publishes the service on `3000`, PostgreSQL on `5433` and LocalStack on `4566`. Each `git worktree` of this repository gets its own Compose project, image and block of ports instead, so two checkouts run `make check` at the same time and `make down` in one leaves the other running. `make stack` prints what a checkout uses; `make` passes it to Compose, so a `docker compose` or `psql` command typed by hand needs `eval "$(make -s stack)"` first, or it addresses the wrong stack.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the gate, the pull request rules, CI, the board and the issue forms.
 
@@ -75,9 +78,9 @@ src/application/             ports the use cases depend on: the persistence repo
 src/infrastructure/          configuration, persistence (row mappings, repositories, unit of work, migrations), messaging (SQS), health
 test/                        unit and integration suites, run by bun test
 compose.yaml, Dockerfile     the stack and the image
-docker/                      PostgreSQL roles and LocalStack queues, applied once at container init
+docker/                      PostgreSQL roles and LocalStack queues, applied once at container init, and stack.sh, which names this checkout's stack
 .env.example                 the variables the service, the migration step and the suites read
-Makefile                     check, fmt, fmt-check, lint, typecheck, test, audit, build, dev, infra, migrate, up, down
+Makefile                     stack, check, fmt, fmt-check, lint, typecheck, test, audit, build, dev, infra, migrate, up, down
 .bun-version                 the Bun version CI installs
 .github/                     ci and pr-title workflows, issue forms, PR template
 package.json, bun.lock       toolchain dependencies

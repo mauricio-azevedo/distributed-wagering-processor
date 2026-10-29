@@ -60,10 +60,29 @@ interface Stack {
   readonly slot: number;
 }
 
-function stackOf(directory: string, env: Record<string, string> = BARE_ENV): Stack {
-  const [project = '', slot = ''] = run([STACK_SH], { cwd: directory, env }).split(' ');
+/** What `docker/stack.sh` answers for a checkout: its stack, and the three ports of its slot. */
+interface Chosen extends Stack {
+  readonly ports: Record<string, string>;
+}
 
-  return { project, slot: Number(slot) };
+function chosenStack(directory: string, env: Record<string, string> = BARE_ENV): Chosen {
+  const [project = '', slot = '', ...published] = run([STACK_SH], { cwd: directory, env }).split(
+    ' ',
+  );
+
+  return {
+    project,
+    slot: Number(slot),
+    ports: Object.fromEntries(
+      PORT_VARIABLES.map((variable, index) => [variable, published[index] ?? '']),
+    ),
+  };
+}
+
+function stackOf(directory: string, env: Record<string, string> = BARE_ENV): Stack {
+  const { project, slot } = chosenStack(directory, env);
+
+  return { project, slot };
 }
 
 /**
@@ -169,19 +188,34 @@ function ports(stack: Record<string, string>): Record<string, string> {
  * containers that checkout started. A single clone stays on the names and ports it always had.
  */
 describe('docker-stack-is-per-checkout', () => {
-  test('a repository with no linked worktree takes its own name and slot 0', () => {
+  test('a repository with no linked worktree takes its own name', () => {
     withRepository('wagering', [], ({ main }) => {
-      expect(stackOf(main)).toEqual({ project: 'wagering', slot: 0 });
+      expect(stackOf(main).project).toBe('wagering');
     });
   });
 
-  test('every linked worktree takes its own project name and its own slot', () => {
+  test('every linked worktree takes its own project name', () => {
     withRepository('wagering', ['first', 'second'], ({ main, linked }) => {
-      const [first = '', second = ''] = linked;
+      expect([main, ...linked].map((checkout) => stackOf(checkout).project)).toEqual([
+        'wagering',
+        'wagering-first',
+        'wagering-second',
+      ]);
+    });
+  });
 
-      expect(stackOf(main)).toEqual({ project: 'wagering', slot: 0 });
-      expect(stackOf(first)).toEqual({ project: 'wagering-first', slot: 1 });
-      expect(stackOf(second)).toEqual({ project: 'wagering-second', slot: 2 });
+  /**
+   * A checkout's slot is its position in `git worktree list` and nothing else: no search, so no
+   * dependence on what the host is publishing at the time. Two checkouts of one repository
+   * therefore cannot answer the same slot, whenever and wherever they are asked.
+   */
+  test('no two checkouts of one repository can land on the same slot', () => {
+    withRepository('wagering', ['first', 'second'], ({ main, linked }) => {
+      const checkouts = [main, ...linked];
+      const slots = checkouts.map((checkout) => stackOf(checkout).slot);
+
+      expect(slots).toEqual([0, 1, 2]);
+      expect(new Set(slots).size).toBe(checkouts.length);
     });
   });
 
@@ -194,17 +228,16 @@ describe('docker-stack-is-per-checkout', () => {
     });
   });
 
-  test('an exported tree with no repository falls back to its directory name and slot 0', () => {
+  test('an exported tree with no repository falls back to its directory name', () => {
     const base = mkdtempSync(path.join(tmpdir(), 'stack-isolation-'));
     const exported = path.join(base, 'wagering-export');
     mkdirSync(exported);
 
     try {
       // Reached through git, not through the filesystem: the fixture has no repository above it.
-      expect(stackOf(exported, { ...FIXTURE_GIT_ENV, GIT_CEILING_DIRECTORIES: base })).toEqual({
-        project: 'wagering-export',
-        slot: 0,
-      });
+      expect(stackOf(exported, { ...FIXTURE_GIT_ENV, GIT_CEILING_DIRECTORIES: base }).project).toBe(
+        'wagering-export',
+      );
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -239,6 +272,24 @@ describe('docker-stack-is-per-checkout', () => {
         expect(Number(port)).toBeLessThan(EPHEMERAL_FLOOR);
       }
     }
+  });
+
+  /**
+   * The one way to leave the numbering: a pin replaces the slot the checkout would derive, and
+   * keeps everything else about it, so a checkout whose block collides with something on the host
+   * is moved by the person who can see the collision.
+   */
+  test('an explicit STACK_SLOT is taken as given, over the slot the checkout derives', () => {
+    withRepository('wagering', ['first'], ({ linked }) => {
+      const [checkout = ''] = linked;
+      const derived = chosenStack(checkout);
+      const pinned = chosenStack(checkout, { ...BARE_ENV, STACK_SLOT: '7' });
+
+      expect(derived.slot).toBe(1);
+      expect(pinned.slot).toBe(7);
+      expect(pinned.project).toBe(derived.project);
+      expect(pinned.ports).toEqual(ports(makeStack(['STACK_SLOT=7'])));
+    });
   });
 
   test('compose publishes the ports and tags the image the environment asks for', () => {

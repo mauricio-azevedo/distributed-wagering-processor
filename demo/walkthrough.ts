@@ -1,5 +1,5 @@
 /**
- * The seven demonstrations of [docs/demonstrations.md](../docs/demonstrations.md), run end to end
+ * The eight demonstrations of [docs/demonstrations.md](../docs/demonstrations.md), run end to end
  * against the stack `make up` started: the deployed `api` instance over HTTP, the two `worker`
  * instances over `wager-transactions.fifo`, and the events they publish on
  * `wager-integration-events.fifo`.
@@ -27,7 +27,9 @@ import {
 } from '@aws-sdk/client-sqs';
 
 import type { IntegrationEventEnvelope } from '../src/domain/integration-events';
+import { Money, type MoneyProps } from '../src/domain/money';
 import { loadEnv } from '../src/infrastructure/config/env';
+import type { LedgerEntryResponse } from '../src/infrastructure/http/ledger.dto';
 import { queueUrlResolver, wagerQueues } from '../src/infrastructure/messaging/sqs';
 import type { WagerOperationFields } from '../src/infrastructure/transport/wager-operation.dto';
 
@@ -80,7 +82,7 @@ async function call(
       ...(idempotencyKey !== undefined && { 'Idempotency-Key': idempotencyKey }),
     },
     ...(body !== undefined && { body: JSON.stringify(body) }),
-  });
+  }).catch(() => giveUp(`${baseUrl} did not answer`, 'make logs SERVICES=api'));
   const text = await response.text();
 
   return {
@@ -214,10 +216,25 @@ async function until<T>(what: string, answer: () => Promise<T | null>): Promise<
       return found;
     }
     if (Date.now() > deadline) {
-      throw new Error(`gave up waiting for ${what} after ${String(PATIENCE_MS)}ms`);
+      giveUp(
+        `gave up waiting for ${what} after ${(PATIENCE_MS / 1000).toString()}s`,
+        'make logs SERVICES=worker',
+      );
     }
     await Bun.sleep(POLL_MS);
   }
+}
+
+/**
+ * The one way this walkthrough ends early: what it was waiting for, and the command that shows why
+ * it never came. Everything it waits for is work an instance does on its own, so the answer is
+ * always in that instance's log.
+ */
+function giveUp(reason: string, next: string): never {
+  console.log(`  ✗ ${reason}`);
+  console.log(`Next: ${next}`);
+  sqs.destroy();
+  process.exit(1);
 }
 
 let failures = 0;
@@ -232,6 +249,14 @@ function shows(claim: string, actual: unknown, expected: unknown): void {
     failures += 1;
     console.log(`  ✗ ${claim}: expected ${wanted}, got ${got}`);
   }
+}
+
+/**
+ * The answer as it came back. The refusals are what a reviewer came to read, so they are printed
+ * whole rather than described: a status and the body the service sent under it.
+ */
+function answers({ status, body }: Answer): void {
+  console.log(`  ${String(status)} ${JSON.stringify(body)}`);
 }
 
 function heading(number: number, title: string): void {
@@ -292,6 +317,7 @@ const mismatch = await call('POST', '/wagering/transactions', {
   idempotencyKey: keyOf(bet),
 });
 
+answers(mismatch);
 shows('the key with another payload is a conflict', mismatch.status, 409);
 shows('with its own code', mismatch.body['code'], 'IDEMPOTENCY_PAYLOAD_MISMATCH');
 
@@ -302,6 +328,7 @@ heading(3, 'Rejection — a refusal the wallet decides is persisted, not an erro
 const rejected = await submit(operation('demo-bet-2', 'BET', '10000.00'));
 const rejectedId = String(rejected.body['transactionId']);
 
+answers(rejected);
 shows('an uncovered bet is refused', rejected.status, 422);
 shows('as a recorded outcome', rejected.body['status'], 'REJECTED');
 shows('with its failure code', rejected.body['failureCode'], 'INSUFFICIENT_BALANCE');
@@ -327,12 +354,56 @@ shows('the stake is back', refund.body['balance'], { amount: '500.00', currency:
 
 const second = await submit(operation('demo-rollback-1', 'ROLLBACK', '40.00', 'demo-bet-1'));
 
+answers(second);
 shows('a second reversal of the same bet is refused', second.status, 422);
 shows('whatever its kind', second.body['failureCode'], 'REFERENCE_ALREADY_REVERSED');
 
-// ----------------------------------------------------------------- 5. Queue submission
+// ----------------------------------------------------------------- 5. Reversal before its bet
 
-heading(5, 'Queue submission — the same use case, reached by a message, and its redelivery');
+heading(5, 'Out of order — a reversal that arrives before the bet it reverses');
+
+/**
+ * `ref.parked-state`: a reversal whose reference has not arrived is neither applied nor refused.
+ * It is persisted as `PENDING_REFERENCE` and answered `202`, and a worker's scheduler attempts it
+ * again until the reference lands or the window closes (ADR 0011). Nothing here drives that sweep.
+ */
+const parked = await submit(operation('demo-rollback-2', 'ROLLBACK', '30.00', 'demo-bet-3'));
+const parkedId = String(parked.body['transactionId']);
+
+answers(parked);
+shows(
+  'the reversal is parked, not refused',
+  [parked.status, parked.body['status']],
+  [202, 'PENDING_REFERENCE'],
+);
+shows(
+  'Location names the transaction to poll',
+  parked.location,
+  `/wagering/transactions/${parkedId}`,
+);
+
+const target = await submit(operation('demo-bet-3', 'BET', '30.00'));
+
+shows('the bet it was waiting for applies', target.body['balance'], {
+  amount: '470.00',
+  currency: 'BRL',
+});
+
+const swept = await until('a worker to apply the parked reversal', async () => {
+  const found = await call('GET', `/wagering/transactions/${parkedId}`);
+
+  return found.body['status'] === 'PROCESSED' ? found : null;
+});
+
+shows('a sweep applied it once the reference existed', swept.body['status'], 'PROCESSED');
+shows('crediting the stake back', (await call('GET', `/wallets/${walletId}`)).body['balance'], {
+  amount: '500.00',
+  currency: 'BRL',
+});
+
+// ----------------------------------------------------------------- 6. Queue submission
+
+heading(6, 'Queue submission — the same use case, reached by a message, and its redelivery');
 
 const win = operation('demo-win-1', 'WIN', '25.00');
 await enqueue(win, `${run}-msg-1`);
@@ -362,14 +433,47 @@ shows('the redelivery changed nothing', afterRedelivery.body['balance'], {
   amount: '525.00',
   currency: 'BRL',
 });
-shows('and added no version', afterRedelivery.body['version'], 4);
+shows('and added no version', afterRedelivery.body['version'], 6);
 
-// ----------------------------------------------------------------- 6. Reconciliation
+// ----------------------------------------------------------------- 7. Reconciliation
 
-heading(6, 'Reconciliation — the stored balance against the ledger that explains it');
+heading(7, 'Reconciliation — the stored balance against the ledger that explains it');
+
+/**
+ * The invariant of this service, printed rather than asserted: every entry of the wallet, and the
+ * balance added up from them beside the balance the wallet row carries. `recon.calculation` is the
+ * same sum, run inside one snapshot by the endpoint below; what this adds is that the reader does
+ * the arithmetic too, from the rows the ledger endpoint serves anyone.
+ */
+const history = await call('GET', `/wallets/${walletId}/ledger?limit=50`);
+const entriesSoFar = history.body['items'] as LedgerEntryResponse[];
+const rebuilt = entriesSoFar.reduce((balance, { direction, money }) => {
+  const entry = Money.from(money.amount, money.currency);
+
+  return direction === 'CREDIT' ? balance.add(entry) : balance.subtract(entry);
+}, Money.zero('BRL'));
+const stored = await call('GET', `/wallets/${walletId}`);
+
+console.log('  version  direction  amount  balance after');
+for (const { walletVersion, direction, money, balanceAfter } of entriesSoFar) {
+  console.log(
+    `  ${String(walletVersion).padStart(7)}  ${direction.padEnd(9)}  ${money.amount.padStart(6)}  ${balanceAfter.amount.padStart(13)}`,
+  );
+}
+// The two totals land under `balance after`, because that is the column they are a claim about.
+const total = (label: string, amount: string): string =>
+  `  ${label.padEnd(28)}${amount.padStart(13)}`;
+
+console.log(total('rebuilt from the ledger', rebuilt.toString()));
+console.log(total('stored on the wallet', (stored.body['balance'] as MoneyProps).amount));
 
 const report = await call('POST', `/wallets/${walletId}/reconciliation`);
 
+shows(
+  'the entries add up to the balance the wallet carries',
+  rebuilt.toJSON(),
+  stored.body['balance'],
+);
 shows('the report is an answer, not a refusal', report.status, 200);
 shows(
   'stored and calculated agree',
@@ -381,20 +485,26 @@ shows(
 );
 shows('the difference is zero', report.body['difference'], { amount: '0.00', currency: 'BRL' });
 shows('it is consistent', report.body['consistent'], true);
-shows('over every entry', report.body['checkedEntries'], 4);
+shows('over every entry', report.body['checkedEntries'], 6);
 
 /**
- * The four processed operations — the opening credit, the bet, the refund and the queued win —
- * each announced twice, and the two refusals announced once (`event.*-when`). The wait is the
+ * The six processed operations — the opening credit, the bet, the refund, the late bet, the
+ * reversal that waited for it and the queued win — each announced twice, the two refusals
+ * announced once, and the parking of the reversal announced once (`event.*-when`). The wait is the
  * publisher's poll interval, not a race: the rows were committed by the operations above.
  */
 const ANNOUNCED = [
+  'WagerTransactionPendingReference',
+  'WagerTransactionProcessed',
+  'WagerTransactionProcessed',
   'WagerTransactionProcessed',
   'WagerTransactionProcessed',
   'WagerTransactionProcessed',
   'WagerTransactionProcessed',
   'WagerTransactionRejected',
   'WagerTransactionRejected',
+  'WalletBalanceChanged',
+  'WalletBalanceChanged',
   'WalletBalanceChanged',
   'WalletBalanceChanged',
   'WalletBalanceChanged',
@@ -421,9 +531,9 @@ shows(
   true,
 );
 
-// ----------------------------------------------------------------- 7. Recovery
+// ----------------------------------------------------------------- 8. Recovery
 
-heading(7, 'Recovery — both workers killed mid-flight, and nothing lost or doubled');
+heading(8, 'Recovery — both workers killed mid-flight, and nothing lost or doubled');
 
 /**
  * Enough queued operations that the drain takes long enough to be interrupted on purpose. Each one
@@ -431,7 +541,7 @@ heading(7, 'Recovery — both workers killed mid-flight, and nothing lost or dou
  * in flight at a time, which would turn the batch into a queue of sixty round trips.
  */
 const QUEUED = 60;
-const VERSION_BEFORE = 4;
+const VERSION_BEFORE = 6;
 
 const inFlight = Array.from({ length: QUEUED }, (_, index) =>
   operation(`demo-queued-${String(index)}`, 'BET', '1.00'),
@@ -451,9 +561,9 @@ async function applications(): Promise<number> {
 
 /** `make` exports the project, the image and the ports of this checkout's stack; Bun inherits them. */
 const compose = (...args: string[]): void => {
-  const { success, stderr } = Bun.spawnSync(['docker', 'compose', ...args]);
+  const { success } = Bun.spawnSync(['docker', 'compose', ...args], { stderr: 'inherit' });
   if (!success) {
-    throw new Error(`docker compose ${args.join(' ')} failed:\n${stderr.toString()}`);
+    giveUp(`docker compose ${args.join(' ')} failed`, 'make logs');
   }
 };
 
@@ -508,9 +618,14 @@ shows('having paid each bet exactly once', recovered.body['storedBalance'], {
 
 sqs.destroy();
 
-console.log(
-  failures === 0
-    ? `\nEvery demonstration answered as docs/demonstrations.md says. Wallet ${walletId}.`
-    : `\n${String(failures)} claim(s) did not hold. Wallet ${walletId}.`,
-);
+if (failures === 0) {
+  console.log(`\nEvery demonstration answered as docs/demonstrations.md says. Wallet ${walletId}.`);
+  console.log('\nNext:');
+  console.log(`  ${'make drill'.padEnd(31)}break the wallet lock on purpose; three cases catch it`);
+  console.log(`  ${'make check'.padEnd(31)}the whole gate: every suite, real PostgreSQL and SQS`);
+  console.log(`  ${`${baseUrl}/docs`.padEnd(31)}the HTTP contract this ran against`);
+} else {
+  console.log(`\n${String(failures)} claim(s) did not hold. Wallet ${walletId}.`);
+  console.log('Next: make logs');
+}
 process.exit(failures === 0 ? 0 : 1);

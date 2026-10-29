@@ -1,150 +1,152 @@
 # Distributed Wagering Processor
 
-A wallet and wagering transaction service for game providers. Providers open wallets for players and submit bets, payouts, losses, refunds and rollbacks over HTTP or through an SQS queue. The service keeps one exact balance per wallet, an immutable ledger of every balance change, persistent idempotency for every operation, and publishes integration events through a transactional outbox. It stays correct when the same operation arrives several times, when dependent operations arrive out of order, and when several instances process the same wallet at once.
+Process bets, wins, losses, refunds, and rollbacks from game providers through HTTP or SQS.
 
-## Status
+Every balance change has an immutable ledger entry. Duplicate messages, concurrent requests, and worker restarts do not duplicate financial effects.
 
-| Area                                        | State                                                                                                                                                                                                                                                                                                                                            |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| System contract, decisions, acceptance plan | Complete; `make check` passing                                                                                                                                                                                                                                                                                                                   |
-| Infrastructure foundation                   | Runs: the NestJS service on Bun, PostgreSQL with both roles, LocalStack with the three queues, the migration step, liveness and readiness endpoints                                                                                                                                                                                              |
-| Domain model                                | `Money`, the `Wallet` aggregate with its immutable ledger entries, the `WagerTransaction` state machine, the inbox and outbox records and the typed integration events                                                                                                                                                                           |
-| Persistence mapping                         | Tables, row mappings and transactional repositories behind one unit of work                                                                                                                                                                                                                                                                      |
-| Schema enforcement                          | Every guarantee of ADR 0003, in reversible migrations: uniqueness, validity, referential integrity, the append-only triggers, the per-table privileges and the deferred triggers that tie a balance to its ledger at commit                                                                                                                      |
-| Operation identity                          | The canonical payload hash and the PostgreSQL reservation that decides a replay, a payload mismatch or a bound provider transaction id, claimed by the first statement of every financial transaction                                                                                                                                            |
-| Wallet opening and reads                    | Runs: `POST /wallets` with its atomic opening credit, `GET /wallets/{walletId}`, and RFC 9457 problem details for every refused request                                                                                                                                                                                                          |
-| Reconciliation                              | Runs: `POST /wallets/{walletId}/reconciliation` compares the stored balance with the ledger in one read-only snapshot, and reports a divergence without ever repairing it                                                                                                                                                                        |
-| Bet submission                              | Runs: `POST /wagering/transactions` applies a `BET` under the wallet lock, persists its rejection when a rule refuses it, replays a stored outcome, and answers `503` with `Retry-After` on a transient failure                                                                                                                                  |
-| Transaction and ledger reads                | Runs: `GET /wagering/transactions/{transactionId}` and `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` return the full transaction view, opening credits included; `GET /wallets/{walletId}/ledger` pages the ledger with an opaque cursor that stays correct while it is being appended to                          |
-| Reversals and references                    | Runs: `WIN`, `LOSS`, `REFUND` and `ROLLBACK`, with references resolved by provider ids under the wallet lock, every reference rule as its own persisted failure code, and a target reversed at most once                                                                                                                                         |
-| Pending-reference recovery                  | Runs: a reversal that arrives before its target is parked as `PENDING_REFERENCE` and answered `202`, then claimed, reattempted with exponential backoff and settled or rejected after an hour by a scheduler sweep                                                                                                                               |
-| Outbox publication                          | Runs: concurrent publishers claim committed outbox rows with `FOR UPDATE SKIP LOCKED`, publish them to `wager-integration-events.fifo` and record the publication, driven by the `worker` role in every deployment                                                                                                                               |
-| Queue entry point, inbox and dead letters   | Runs: a message on `wager-transactions.fifo` runs the same use case as the controller, its inbox row commits with the financial effect, it is deleted only after that commit, a transient failure comes back on a growing backoff and a permanent one is forwarded to the dead-letter queue                                                      |
-| Structured logs and operational metrics     | Runs: every line is a JSON record carrying the identity fields it knows and no amount or balance, one correlation id follows an operation from a request or a message into its events and its later retries, and `GET /metrics` exposes the documented Prometheus metrics with the outbox backlog measured on every scrape                       |
-| Runtime roles and graceful shutdown         | Runs: one image serves as `api`, `worker` or `all`; Compose starts one `api` and two `worker` instances; an invalid variable stops the process by name before any port opens; `SIGTERM` drains the requests in flight, the message being applied, the publication batch and the attempt in flight within the grace period                        |
-| Concurrency under load                      | Proven: three independent processes against one database — two bets racing for one balance, fifty copies of one bet, two hundred wallets in parallel, a mixed load that raises no deadlock, and reconciliation running throughout                                                                                                                |
-| HTTP conformance and authentication         | Runs: the service serves `docs/openapi.yaml` byte for byte at `/docs-json` and renders it at `/docs`, its routes are exactly the operations of that document, one status class answers one situation on every endpoint, and the authentication extension point is a port with a guard that admits every request until an implementation is bound |
-| Reviewer documentation and demonstrations   | Runs: setup from a clean checkout, an architecture document describing what was built with its trade-offs and limitations, and seven demonstrations against the running stack in `make demo`; every required entry of [docs/acceptance.yaml](docs/acceptance.yaml) is `implemented` and `passing`                                                |
+Built with Bun, TypeScript, NestJS, MikroORM, PostgreSQL, and SQS.
 
-The service starts, reports its readiness and applies migrations against the Compose dependencies. The domain layer holds the `Money` value object and the `Wallet` aggregate: a wallet opens at version 1, refuses an uncovered debit, a foreign currency, a foreign owner and a credit past the money bound with the failure code each one carries, and answers every applied operation with the new balance, the next version and the one immutable ledger entry that mirrors them. Beside it, a `WagerTransaction` is born pending with the reference requirement of its kind validated, records every outcome with the balance observed at that moment, and once processed, rejected or failed refuses every further transition and keeps what it recorded. Beside them are the inbox row that makes a redelivery a no-op, the outbox row that carries a committed event with its fixed event id and capped retry backoff, and the four integration events, each fixing its type and version in its class and serializing every amount as a string. The first migration creates the tables and the mappings carry a row into the aggregate its factory would have produced and back, with every amount exact to the cent; the repositories reach a use case only inside a transaction, on an entity manager forked for that operation alone. The schema refuses what no invariant allows whatever issued the write: duplicate wallets, provider transactions, idempotency keys, reversals and opening credits; unknown kinds, statuses, directions and failure codes; a negative balance, an unbalanced entry, a non-finite amount, an entry in a currency other than its wallet's; any update or delete of a ledger entry, any delete of a transaction row and any change to one that already reached its outcome. The runtime role holds `select` and `insert` on the ledger, no `delete` anywhere and no DDL. Two more triggers, deferred to commit, tie a balance to the ledger that explains it: a wallet row mirrors the head of its ledger or carries version 1 and `0.00` with no ledger at all, and every entry continues the one before it and is continued by the one after it, so a balance change without its entry, an entry without its balance change, an entry squeezed between two others and a version gap cannot be committed, whatever issued the write. On top of all of it sits operation identity: a submission is hashed over the canonical JSON of its business fields alone, so the same operation is one hash through either entry point whatever order or envelope it arrives in, and the first statement of a financial transaction inserts that row with its two unique keys, which is how fifty copies of one bet become one row, how a key reused for different content becomes a conflict rather than a replay, and how a process that exited still leaves the decision behind.
+## Contents
 
-The service now has its first behaviour. `POST /wallets` commits, in one transaction, the wallet row, the `OPENING` transaction already `PROCESSED` under the reserved `system` provider, the `CREDIT` entry that mirrors the balance at `walletVersion` 1 and the two outbox rows that announce it; an initial balance of `0.00` commits the wallet alone, because a ledger entry records a movement and there is none. A failure anywhere inside leaves no row in any table, and a duplicate is nothing the use case looks for: the unique key on the player and the currency is the only check, so two instances opening the same wallet at the same moment end at one wallet and one `409 WALLET_ALREADY_EXISTS` with the first wallet untouched. `GET /wallets/{walletId}` returns the current balance and version, and every refused request leaves as RFC 9457 problem details carrying its stable error code and the correlation id of the response header, whether a schema, a use case or the body parser refused it.
+- [Run it](#run-it)
+- [How it works](#how-it-works)
+- [The operations](#the-operations)
+- [Why retries and races are safe](#why-retries-and-races-are-safe)
+- [Connect a provider](#connect-a-provider)
+- [Check a wallet](#check-a-wallet)
+- [Everyday commands](#everyday-commands)
+- [Load test](#load-test)
+- [Scope and design](#scope-and-design)
 
-`POST /wallets/{walletId}/reconciliation` proves the balance the service produced. It compares the stored balance with the ledger that explains it — credits minus debits summed by the database, and the balance the entry at the wallet's own version left behind — and answers `200` whether or not the two agree, with the signed difference between them. Both readings come from one `REPEATABLE READ`, read-only snapshot taken without locking the wallet, so they cannot straddle a balance change and reconciling a busy wallet costs its processing nothing. A divergence is reported, logged and counted, and never corrected: a service that quietly fixed a balance would destroy the only evidence of the defect behind it. The same comparison, written independently in SQL, is the invariant every test that moves money ends with.
+## Run it
 
-`POST /wagering/transactions` is the financial core. One submission claims its idempotency key by inserting the transaction row, locks the wallet with `SELECT ... FOR NO KEY UPDATE`, and commits — together or not at all — the outcome on that row, the new balance under the version it read, the single `DEBIT` entry that mirrors it and the outbox rows that announce it. A bet the balance cannot cover, one in another currency and one naming another player are not errors but outcomes: each is a `422` with its stable failure code, persisted and auditable, leaving balance, ledger and version untouched. A repetition of the same operation returns the stored outcome with `idempotentReplay: true` and the balance observed when it was recorded, however far the balance has moved since; the same key with another payload is a `409`, and so is a second key for a provider transaction id that already exists. A wait for the wallet lock longer than `LOCK_TIMEOUT_MS` is a `503` with `Retry-After` that persists nothing, so the resend is a new operation — and if instead the connection drops after the commit was confirmed, the resend finds the stored outcome and replays it, because the key was committed by the same transaction as the money.
+You need **Bun** at the version pinned in [.bun-version](.bun-version), **Docker with Compose v2**, **Make**, and **Bash**.
 
-The other four kinds take that same path, and what separates them from a `BET` is the transaction they name. A reference is resolved on the provider's own ids after the wallet is locked, so every reversal of one target is serialized by one lock, and the whole eligibility matrix — the kind, the shared context, the status, the amount — is decided by the domain over the two transactions alone, each refusal a `422` with its own code. A `WIN` credits, a `REFUND` credits the referenced `BET` back, a `ROLLBACK` applies the inverse of what it reverses, a `LOSS` is processed without touching balance, version or ledger, and a target is reversed at most once however the second reversal is spelled.
-
-A reversal that arrives before the operation it applies to is neither rejected nor blocked on: it is parked as `PENDING_REFERENCE` with the balance it observed, answered `202` with `Location`, announced once, and handed to the scheduler with the attempts, the backoff and the hour it will be awaited for. A sweep claims the oldest due transaction with `SELECT ... FOR UPDATE SKIP LOCKED`, one row per database transaction, and reattempts it through the same financial step a submission takes: once the target is processed the reversal is applied under the normal rules, a reference rule that refuses it records the rejection it would have recorded on arrival, and a reference still missing is counted and reattempted at one second, two, four and so on up to five minutes. The first attempt after the window closes ends the wait with `REFERENCE_NOT_FOUND`, unless the reference did arrive, in which case it is applied instead. Because the claim is the lock, a worker killed mid-attempt releases it with its connection and the row is due again, unchanged, for whoever sweeps next, and several workers never pick the same row. A transient failure changes nothing on the transaction and only reschedules it, with the hour left exactly where it was; a failure the service recognises as permanent marks it `FAILED` with `PROCESSING_FAILED`, which emits no event and replays as `500`.
-
-The read endpoints answer for what was recorded. A transaction comes back in full by the id the service minted or by the pair the provider minted, which is the only way a provider reaches one — `system` is accepted on that path precisely so the internal opening credit of a wallet is readable — and a `REJECTED` or `FAILED` transaction is readable like any other, because the audit trail is the point. `GET /wallets/{walletId}/ledger` pages the ledger in ascending wallet version with an opaque cursor that names the last version returned, so entries committed while a caller holds that cursor land beyond it: pages are contiguous, no entry is ever repeated or skipped, and the page after the last one is empty rather than wrong. `limit` is 1 to 200 and defaults to 50; a cursor the service did not issue is refused with its own code instead of silently restarting from the first page.
-
-The outbox publisher delivers what those commits left behind. One cycle is one transaction: it claims the due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, sends each row's stored envelope to `wager-integration-events.fifo` with the wallet as the message group and the event id as the deduplication id, marks what the broker took, schedules what it refused, and commits. The claim is the only coordination between instances: any number of publishers work on one table and receive disjoint batches, a publisher that dies hands its rows back the moment PostgreSQL closes its connection, and a row is claimable only once it is committed. The send happens before the commit that records it, which is the choice that makes a crash in that window a duplicate instead of a loss — every publication of a row carries the event id and the envelope it was enqueued with, so a consumer deduplicating by `eventId` applies it once. No row is ever dropped: a failed publication is counted and retried with exponential backoff capped at five minutes, and from the tenth attempt the publisher records the row for an operator while the retries continue. Ordering across publishers is not promised; consumers order a wallet's balance events by `walletVersion` and everything else by `occurredAt`.
-
-The queue is the second entry point and not a second implementation. A `WagerTransactionRequested` message is validated against the messaging contract, becomes the very command the controller builds, and runs the same use case; what it adds is a delivery identity. The inbox row for `(consumerName, messageId)` — the id the producer assigned, never the broker's receipt id — is claimed as the first statement of the financial transaction and completed by the same commit, so a redelivery is absorbed without a second effect, a message id reused for other content is refused with the first delivery untouched, and the message is deleted only after the commit returned: a worker killed in that window costs one redelivery and nothing else. The same operation submitted over HTTP and then through the queue is one debit and a replay, and the message's correlation id, or its message id when it carries none, reaches every event the operation produced. A delivery that did not end in a business outcome is classified before anything is done to the message, and the class alone decides the action: a transient failure — an unreachable database, a lock wait, and any error no rule classifies, so that a defect is never terminal — comes back with a visibility that doubles per receive until the queue's redrive policy dead-letters it, while a permanent one is forwarded to `wager-transactions-dlq.fifo` and only then deleted, so a forward the broker refuses loses nothing. None of it depends on the queue being FIFO or on the broker's deduplication window: a reversal delivered before the operation it reverses is parked, and a duplicate the broker did not filter is absorbed by the inbox row.
-
-Correctness under concurrency is the claim the service exists to make, so it is demonstrated rather than argued. A suite starts three instances, each a process of its own sharing nothing with the others but PostgreSQL, arms them with a scenario and releases them on an instant they agree on. Two bets of `80.00` against a balance of `100.00` end, twenty rounds over, with one processed, one rejected for insufficient balance, a balance of `20.00`, one debit entry, and retries of both that replay instead of debiting again. Fifty copies of one bet end at one debit and forty-nine replays, the copy that applied running in one instance while the others read back what it committed. Two hundred wallets taking twenty bets each all apply, every wallet holding exactly its own twenty debits, and that operations on different wallets never wait for each other is observed instead of timed: one wallet's bet is held open between its last statement and its commit while another wallet's bet is applied and committed past it, once from another process and once from the same instance. A mixed load of bets, duplicates and both reversal kinds aimed at the same targets leaves PostgreSQL's own deadlock counter untouched. Reconciliation runs continuously against a wallet three instances are betting on, every report consistent and the betting no slower for it. Beside the load, the two defences behind the lock are shown against their alternatives: two writers that skipped the lock cannot both commit, and ten pairs of submissions that deadlock in every pair with the lock mode ADR 0002 rejected serialize with no error through the one it chose.
-
-The service is now debuggable from the outside. Every line it writes is a JSON record naming what happened and the identities it knows, and the correlation id of a request or a message reaches every line and every event of that operation — including the ones produced later, by a publisher in another process or by a sweep an hour afterwards, each of which reads the id off the row it is working on rather than minting one. No line carries an amount, a balance or a request body, because the one adapter they all pass through drops anything shaped like money; the reconciliation divergence record reaches the sink through a method of its own, which is the single documented exception and the only place an amount is ever written to a log. `GET /metrics` exposes the documented metrics — transactions by kind and status, duplicates by where they were caught, retries by the component that backed off, dead letters, lock conflicts, processing time by entrypoint, pending-reference attempts by outcome, divergences, and the outbox backlog with the age of its oldest unpublished row — each raised by the path that owns it and each proven by the suite that drives that path.
-
-All of it is now deployable from one image. `APP_ROLE` decides what a process is: `api` serves the HTTP surface and claims nothing, `worker` runs the queue consumer, the outbox publisher and the pending-reference scheduler and serves the health routes alone, `all` is both for a local run. Compose starts PostgreSQL, LocalStack with the three queues, the migration step, one `api` and two `worker` instances, from one image and one environment that differ only in that variable. A missing or unreadable value stops the process by name before any port is opened.
-
-A stop loses nothing. One handler closes the application within `SHUTDOWN_GRACE_PERIOD_MS`: the HTTP server stops accepting and answers the requests in flight, releasing the connections nobody is using so a caller's keep-alive pool cannot hold the drain open; the consumer abandons the receive in flight, finishes and acknowledges the message it was applying, and hands back every message of its batch it had not reached with the visibility cleared, so another instance takes them at once; the publisher finishes the batch it claimed; the scheduler stops claiming between attempts and finishes the one it holds. A drain that needs longer than the period exits `75` rather than waiting, and still loses nothing, because what it did not finish never committed: PostgreSQL releases the claims and locks of the connection that dies, and an unacknowledged message is redelivered into the inbox that absorbs it.
-
-The HTTP surface is now held to its own contract. `GET /docs-json` answers with `docs/openapi.yaml` byte for byte and `GET /docs` renders that route, so the document a caller fetches is the document this repository reviews; the gate compares the registered routes with the operations of the document in both directions, validates every response, every published event and every example of both documents against the schemas they declare, and checks the failure and error code enumerations in the domain, in the adapter and in both contracts against the two tables of the system contract. Authentication is deferred behind an extension point rather than left out: `ProviderIdentityPort` is an application port, one HTTP guard asks it who the caller is, and the implementation this version binds answers nobody, so every request is admitted while the operator's endpoints and the documentation routes stay open by their own declaration. Binding an implementation that identifies its caller — which is all enabling authentication consists of — makes a payload naming another provider refused before any wallet is read, with no use case, controller or route changed, and leaves the queue exactly as it was: an internal channel whose messages carry no credentials and still face every domain rule.
-
-A kill loses nothing either, and that is shown rather than argued. A drill runs three worker instances and kills them where recovery is hardest: one that has committed a delivery and not yet acknowledged its message, and one whose publication reached the broker while the commit that would record it never happened. Both kills are `SIGKILL`, which allows no cleanup, and both are taken at a barrier — the instance says it has reached the point, the drill asserts the state the kill is about to interrupt, and a barrier no instance reached fails the run instead of passing it. After that nothing is driven: the survivors and the restarted instances absorb the redelivery, republish the row the dead publisher had sent under the same event id, and apply the reversal that was parked waiting for an operation that arrived during the kills. What it costs is duplicates and nothing else — one debit, one entry, one application of each event by a consumer deduplicating by event id, every transaction terminal, and every wallet the drill touched equal to the balance rebuilt from its own ledger in SQL. The duplicates are sent with deduplication ids the broker has never seen, so what absorbs them is the database and not a five-minute window in the broker.
-
-All of it can now be watched happening rather than read about. `make demo` starts the stack of `compose.yaml` — one `api`, two `worker` instances, PostgreSQL and LocalStack — and walks seven demonstrations through it: an HTTP submission and the ledger entry that explains the balance, a replay returning the balance the outcome observed, a rejection recorded rather than raised, a reversal and the refusal of the second one, a queue submission with a redelivery the inbox absorbs, a reconciliation and the events the operations published, and both workers `SIGKILL`ed mid-drain of a sixty-operation backlog with every one of them still applied exactly once. [docs/demonstrations.md](docs/demonstrations.md) says what each one shows, which rules it exercises and which suite proves it in the gate.
-
-With that, the service is complete against its contract: every required entry of [docs/acceptance.yaml](docs/acceptance.yaml) is `implemented` and `passing`, naming the test that carries it, and that file is the release report. The three `optional` entries — double-entry bookkeeping, a load-test report and OpenTelemetry tracing — are extensions this version deliberately does not build; each records what building it would add. The trade-offs taken and the limitations left are in [ARCHITECTURE.md](ARCHITECTURE.md), section 9.
-
-## Stack
-
-Bun (version in `.bun-version`), TypeScript (strict), NestJS, PostgreSQL, MikroORM, AWS SQS through LocalStack, Docker Compose. The HTTP and queue shapes are defined in `docs/openapi.yaml` and `docs/asyncapi.yaml`; DTOs and message classes implement them.
-
-## From a clean checkout
-
-Docker and the Bun of `.bun-version` are the only prerequisites: the dependencies run in Compose, the image is part of the gate, and nothing else has to be installed.
+From the repository root:
 
 ```sh
-bun install --frozen-lockfile   # install the toolchain
-cp .env.example .env            # addresses of the Compose dependencies, read by Bun and by Compose
-make up                         # the whole stack: dependencies, migrations, one api and two workers
-eval "$(make -s stack)"         # export this checkout's project and ports into this shell
-curl -s "http://localhost:$HTTP_PORT/health/ready"   # 200, with one entry per dependency
-make demo                       # the seven demonstrations, against that stack
-make check                      # the whole quality gate; CI runs the same target
-make down                       # stop the stack and drop its data
+make demo
 ```
 
-No `make down` is needed between the demonstrations and the gate, in either order or at the same time: the suites address a database and a trio of queues of their own on the same containers, so neither disturbs the other's state (`ops.suite-isolation`, [ADR 0014](docs/decisions/0014-isolating-the-suites-from-the-demonstration-stack.md)). `make check` starts the dependencies it needs on its own (`make infra`).
+This installs dependencies, creates a missing `.env`, runs migrations, and starts one API instance and two workers, backed by PostgreSQL and LocalStack. No AWS account or AWS CLI is needed.
 
-## Commands
+The [walkthrough](demo/walkthrough.ts) places bets, retries them, handles reversals, and checks the ledger. It also kills and restarts both workers during processing, then checks that each bet was applied once.
+
+The stack stays running afterward. Open the [API reference](http://localhost:3000/docs) to explore it.
+
+## How it works
+
+```mermaid
+flowchart TD
+    HTTP["HTTP API"] --> Core["Shared financial use case"]
+    Queue["SQS requests"] --> Worker["Queue worker"]
+    Worker --> Core
+    Core -->|One commit| DB[("PostgreSQL")]
+    DB -->|Committed outbox rows| Publisher["Publisher worker"]
+    Publisher --> Events["SQS integration events"]
+```
+
+Financial changes and outgoing events are saved together. Queue messages are acknowledged only after commit.
+
+## The operations
+
+| Operation  | Balance effect                         | Reference                          |
+| ---------- | -------------------------------------- | ---------------------------------- |
+| `BET`      | Debit the stake                        | None                               |
+| `WIN`      | Credit the winnings                    | Optional `BET`                     |
+| `LOSS`     | Record the result without moving money | Optional `BET`                     |
+| `REFUND`   | Return the stake                       | Required `BET`                     |
+| `ROLLBACK` | Undo the referenced movement           | Required `BET`, `WIN`, or `REFUND` |
+
+There is one wallet per player and currency. A positive starting balance creates an internal `OPENING` credit with a ledger entry.
+
+References use the provider's transaction ID and must match the provider, player, wallet, currency, and round. Reversals cover the full amount. Each transaction can be [reversed once](test/integration/reversals-references.test.ts#L701), by either refund or rollback. A rollback cannot itself be reversed.
+
+Rejections leave the balance and ledger unchanged, including when a reversal would make the balance negative.
+
+## Why retries and races are safe
+
+| Guarantee              | How it works                                                                                                                                                                                                                                                                                             | Proof                                                                                                                                                                                                                            |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact money            | Amounts are strings such as `"25.00"`, with exactly two decimal places. The domain uses `bigint` minor units; PostgreSQL uses `NUMERIC(20,2)`. Nothing is rounded.                                                                                                                                       | [Exact arithmetic](test/unit/money.test.ts#L75)                                                                                                                                                                                  |
+| Concurrent bets        | PostgreSQL serializes balance changes and checks the wallet version. Two simultaneous bets of **80.00 BRL** against **100.00 BRL** produce one debit, one rejection, and a final balance of **20.00 BRL**.                                                                                               | [Competing bets](test/concurrency/wallet-contention.test.ts#L500)                                                                                                                                                                |
+| Independent wallets    | Locks belong to individual wallets. Holding one wallet does not stop another from committing.                                                                                                                                                                                                            | [Independent wallets](test/concurrency/wallet-contention.test.ts#L884)                                                                                                                                                           |
+| One commit             | Outcomes, balance movements, ledger entries, events, and queue inbox records commit together. PostgreSQL also enforces ledger immutability and balance consistency.                                                                                                                                      | [Atomic writes](test/integration/bet-atomicity.test.ts#L265); [immutable ledger](test/integration/schema.test.ts#L738); [ledger consistency](test/integration/wallet-ledger-chain.test.ts#L306)                                  |
+| Persistent idempotency | The same provider key and business payload return the stored outcome. Terminal replays keep the original observed balance. Changing the payload under that key returns `409`.                                                                                                                            | [Replay after restart](test/integration/bet-submission.test.ts#L995); [50 copies, one debit](test/concurrency/wallet-contention.test.ts#L564)                                                                                    |
+| Late references        | An operation waits as `PENDING_REFERENCE`, without moving money. HTTP returns `202` and a `Location` URL to check progress. Workers retry with exponential backoff, capped at five minutes. After a one-hour window, the next attempt rejects any still-unresolved reference with `REFERENCE_NOT_FOUND`. | [Rollback before bet](test/integration/pending-reference.test.ts#L464)                                                                                                                                                           |
+| Worker recovery        | Messages are acknowledged only after commit. If a worker dies before acknowledgment, the persistent inbox absorbs redelivery.                                                                                                                                                                            | [Crash before acknowledgment](test/integration/queue-submission.test.ts#L753)                                                                                                                                                    |
+| Event recovery         | Committed events wait in the outbox. Publishers claim separate rows, and crashes release their claims. Delivery is at least once, with no global ordering. Consumers deduplicate by `eventId` and order balance changes by `walletVersion`.                                                              | [Concurrent publishers](test/concurrency/outbox-publishers.test.ts#L228); [claim recovery](test/concurrency/outbox-publishers.test.ts#L265); [worker and publisher crash recovery](test/concurrency/crash-recovery.test.ts#L419) |
+
+## Connect a provider
+
+Create a wallet with `POST /wallets`. Then submit operations through either entry point:
+
+- **HTTP:** `POST /wagering/transactions`, with an `Idempotency-Key` such as `provider-a:bet-123`. Keep the key when retrying.
+- **SQS:** send a `WagerTransactionRequested` message to `wager-transactions.fifo`.
+
+Both run the same financial use case. The [HTTP contract](docs/openapi.yaml) and [messaging contract](docs/asyncapi.yaml) contain request shapes, examples, and responses, including retry and dead-letter behavior.
+
+## Check a wallet
+
+The demo prints a wallet ID. Paste it below to read the balance and compare it with the ledger:
 
 ```sh
-make                            # list the targets
-make stack                      # this checkout's Compose project, image, ports and suite addresses
-make dev                        # start PostgreSQL and LocalStack, apply migrations, run the service with reload
-make up                         # the whole stack in containers: dependencies, migrations, one api on HTTP_PORT and two workers
-make demo                       # start the stack and walk through docs/demonstrations.md
-make down                       # stop the stack and drop its data
-make migrate                    # apply pending migrations as the migrator role
-make test                       # the test suites, against the suites' database and queues
-make check                      # the whole quality gate; CI runs the same target
-make fmt                        # rewrite files with Prettier
+WALLET_ID='paste-the-wallet-id-here'
+
+curl -sS "http://localhost:3000/wallets/$WALLET_ID"
+curl -sS -X POST "http://localhost:3000/wallets/$WALLET_ID/reconciliation"
 ```
 
-`GET /health/live` answers while the process serves HTTP; `GET /health/ready` answers `200` only when PostgreSQL and SQS are reachable, with one entry per dependency. `GET /docs` renders `docs/openapi.yaml` and `GET /docs-json` serves it byte for byte; `GET /metrics` exposes the Prometheus metrics.
+Look for `consistent: true` and a difference of `0.00`. Reconciliation [reports, logs, and counts divergences without changing the balance](test/integration/wallet-reconciliation.test.ts#L528).
 
-A single clone publishes the service on `3000`, PostgreSQL on `5433` and LocalStack on `4566`. Each `git worktree` of this repository gets its own Compose project, image and block of ports instead, so two checkouts run `make check` at the same time and `make down` in one leaves the other running. `make stack` prints what a checkout uses; `make` passes it to Compose, so a `docker compose` or `psql` command typed by hand needs `eval "$(make -s stack)"` first, or it addresses the wrong stack. If one of the three default ports is already taken on the host, export `STACK_SLOT` with any number above zero — `export STACK_SLOT=7` — and that checkout publishes a block of its own instead; everything else, the gate included, is unchanged.
+Operational endpoints are `/health/live`, `/health/ready`, and `/metrics`. Logs are JSON; HTTP responses carry `X-Correlation-Id`.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the gate, the pull request rules, CI, the board and the issue forms.
+## Everyday commands
 
-## Documents
+| Command                     | Purpose                                                                 |
+| --------------------------- | ----------------------------------------------------------------------- |
+| `make up`                   | Start the stack without the walkthrough                                 |
+| `make dev`                  | Run the API from source with reload                                     |
+| `make test`                 | Run the tests against PostgreSQL and LocalStack                         |
+| `make test TESTS=test/unit` | Run a focused suite                                                     |
+| `make check`                | Check formatting, lint, types, tests, dependencies, and the image build |
+| `make drill`                | Break the wallet lock three ways and watch the tests catch it           |
+| `make logs`                 | Show recent stack logs                                                  |
+| `make down`                 | Remove the stack **and its local database volume**                      |
+| `make help`                 | List all commands                                                       |
 
-| Document                                                   | Read it for                                                                                             |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| [docs/system-contract.md](docs/system-contract.md)         | Every rule the service guarantees, with stable ids, failure codes and adopted interpretations           |
-| [docs/openapi.yaml](docs/openapi.yaml)                     | The HTTP contract: every endpoint, request, response, header, status code and the pagination rule       |
-| [docs/asyncapi.yaml](docs/asyncapi.yaml)                   | The messaging contract: queues, the input message, integration events, envelopes and delivery semantics |
-| [docs/glossary.md](docs/glossary.md)                       | The vocabulary used by the rules and the code                                                           |
-| [ARCHITECTURE.md](ARCHITECTURE.md)                         | Layers, runtime topology, decisions, database enforcement, failure windows, limitations                 |
-| [docs/decisions](docs/decisions/README.md)                 | Architecture decision records in MADR 4.0.0 and the templates for new ones                              |
-| [docs/acceptance.yaml](docs/acceptance.yaml)               | Every obligation mapped to rules, enforcement, scenario, expected outcome and the test that proves it   |
-| [docs/demonstrations.md](docs/demonstrations.md)           | The seven demonstrations `make demo` runs against the stack, and what each one shows                    |
-| [docs/implementation-plan.md](docs/implementation-plan.md) | The delivery slices and the acceptance ids each one turned green; a record now, not a plan              |
-| [CONTRIBUTING.md](CONTRIBUTING.md)                         | Quality gate, pull requests, CI, repository settings, ADRs, board and issue conventions                 |
-| [AGENTS.md](AGENTS.md)                                     | The rules a coding agent follows in this repository; `CLAUDE.md` is a symlink to it                     |
+CI runs `make check`. Tests use a separate database and queues, so they can run beside the demo. Concurrency tests use independent processes to exercise competing bets, duplicate storms, separate wallets, and crash recovery.
 
-## Repository map
+Settings are documented in [.env.example](.env.example) and [compose.yaml](compose.yaml). An existing `.env` is preserved.
 
+## Load test
+
+```sh
+bun run test:load
 ```
-AGENTS.md                    rules for coding agents; CLAUDE.md symlinks to it
-ARCHITECTURE.md              current design and decisions
-CONTRIBUTING.md              gate, pull requests, CI, settings, ADRs, board, issues
-docs/system-contract.md      behavioural rules (area.name ids)
-docs/openapi.yaml            HTTP contract (OpenAPI 3.1)
-docs/asyncapi.yaml           messaging contract (AsyncAPI 3.0)
-docs/glossary.md             terms
-docs/decisions/              architecture decision records (MADR 4.0.0) and templates
-docs/acceptance.yaml         acceptance plan and verification status; the release report
-docs/demonstrations.md       the seven demonstrations and what each one shows
-docs/implementation-plan.md  delivery slices, in the order they shipped
-src/main.ts                  bootstrap: validated environment, the role's NestJS application, the signal handler that drains it
-src/app.module.ts            composition root: the controllers and the worker processes APP_ROLE selects
-src/domain/                  framework-free domain model: Money, Wallet, WagerTransaction, WalletLedgerEntry, inbox and outbox records, integration events, operation and opening-credit identity, kinds, failure and error codes, domain errors
-src/application/             use cases (OpenWallet, GetWallet, PageWalletLedger, SubmitWagerTransaction, GetWagerTransaction, ReprocessPendingReference, ReconcileWallet, PublishOutbox, ObserveOutboxBacklog), ApplyWagerOperation, the financial step a submission and a scheduled attempt share, the ports they depend on (persistence repositories, unit of work, event publisher, clock, id generator, provider identity, logger, metrics), the request-level errors they answer with
-src/infrastructure/          configuration, HTTP (controllers, DTOs, validation, problem details, correlation id, the contract document routes, the provider identity guard), persistence (row mappings, repositories, unit of work, migrations), messaging (SQS client, the queue consumer, the events publisher and the publisher loop), runtime (the worker loop, the processes of the worker role and the shutdown protocol), observability (the JSON log adapter, the log context, the metric registry and the /metrics endpoint), health, clock and id generator
-test/                        unit, integration and concurrency suites, run by bun test
-demo/                        walkthrough.ts, the demonstrations make demo drives against the running stack
-compose.yaml, Dockerfile     the stack and the image
-docker/                      PostgreSQL roles and databases and LocalStack queues, applied once at container init, and stack.sh, which names this checkout's stack
-.env.example                 the variables the service, the migration step and the suites read
-Makefile                     stack, check, fmt, fmt-check, lint, typecheck, test, audit, build, dev, infra, migrate, up, down, demo
-.bun-version                 the Bun version CI installs
-.github/                     ci and pr-title workflows, issue forms, PR template
-package.json, bun.lock       toolchain dependencies
-eslint.config.js, tsconfig.json, .prettierrc.json
-```
+
+Brings up three API instances and two workers, runs a 30-second measured load against them, and drains the backlog. It prints throughput, latency percentiles, error rate, lock conflicts, and outbox lag — the measured cost behind the guarantees above, not another correctness check.
+
+| Metric                    | Result                               |
+| ------------------------- | ------------------------------------ |
+| Throughput                | ~1,100–1,320 completed ops/s (HTTP)  |
+| Latency (p50 / p95 / p99) | ~10 ms / ~85 ms / ~200 ms            |
+| Infrastructure errors     | 0 in 83,473 attempts                 |
+| Lost or duplicated money  | None (reconciliation: 0 divergences) |
+
+Full environment, methodology, and analysis: [docs/load-experiment.md](docs/load-experiment.md).
+
+## Scope and design
+
+BRL is the operating currency; the model keeps currencies separate. The ledger records wallet movements rather than double-entry accounts. Reconciliation runs on demand.
+
+Authentication is deferred behind `ProviderIdentityPort`. Requests currently need no credentials. An authenticated deployment must also authorize wallet and service-ID lookups.
+
+For more detail:
+
+- [Architecture](ARCHITECTURE.md) — layers, failure windows, trade-offs, and limitations.
+- [Business rules](docs/system-contract.md) — detailed behavior and failure codes.
+- [Decisions](docs/decisions) — the reasoning behind the design.
+- [Walkthrough](docs/demonstrations.md) — each demonstration explained.
+- [Test map](docs/acceptance.yaml) — the full mapping from rules to test scenarios.
+- [Contributing](CONTRIBUTING.md) — development conventions.

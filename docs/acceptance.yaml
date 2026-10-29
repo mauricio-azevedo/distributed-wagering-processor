@@ -2905,6 +2905,54 @@ entries:
     implementationStatus: implemented
     verificationStatus: passing
 
+  - id: OPS-011
+    priority: required
+    requirement: Every checkout of the repository publishes a slot of its own, derived the same way every time.
+    contract: [ops.compose, ops.suite-isolation]
+    enforcement:
+      - docker/stack.sh names the Compose project and takes the slot from the checkout's own position in git worktree list — the main worktree slot 0, hence the ports a single clone always had — so the answer depends on nothing but the worktree list and two checkouts cannot land on one slot. Nothing looks at what the host already publishes: a port in use fails docker compose with Compose's own message, and an explicit STACK_SLOT, used as given, is how a checkout is moved off it. The Makefile reads the project, the slot and the three ports from that one line.
+    scenario:
+      - Read the slots and project names of a fixture repository with three checkouts, and what make exports for each slot.
+      - Run the script for a linked worktree with STACK_SLOT set to a slot that is not the one its position derives.
+    expected:
+      - No two checkouts of one repository can land on the same slot; slot 0 publishes 3000, 5433 and 4566, every slot publishes a fixed port below the ephemeral range, and no two slots share one.
+      - The pinned slot replaces the derived one, with the same project name and the block of ports that slot publishes.
+    evidence: { testId: docker-stack-is-per-checkout, layer: integration }
+    deliverySlice: reader-experience
+    implementationStatus: implemented
+    verificationStatus: passing
+
+  - id: OPS-012
+    priority: required
+    requirement: One command takes a clean clone to the running demonstrations.
+    contract: ops.compose
+    enforcement:
+      - make demo depends on the dependencies and on .env as files it produces: bun install --frozen-lockfile when node_modules is older than package.json or bun.lock, and a copy of .env.example when .env is missing, which is never overwritten. It is also the default target, and make help lists the rest. A dependency that does not come up and a stack that does not reach readiness each end with the command that shows why.
+    scenario:
+      - Clone the repository into an empty directory and run make.
+    expected:
+      - The dependencies are installed, .env is created from .env.example, the stack is built and started on 3000, 5433 and 4566, and the eight demonstrations pass; an .env that already exists is left as it is.
+    evidence: { testId: first-run-from-a-clean-clone, layer: manual }
+    deliverySlice: reader-experience
+    implementationStatus: implemented
+    verificationStatus: passing
+
+  - id: OPS-013
+    priority: required
+    requirement: Breaking an invariant on purpose fails the cases that name it and leaves no file changed.
+    contract: [conc.row-lock, conc.parallel-wallets, conc.lock-order]
+    enforcement:
+      - make drill applies three mutations one at a time — the wallet lock removed, a process-local mutex around every transaction, and the lock taken FOR UPDATE — runs only the cases named for each through make test, and asserts the result each one should give them. It refuses to start unless the files it edits are as committed, restores each file in a signal and exit trap, and verifies the restore against the index before continuing.
+    scenario:
+      - Run make drill with the tree as committed, and with one of the files it edits modified.
+    expected:
+      - Each mutation fails the cases that name it and leaves the ones that cannot see it passing: the structural check refuses the missing clause and the wrong mode, two concurrent bets on one balance stop ending as one debit, the same-instance case of conc.parallel-wallets fails while the cross-process one passes, and FOR UPDATE deadlocks the pairs that queue otherwise. Every file is reported as committed again afterwards.
+      - A modified file stops the drill before anything is edited, naming the file and the diff to read.
+    evidence: { testId: mutation-drill, layer: manual }
+    deliverySlice: reader-experience
+    implementationStatus: implemented
+    verificationStatus: passing
+
   # ---------------------------------------------------------------- AUTH
   - id: AUTH-001
     priority: required

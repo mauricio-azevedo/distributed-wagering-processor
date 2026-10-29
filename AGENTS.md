@@ -5,6 +5,8 @@
 - Read README.md and CONTRIBUTING.md.
 - Read docs/system-contract.md, ARCHITECTURE.md, and relevant ADRs under
   docs/decisions/ before changing financial behavior or persistence.
+  ARCHITECTURE.md is the summary; docs/architecture-reference.md holds the
+  detail it points to.
 - Read docs/implementation-plan.md for the current slice and
   docs/acceptance.yaml for the acceptance ids it must turn green.
 - Read docs/openapi.yaml before changing an HTTP endpoint and docs/asyncapi.yaml
@@ -65,7 +67,8 @@ small local helpers over custom verification or orchestration systems.
   contracts; DTOs and message classes implement them, and runtime validation
   stays in code.
 - Document behavior and interpretations in docs/system-contract.md.
-- Keep ARCHITECTURE.md aligned with the implemented design.
+- Keep ARCHITECTURE.md and docs/architecture-reference.md aligned with the
+  implemented design, and with each other.
 - Link to authoritative definitions instead of maintaining duplicate schemas.
 - Distinguish planned behavior from implemented and verified behavior.
 - Resolve contradictions explicitly before building on them.

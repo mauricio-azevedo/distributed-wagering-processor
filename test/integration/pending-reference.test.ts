@@ -5,7 +5,6 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import path from 'node:path';
 
 import { ServiceUnavailableError, WalletNotFoundError } from '../../src/application/errors';
-import type { LogFields, Logger } from '../../src/application/ports/logger';
 import type { Repositories, UnitOfWork } from '../../src/application/ports/unit-of-work';
 import {
   type PendingReferenceAttempt,
@@ -14,8 +13,10 @@ import {
 import { AppModule } from '../../src/app.module';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
+import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
+import { recordingLogger } from '../helpers/recording-logger';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
@@ -74,7 +75,8 @@ afterAll(async () => {
 // The migrator owns the tables, so it is the role that may truncate them (ADR 0003).
 beforeEach(async () => {
   await schema.em.getConnection().execute(`truncate table ${TABLES.join(', ')}`);
-  records.length = 0;
+  log.records.length = 0;
+  metrics = new MetricsRegistry();
 });
 
 // `recon.final-invariant` (RECON-004): every wallet a case touched is rebuilt from its ledger
@@ -289,19 +291,14 @@ const eventsOf = (transactionId: string): Promise<OutboxRow[]> =>
 const eventTypesOf = async (transactionId: string): Promise<string[]> =>
   (await eventsOf(transactionId)).map((row) => row.event_type);
 
-interface LogRecord {
-  readonly event: string;
-  readonly fields: LogFields;
-}
-
 /** What the scheduler logged, which `ref.permanent-failure` requires of a `FAILED` outcome. */
-const records: LogRecord[] = [];
+const log = recordingLogger();
 
-const recordingLogger: Logger = {
-  error: (event, fields) => {
-    records.push({ event, fields });
-  },
-};
+/**
+ * What the scheduler counted, which `obs.metrics` requires of every attempt (OBS-003). A registry
+ * of its own per test, because a counter is cumulative and a case asserts what its own sweep raised.
+ */
+let metrics = new MetricsRegistry();
 
 /**
  * The scheduler, with the moment of its sweep as an argument. The first attempt of a parked
@@ -318,7 +315,8 @@ function sweepAt(
     unitOfWork: over,
     clock: { now: () => at },
     ids: uuidV7IdGenerator,
-    logger: recordingLogger,
+    logger: log.logger,
+    metrics,
   }).execute();
 }
 
@@ -425,7 +423,9 @@ describe('missing-reference-is-parked', () => {
 
     const attempts = await sweep();
 
-    expect(attempts).toEqual([{ transactionId, outcome: 'pending' }]);
+    expect(attempts).toEqual([
+      { transactionId, correlationId: CORRELATION_ID, outcome: 'pending' },
+    ]);
     expect(await transactionRow(transactionId)).toMatchObject({
       status: 'PENDING_REFERENCE',
       failure_code: null,
@@ -478,7 +478,9 @@ describe('rollback-before-bet-resolves', () => {
 
     const attempts = await sweep();
 
-    expect(attempts).toEqual([{ transactionId: rollbackId, outcome: 'settled' }]);
+    expect(attempts).toEqual([
+      { transactionId: rollbackId, correlationId: CORRELATION_ID, outcome: 'settled' },
+    ]);
     expect(await transactionRow(rollbackId)).toMatchObject({
       status: 'PROCESSED',
       failure_code: null,
@@ -554,7 +556,9 @@ describe('rollback-before-bet-resolves', () => {
 
     const attempts = await sweep();
 
-    expect(attempts).toEqual([{ transactionId: rollbackId, outcome: 'settled' }]);
+    expect(attempts).toEqual([
+      { transactionId: rollbackId, correlationId: CORRELATION_ID, outcome: 'settled' },
+    ]);
     expect(await transactionRow(rollbackId)).toMatchObject({
       status: 'REJECTED',
       failure_code: 'REFERENCE_ALREADY_REVERSED',
@@ -580,7 +584,9 @@ describe('pending-reference-expires', () => {
 
     const attempts = await sweepAfterTheWindow();
 
-    expect(attempts).toEqual([{ transactionId, outcome: 'expired' }]);
+    expect(attempts).toEqual([
+      { transactionId, correlationId: CORRELATION_ID, outcome: 'expired' },
+    ]);
     expect(await transactionRow(transactionId)).toMatchObject({
       status: 'REJECTED',
       failure_code: 'REFERENCE_NOT_FOUND',
@@ -632,7 +638,9 @@ describe('pending-reference-expires', () => {
 
     const attempts = await sweepAfterTheWindow();
 
-    expect(attempts).toEqual([{ transactionId: rollbackId, outcome: 'settled' }]);
+    expect(attempts).toEqual([
+      { transactionId: rollbackId, correlationId: CORRELATION_ID, outcome: 'settled' },
+    ]);
     expect(await transactionRow(rollbackId)).toMatchObject({ status: 'PROCESSED' });
     expect(await walletRow(walletId)).toEqual({ balance: '500.00', version: 3 });
   });
@@ -659,7 +667,9 @@ describe('pending-reference-failure-classes', () => {
     );
 
     expect(failures).toBe(1);
-    expect(attempts).toEqual([{ transactionId: rollbackId, outcome: 'retried' }]);
+    expect(attempts).toEqual([
+      { transactionId: rollbackId, correlationId: CORRELATION_ID, outcome: 'retried' },
+    ]);
     expect(await transactionRow(rollbackId)).toMatchObject({
       status: 'PENDING_REFERENCE',
       failure_code: null,
@@ -671,11 +681,14 @@ describe('pending-reference-failure-classes', () => {
     const after = await scheduleRow(rollbackId);
     expect(after?.attempts).toBe(1);
     expect(moment(after?.expires_at)).toBe(moment(before?.expires_at));
-    expect(records).toEqual([]);
+    expect(log.at('error')).toEqual([]);
+    // `obs.metrics`: the attempt counted by what it ended in, and as a retry of this component.
+    expect(await metrics.total('wager_pending_reference_total', { outcome: 'retried' })).toBe(1);
+    expect(await metrics.total('wager_retries_total', { component: 'pending-reference' })).toBe(1);
 
     // The attempt after it applies the transaction: transient failures are never limited.
     expect(await sweepAt(new Date(Date.now() + 10 * MINUTE))).toEqual([
-      { transactionId: rollbackId, outcome: 'settled' },
+      { transactionId: rollbackId, correlationId: CORRELATION_ID, outcome: 'settled' },
     ]);
     expect(await walletRow(walletId)).toEqual({ balance: '500.00', version: 3 });
   });
@@ -694,7 +707,14 @@ describe('pending-reference-failure-classes', () => {
       }),
     );
 
-    expect(attempts).toEqual([{ transactionId: rollbackId, outcome: 'failed' }]);
+    expect(attempts).toEqual([
+      { transactionId: rollbackId, correlationId: CORRELATION_ID, outcome: 'failed' },
+    ]);
+    // `obs.metrics`: the attempt by its outcome, and the terminal outcome it recorded (OBS-003).
+    expect(await metrics.total('wager_pending_reference_total', { outcome: 'failed' })).toBe(1);
+    expect(
+      await metrics.total('wager_transactions_total', { kind: 'ROLLBACK', status: 'FAILED' }),
+    ).toBe(1);
     expect(await transactionRow(rollbackId)).toMatchObject({
       status: 'FAILED',
       failure_code: 'PROCESSING_FAILED',
@@ -704,8 +724,12 @@ describe('pending-reference-failure-classes', () => {
     expect(await walletRow(walletId)).toEqual({ balance: '460.00', version: 2 });
     expect(await ledgerKinds(walletId)).toEqual(['OPENING CREDIT 500.00', 'BET DEBIT 40.00']);
     expect(await eventTypesOf(rollbackId)).toEqual(['WagerTransactionPendingReference']);
-    expect(records).toHaveLength(1);
-    expect(records[0]?.fields).toMatchObject({ transactionId: rollbackId, attempts: 0 });
+    expect(log.at('error')).toHaveLength(1);
+    expect(log.at('error')[0]?.fields).toMatchObject({
+      correlationId: CORRELATION_ID,
+      transactionId: rollbackId,
+      attempts: 0,
+    });
 
     // `tx.failed-semantics`: a FAILED transaction is auditable, and its replay is a 500 carrying
     // the outcome the read endpoint serves.

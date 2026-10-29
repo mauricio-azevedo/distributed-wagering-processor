@@ -55,10 +55,11 @@ export class ReconcileWallet {
 
     if (!report.consistent) {
       /*
-       * The record an operator acts on: the wallet, how far off it is and over how many entries,
-       * which is the one place an amount is allowed into a log line (`obs.no-sensitive-data`).
+       * The record an operator acts on: the wallet, how far off it is and over how many entries.
+       * `divergence` is the one method of the port that carries an amount, which is what makes this
+       * line the single documented exception rather than a habit (`obs.no-sensitive-data`).
        */
-      this.dependencies.logger.error('the stored balance of a wallet diverges from its ledger', {
+      this.dependencies.logger.divergence('recon.balance-diverged', {
         walletId: report.walletId,
         difference: report.difference.toString(),
         checkedEntries: report.checkedEntries,
@@ -102,10 +103,10 @@ export class ReconcileWallet {
       });
     } catch (error) {
       if (error instanceof DomainError) {
-        this.dependencies.logger.error(
-          'the stored state of a wallet is not money the service can reason about',
-          { walletId, reason: error.message },
-        );
+        this.dependencies.logger.divergence('recon.stored-state-not-money', {
+          walletId,
+          reason: error.message,
+        });
         this.dependencies.metrics.increment('wager_reconciliation_divergence_total');
       }
 

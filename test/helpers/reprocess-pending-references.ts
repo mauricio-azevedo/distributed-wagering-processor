@@ -19,6 +19,8 @@ import { ReprocessPendingReference } from '../../src/application/use-cases/repro
 import { systemClock } from '../../src/infrastructure/clock';
 import { loadEnv } from '../../src/infrastructure/config/env';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
+import { jsonLinesLogger } from '../../src/infrastructure/observability/logger';
+import { uncountedMetrics } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
 
@@ -70,11 +72,8 @@ try {
       options.holdMs === undefined ? unitOfWork : holdingClaims(unitOfWork, options.holdMs),
     clock: systemClock,
     ids: uuidV7IdGenerator,
-    logger: {
-      error: (event, fields) => {
-        process.stderr.write(`${event} ${JSON.stringify(fields)}\n`);
-      },
-    },
+    logger: jsonLinesLogger('reprocess-pending-references', process.stderr),
+    metrics: uncountedMetrics,
     ...(options.holdMs === undefined ? {} : { sweepSize: 1 }),
   });
 

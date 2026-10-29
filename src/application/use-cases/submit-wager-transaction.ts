@@ -19,6 +19,8 @@ import { ApplyWagerOperation, type AppliedWagerOperation } from '../apply-wager-
 import { InboxPayloadConflictError, WalletNotFoundError, idempotencyConflict } from '../errors';
 import type { Clock } from '../ports/clock';
 import type { IdGenerator } from '../ports/id-generator';
+import type { Logger } from '../ports/logger';
+import type { Metrics } from '../ports/metrics';
 import type { Repositories, UnitOfWork } from '../ports/unit-of-work';
 
 /**
@@ -80,6 +82,8 @@ export interface SubmitWagerTransactionDependencies {
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly sha256Hex: Sha256Hex;
+  readonly logger: Logger;
+  readonly metrics: Metrics;
 }
 
 /** What one submission is prepared as before its transaction opens (`prepare`). */
@@ -127,6 +131,10 @@ interface PreparedSubmission {
  * No network call happens while the lock is held, and nothing in the path reads a clock or mints an
  * id after the transaction opened its first statement, so the window the lock covers is the
  * database work alone.
+ *
+ * What one submission reports — the line an operator follows it by and the counter its outcome
+ * belongs to — is written after the commit and from here rather than from the entry points, so the
+ * record of an operation is the same whichever way it arrived (`obs.structured-logs`, `obs.metrics`).
  */
 export class SubmitWagerTransaction {
   private readonly operations: ApplyWagerOperation;
@@ -138,10 +146,13 @@ export class SubmitWagerTransaction {
   /** The HTTP entry point: one submission, in one transaction of its own. */
   async execute(command: SubmitWagerTransactionCommand): Promise<SubmissionOutcome> {
     const prepared = this.prepare(command);
-
-    return this.dependencies.unitOfWork.transactional((repositories) =>
+    const outcome = await this.dependencies.unitOfWork.transactional((repositories) =>
       this.apply(repositories, prepared),
     );
+
+    this.report(outcome, prepared.correlationId);
+
+    return outcome;
   }
 
   /**
@@ -172,23 +183,86 @@ export class SubmitWagerTransaction {
       receivedAt: prepared.receivedAt,
     });
 
-    return this.dependencies.unitOfWork.transactional(async (repositories) => {
-      const claim = await repositories.inbox.claim(received);
+    const delivered = await this.dependencies.unitOfWork.transactional(
+      async (repositories): Promise<DeliveryOutcome> => {
+        const claim = await repositories.inbox.claim(received);
 
-      if (!claim.claimed) {
-        if (!claim.stored.matchesPayload(received.payloadHash)) {
-          throw new InboxPayloadConflictError(delivery.consumerName, delivery.messageId);
+        if (!claim.claimed) {
+          if (!claim.stored.matchesPayload(received.payloadHash)) {
+            /*
+             * Counted before the rollback and not after it, because this is where the reuse is
+             * recognised: the claim read a row holding this message id under other content, which no
+             * caller of `deliver` can see from the refusal alone (`msg.inbox-payload-conflict`).
+             */
+            this.dependencies.metrics.increment('wager_duplicates_detected_total', {
+              source: 'inbox-conflict',
+            });
+
+            throw new InboxPayloadConflictError(delivery.consumerName, delivery.messageId);
+          }
+
+          return { absorbed: true };
         }
 
-        return { absorbed: true };
-      }
+        const outcome = await this.apply(repositories, prepared);
 
-      const outcome = await this.apply(repositories, prepared);
+        received.markProcessed(prepared.receivedAt);
+        await repositories.inbox.complete(received);
 
-      received.markProcessed(prepared.receivedAt);
-      await repositories.inbox.complete(received);
+        return { absorbed: false, ...outcome };
+      },
+    );
 
-      return { absorbed: false, ...outcome };
+    if (delivered.absorbed) {
+      this.dependencies.metrics.increment('wager_duplicates_detected_total', { source: 'inbox' });
+      this.dependencies.logger.info('wager.delivery.absorbed', {
+        correlationId: command.correlationId,
+        messageId: delivery.messageId,
+      });
+
+      return delivered;
+    }
+
+    this.report(delivered, prepared.correlationId);
+
+    return delivered;
+  }
+
+  /**
+   * What one committed submission reports: the line an operator follows the operation by and the
+   * counter the outcome belongs to (`obs.structured-logs`, `obs.metrics`).
+   *
+   * It runs after the commit and never inside it, so nothing is reported for work that rolled back,
+   * and it is here rather than in the two entry points so that the record of an operation is the
+   * same whichever way it arrived (`msg.same-use-case`). No amount and no balance reaches it; the
+   * identity fields are what a line is searched by (`obs.no-sensitive-data`).
+   */
+  private report(outcome: SubmissionOutcome, correlationId: string): void {
+    const transaction = outcome.transaction;
+
+    if (outcome.idempotentReplay) {
+      this.dependencies.metrics.increment('wager_duplicates_detected_total', {
+        source: 'idempotency',
+      });
+    } else if (transaction.status !== 'PENDING') {
+      // One recorded outcome, which is what the counter counts: a transaction parked now and
+      // settled later is counted under both of the statuses it reached (`obs.metrics`).
+      this.dependencies.metrics.increment('wager_transactions_total', {
+        kind: transaction.kind,
+        status: transaction.status,
+      });
+    }
+
+    this.dependencies.logger.info('wager.transaction.recorded', {
+      correlationId,
+      transactionId: transaction.id,
+      walletId: transaction.walletId,
+      providerId: transaction.providerId,
+      externalTransactionId: transaction.externalTransactionId,
+      kind: transaction.kind,
+      status: transaction.status,
+      failureCode: transaction.failureCode,
+      idempotentReplay: outcome.idempotentReplay,
     });
   }
 
@@ -266,7 +340,7 @@ export class SubmitWagerTransaction {
 
     await this.operations.park(repositories, operation);
 
-    const schedule = PendingReferenceSchedule.open(submission);
+    const schedule = PendingReferenceSchedule.open(submission, correlationId);
 
     await repositories.pendingReferences.insert(schedule);
     await this.operations.enqueue(repositories, [

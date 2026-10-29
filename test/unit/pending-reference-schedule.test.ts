@@ -9,6 +9,7 @@ const TRANSACTION_ID = '01a18268-f900-758e-8c3e-13ce27511119';
 const WALLET_ID = '01a18261-a600-7589-8768-3d958460eced';
 const PLAYER_ID = '01a17cb1-f5c0-7588-9a61-47a9444c049e';
 const RECEIVED_AT = new Date('2026-10-28T12:08:00.000Z');
+const CORRELATION_ID = '01a18266-39e0-7597-812c-a89950b9acf2';
 
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
@@ -35,7 +36,8 @@ function parked(): WagerTransaction {
   return transaction;
 }
 
-const openSchedule = (): PendingReferenceSchedule => PendingReferenceSchedule.open(parked());
+const openSchedule = (): PendingReferenceSchedule =>
+  PendingReferenceSchedule.open(parked(), CORRELATION_ID);
 
 describe('pending-reference-backoff', () => {
   test('a parked transaction is first attempted one second after it was received', () => {
@@ -44,6 +46,15 @@ describe('pending-reference-backoff', () => {
     expect(schedule.transactionId).toBe(TRANSACTION_ID);
     expect(schedule.attempts).toBe(0);
     expect(schedule.nextAttemptAt).toEqual(new Date(RECEIVED_AT.getTime() + SECOND));
+  });
+
+  /**
+   * `obs.correlation-propagation` (OBS-005): the row carries the correlation id of the arrival that
+   * parked the transaction, which is what lets an attempt an hour later be found under the id of
+   * the request or the message that created the work.
+   */
+  test('the row carries the correlation id of the arrival that parked the transaction', () => {
+    expect(openSchedule().correlationId).toBe(CORRELATION_ID);
   });
 
   /**
@@ -109,12 +120,15 @@ describe('pending-reference-schedule-identity', () => {
       referenceTransactionId: '01a18266-39e0-758b-a289-fb48c2dd9c8b',
     });
 
-    expect(() => PendingReferenceSchedule.open(transaction)).toThrow(InvalidTransactionStateError);
+    expect(() => PendingReferenceSchedule.open(transaction, CORRELATION_ID)).toThrow(
+      InvalidTransactionStateError,
+    );
   });
 
   test('a stored row is rebuilt as it stands, without replaying the backoff', () => {
     const state = {
       transactionId: TRANSACTION_ID,
+      correlationId: CORRELATION_ID,
       attempts: 4,
       nextAttemptAt: new Date(RECEIVED_AT.getTime() + 2 * MINUTE),
       expiresAt: new Date(RECEIVED_AT.getTime() + 60 * MINUTE),
@@ -122,6 +136,7 @@ describe('pending-reference-schedule-identity', () => {
 
     const schedule = PendingReferenceSchedule.rehydrate(state);
 
+    expect(schedule.correlationId).toBe(CORRELATION_ID);
     expect(schedule.attempts).toBe(4);
     expect(schedule.nextAttemptAt).toEqual(state.nextAttemptAt);
     expect(schedule.expiresAt).toEqual(state.expiresAt);

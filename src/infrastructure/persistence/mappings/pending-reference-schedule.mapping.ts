@@ -9,10 +9,13 @@ import { PendingReferenceSchedule } from '../../../domain/pending-reference-sche
  * `transactionId` is both the primary key and the foreign key, so a schedule cannot exist without
  * its transaction and a transaction cannot be in the claim list twice. The row holds no copy of the
  * transaction's state: whether it is still waiting is the `status` of the transaction row, which is
- * what the claim query reads (`tx.row-append-only`).
+ * what the claim query reads (`tx.row-append-only`). `correlationId` is not state either: it is
+ * the arrival that created the work, so that every attempt is searchable under it
+ * (`obs.correlation-propagation`).
  */
 export class PendingReferenceScheduleRow {
   transactionId!: string;
+  correlationId!: string;
   attempts!: number;
   nextAttemptAt!: Date;
   expiresAt!: Date;
@@ -23,6 +26,7 @@ export const pendingReferenceScheduleSchema = new EntitySchema<PendingReferenceS
   tableName: 'pending_reference_schedule',
   properties: {
     transactionId: { type: 'uuid', primary: true },
+    correlationId: { type: 'string', length: 128 },
     attempts: { type: 'integer' },
     nextAttemptAt: { type: 'datetime' },
     expiresAt: { type: 'datetime' },
@@ -37,6 +41,7 @@ export const pendingReferenceScheduleSchema = new EntitySchema<PendingReferenceS
  */
 export interface ClaimedPendingReferenceScheduleRow {
   readonly transactionId: string;
+  readonly correlationId: string;
   readonly attempts: number | string;
   readonly nextAttemptAt: Date | string;
   readonly expiresAt: Date | string;
@@ -48,6 +53,7 @@ export function toPendingReferenceSchedule(
 ): PendingReferenceSchedule {
   return PendingReferenceSchedule.rehydrate({
     transactionId: row.transactionId,
+    correlationId: row.correlationId,
     attempts: Number(row.attempts),
     nextAttemptAt: new Date(row.nextAttemptAt),
     expiresAt: new Date(row.expiresAt),
@@ -59,6 +65,7 @@ export function toPendingReferenceScheduleRow(
 ): PendingReferenceScheduleRow {
   const row = new PendingReferenceScheduleRow();
   row.transactionId = schedule.transactionId;
+  row.correlationId = schedule.correlationId;
   row.attempts = schedule.attempts;
   row.nextAttemptAt = schedule.nextAttemptAt;
   row.expiresAt = schedule.expiresAt;

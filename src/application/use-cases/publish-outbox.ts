@@ -2,6 +2,7 @@ import type { OutboxMessage } from '../../domain/outbox-message';
 import type { Clock } from '../ports/clock';
 import type { EventPublisher } from '../ports/event-publisher';
 import type { Logger } from '../ports/logger';
+import type { Metrics } from '../ports/metrics';
 import type { Repositories, UnitOfWork } from '../ports/unit-of-work';
 
 /**
@@ -24,6 +25,7 @@ export interface PublishOutboxDependencies {
   readonly publisher: EventPublisher;
   readonly clock: Clock;
   readonly logger: Logger;
+  readonly metrics: Metrics;
   readonly batchSize?: number;
 }
 
@@ -86,6 +88,7 @@ export class PublishOutbox {
     } catch (error) {
       message.scheduleRetry(this.dependencies.clock.now());
       await repositories.outbox.recordAttempt(message);
+      this.dependencies.metrics.increment('wager_retries_total', { component: 'outbox' });
       this.reportIfStalled(message, error);
 
       return false;
@@ -93,8 +96,30 @@ export class PublishOutbox {
 
     message.markPublished(this.dependencies.clock.now());
     await repositories.outbox.recordAttempt(message);
+    this.report(message);
 
     return true;
+  }
+
+  /**
+   * The line that closes the trail of an operation: the event the broker took, under the
+   * correlation id the envelope was enqueued with, which is the id of the request or the message
+   * that produced the fact however much later this cycle runs (`obs.correlation-propagation`,
+   * OBS-005). The envelope is the source of that id and not anything this process knows, so a
+   * publisher instance that never saw the operation still reports it under its own identity.
+   *
+   * It says the broker accepted the message, which is what happened; the commit that records it
+   * may still be lost, and that window is one more copy of the same message rather than a line
+   * that was not true (`outbox.duplicate-safe`).
+   */
+  private report(message: OutboxMessage): void {
+    this.dependencies.logger.info('outbox.published', {
+      correlationId: message.payload.correlationId,
+      eventId: message.eventId,
+      eventType: message.eventType,
+      aggregateId: message.aggregateId,
+      attempts: message.attempts,
+    });
   }
 
   /**

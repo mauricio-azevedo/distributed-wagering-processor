@@ -31,6 +31,7 @@ import {
  * in the order it was parked rather than by whichever row the planner reaches.
  */
 const CLAIM_NEXT_DUE = `select "s"."transaction_id" as "transactionId",
+                               "s"."correlation_id" as "correlationId",
                                "s"."attempts",
                                "s"."next_attempt_at" as "nextAttemptAt",
                                "s"."expires_at" as "expiresAt"
@@ -59,7 +60,8 @@ export class MikroOrmPendingReferenceScheduleRepository implements PendingRefere
 
   /**
    * The two columns an attempt changes, and no others: the window a row was opened with is never
-   * rewritten (`ref.ttl`), and the transaction it belongs to is not this row's to name.
+   * rewritten (`ref.ttl`), the correlation id of the arrival that created the work is never
+   * rewritten either, and the transaction it belongs to is not this row's to name.
    *
    * No row updated means the schedule this is the attempt of is gone, which nothing can do — the
    * runtime role cannot delete it — so it is raised rather than reported.

@@ -20,6 +20,8 @@ import { systemClock } from '../../src/infrastructure/clock';
 import { type Env, loadEnv } from '../../src/infrastructure/config/env';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
+import { jsonLinesLogger } from '../../src/infrastructure/observability/logger';
+import { uncountedMetrics } from '../../src/infrastructure/observability/metrics';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
 
 export const wagerCommandSchema = z.object({
@@ -65,6 +67,10 @@ export function submitterOf(orm: MikroORM, env: Env): SubmitWagerTransaction {
     clock: systemClock,
     ids: uuidV7IdGenerator,
     sha256Hex,
+    // A helper process writes its lines to stderr, so a suite reading its stdout reads the outcome
+    // alone, and counts nothing: the registry a metric is asserted on is the service's own.
+    logger: jsonLinesLogger('wager-command', process.stderr),
+    metrics: uncountedMetrics,
   });
 }
 

@@ -32,7 +32,8 @@ import {
   WAGER_TRANSACTIONS_CONSUMER,
   WagerTransactionsConsumer,
 } from '../../src/infrastructure/messaging/wager-transactions.consumer';
-import { CounterRegistry } from '../../src/infrastructure/observability/metrics';
+import { jsonLinesLogger } from '../../src/infrastructure/observability/logger';
+import { MetricsRegistry, uncountedMetrics } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
 
@@ -68,11 +69,11 @@ try {
       clock: systemClock,
       ids: uuidV7IdGenerator,
       sha256Hex,
+      logger: jsonLinesLogger('consume-message', process.stderr),
+      metrics: uncountedMetrics,
     }),
-    metrics: new CounterRegistry(),
-    logger: {
-      error: (event, fields) => process.stderr.write(`${event} ${JSON.stringify(fields)}\n`),
-    },
+    metrics: new MetricsRegistry(),
+    logger: jsonLinesLogger('consume-message', process.stderr),
     consumerName: WAGER_TRANSACTIONS_CONSUMER,
     waitTimeSeconds: 5,
     visibilityTimeoutSeconds: env.SQS_VISIBILITY_TIMEOUT_SECONDS,

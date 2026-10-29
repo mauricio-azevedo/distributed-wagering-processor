@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 
 import { AppModule } from '../../src/app.module';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
-import { CounterRegistry } from '../../src/infrastructure/observability/metrics';
+import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
@@ -342,8 +342,8 @@ describe('reconciliation-endpoint', () => {
   test('a diverged wallet answers 200 with consistent false, the signed difference and one divergence counted', async () => {
     const created = await openWallet(brl('500.00'));
     const walletId = String(created.body.id);
-    const counters = app.get(CounterRegistry);
-    const counted = counters.total('wager_reconciliation_divergence_total');
+    const counters = app.get(MetricsRegistry);
+    const counted = await counters.total('wager_reconciliation_divergence_total');
     await divergeStoredBalance(walletId, '460.00');
 
     const answer = await request('POST', `/wallets/${walletId}/reconciliation`);
@@ -356,7 +356,7 @@ describe('reconciliation-endpoint', () => {
       consistent: false,
       checkedEntries: 1,
     });
-    expect(counters.total('wager_reconciliation_divergence_total')).toBe(counted + 1);
+    expect(await counters.total('wager_reconciliation_divergence_total')).toBe(counted + 1);
 
     // Reported, never repaired: the wallet is still as divergent as the report said it was.
     const unchanged = await request('GET', `/wallets/${walletId}`);

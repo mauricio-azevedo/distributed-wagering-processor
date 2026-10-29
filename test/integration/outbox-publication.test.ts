@@ -4,7 +4,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 
 import type { Clock } from '../../src/application/ports/clock';
 import type { EventPublisher } from '../../src/application/ports/event-publisher';
-import type { LogFields, Logger } from '../../src/application/ports/logger';
+import type { Logger } from '../../src/application/ports/logger';
+import type { Metrics } from '../../src/application/ports/metrics';
 import type { Repositories, UnitOfWork } from '../../src/application/ports/unit-of-work';
 import { PublishOutbox } from '../../src/application/use-cases/publish-outbox';
 import {
@@ -18,9 +19,12 @@ import { OutboxMessage } from '../../src/domain/outbox-message';
 import { type LedgerOperation, WalletLedgerEntry } from '../../src/domain/wallet-ledger-entry';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event-publisher';
+import { silentLogger } from '../../src/infrastructure/observability/logger';
+import { uncountedMetrics } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
 import { EventsQueue } from '../helpers/events-queue';
+import { recordingLogger } from '../helpers/recording-logger';
 import { ReferenceConsumer } from '../helpers/reference-consumer';
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
@@ -223,15 +227,6 @@ function movableClock(start: Date) {
   };
 }
 
-function recordingLogger() {
-  const records: { readonly event: string; readonly fields: LogFields }[] = [];
-
-  return {
-    records,
-    logger: { error: (event, fields) => records.push({ event, fields }) } satisfies Logger,
-  };
-}
-
 /** The real adapter, against LocalStack. */
 const sqsPublisher = (): SqsEventPublisher =>
   new SqsEventPublisher(
@@ -290,6 +285,7 @@ function publisherOver(
     readonly publisher?: EventPublisher;
     readonly clock?: Clock;
     readonly logger?: Logger;
+    readonly metrics?: Metrics;
     readonly unitOfWork?: UnitOfWork;
     readonly batchSize?: number;
   } = {},
@@ -298,7 +294,8 @@ function publisherOver(
     unitOfWork: options.unitOfWork ?? unitOfWork,
     publisher: options.publisher ?? sqsPublisher(),
     clock: options.clock ?? { now: () => PUBLISHED_AT },
-    logger: options.logger ?? { error: () => undefined },
+    logger: options.logger ?? silentLogger,
+    metrics: options.metrics ?? uncountedMetrics,
     ...(options.batchSize !== undefined && { batchSize: options.batchSize }),
   });
 }

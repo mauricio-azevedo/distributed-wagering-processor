@@ -4,6 +4,13 @@ import type { WagerTransaction } from './wager-transaction';
 /** A `pending_reference_schedule` row as the database holds it (ADR 0011). */
 export interface PendingReferenceScheduleState {
   readonly transactionId: string;
+  /**
+   * `obs.correlation-propagation`: the correlation id of the arrival that parked the transaction.
+   * It is stored because the work outlives what created it — an attempt runs minutes or an hour
+   * later, in another process — and an operator following one operation has to reach the attempts
+   * and their events under the id of the request or the message that caused them (OBS-005).
+   */
+  readonly correlationId: string;
   readonly attempts: number;
   readonly nextAttemptAt: Date;
   readonly expiresAt: Date;
@@ -38,6 +45,7 @@ const SECONDS_PER_MINUTE = 60;
  */
 export class PendingReferenceSchedule implements PendingReferenceScheduleState {
   readonly transactionId: string;
+  readonly correlationId: string;
   readonly expiresAt: Date;
 
   /** Behind getters, so `recordAttempt` is the only thing that moves the schedule. */
@@ -46,6 +54,7 @@ export class PendingReferenceSchedule implements PendingReferenceScheduleState {
 
   private constructor(state: PendingReferenceScheduleState) {
     this.transactionId = state.transactionId;
+    this.correlationId = state.correlationId;
     this.expiresAt = state.expiresAt;
     this.#attempts = state.attempts;
     this.#nextAttemptAt = state.nextAttemptAt;
@@ -59,9 +68,12 @@ export class PendingReferenceSchedule implements PendingReferenceScheduleState {
    *
    * It takes the transaction rather than the two values so that a schedule cannot be opened for a
    * transaction that is not waiting for anything: a row in any other status would be claimed,
-   * reprocessed and, after an hour, rejected for a reference nobody is waiting for.
+   * reprocessed and, after an hour, rejected for a reference nobody is waiting for. The correlation
+   * id comes beside it because it is a fact of the arrival and not of the transaction: the same
+   * operation reaching the service twice is one transaction and two correlation ids, and the one
+   * recorded here is the arrival that created the waiting work (`obs.correlation-propagation`).
    */
-  static open(transaction: WagerTransaction): PendingReferenceSchedule {
+  static open(transaction: WagerTransaction, correlationId: string): PendingReferenceSchedule {
     if (transaction.status !== 'PENDING_REFERENCE') {
       throw new InvalidTransactionStateError(
         `transaction ${transaction.id} is ${transaction.status}, so it waits for no reference and has nothing to schedule`,
@@ -72,6 +84,7 @@ export class PendingReferenceSchedule implements PendingReferenceScheduleState {
 
     return new PendingReferenceSchedule({
       transactionId: transaction.id,
+      correlationId,
       attempts: 0,
       nextAttemptAt: new Date(receivedAt + FIRST_BACKOFF_SECONDS * MILLISECONDS_PER_SECOND),
       expiresAt: new Date(

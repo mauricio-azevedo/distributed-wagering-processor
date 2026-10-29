@@ -11,6 +11,8 @@ import {
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import { systemClock } from '../../src/infrastructure/clock';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
+import { silentLogger } from '../../src/infrastructure/observability/logger';
+import { uncountedMetrics } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
 import type { SubmissionReport, WagerCommand } from '../helpers/wager-command';
@@ -138,8 +140,8 @@ beforeAll(async () => {
   reconcileWallet = new ReconcileWallet({
     unitOfWork: new MikroOrmUnitOfWork(runtime.em, LOCK_CEILING_MS),
     clock: systemClock,
-    logger: { error: () => undefined },
-    metrics: { increment: () => undefined },
+    logger: silentLogger,
+    metrics: uncountedMetrics,
   });
   instances = await Instances.start(INSTANCES);
 });

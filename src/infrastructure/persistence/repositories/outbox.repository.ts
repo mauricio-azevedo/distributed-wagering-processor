@@ -1,6 +1,10 @@
 import type { EntityManager, QueryResult } from '@mikro-orm/postgresql';
 
-import type { OutboxClaim, OutboxRepository } from '../../../application/ports/repositories';
+import type {
+  OutboxBacklog,
+  OutboxClaim,
+  OutboxRepository,
+} from '../../../application/ports/repositories';
 import type {
   IntegrationEventEnvelope,
   IntegrationEventType,
@@ -43,6 +47,22 @@ const CLAIM_PENDING = `select "event_id" as "eventId",
                         order by "occurred_at", "event_id"
                         limit ?
                           for update skip locked`;
+
+/**
+ * `outbox.lag-metrics`: the backlog as one aggregate over the same predicate the claim uses, minus
+ * the due condition — a row that is backing off is still unpublished, and an operator alerting on
+ * the backlog has to see it (OUTBOX-008). No locking clause: measuring must not wait on the
+ * publisher it measures, and the index the claim already needs serves this scan too.
+ */
+const BACKLOG = `select count(*) as "pending", min("occurred_at") as "oldestOccurredAt"
+                   from "outbox_messages"
+                  where "published_at" is null`;
+
+/** What `BACKLOG` answers: a count the driver renders as text, and a moment or no row at all. */
+interface BacklogColumns {
+  readonly pending: number | string;
+  readonly oldestOccurredAt: Date | string | null;
+}
 
 /** The columns `CLAIM_PENDING` reads: a pending row, so `published_at` is known to be null. */
 interface ClaimedColumns {
@@ -120,5 +140,22 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
         `recording the publication attempt of event ${message.eventId} matched no outbox row, so the row this publisher claimed is gone`,
       );
     }
+  }
+
+  /**
+   * The backlog. `count` arrives as a string from PostgreSQL's `bigint` and the aggregate is read
+   * through the mapping that turns both columns into the values the use case reasons about, the
+   * same way a claimed row's timestamps are (ADR 0008).
+   */
+  async backlog(): Promise<OutboxBacklog> {
+    const [row] = await this.em.execute<BacklogColumns[]>(BACKLOG);
+
+    return {
+      pending: Number(row?.pending ?? 0),
+      oldestOccurredAt:
+        row?.oldestOccurredAt === undefined || row.oldestOccurredAt === null
+          ? null
+          : new Date(row.oldestOccurredAt),
+    };
   }
 }

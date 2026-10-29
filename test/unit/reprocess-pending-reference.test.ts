@@ -3,7 +3,6 @@ import { describe, expect, test } from 'bun:test';
 import { ServiceUnavailableError, WalletNotFoundError } from '../../src/application/errors';
 import type { Clock } from '../../src/application/ports/clock';
 import type { IdGenerator } from '../../src/application/ports/id-generator';
-import type { LogFields, Logger } from '../../src/application/ports/logger';
 import type { Repositories, UnitOfWork } from '../../src/application/ports/unit-of-work';
 import { ReprocessPendingReference } from '../../src/application/use-cases/reprocess-pending-reference';
 import type { IntegrationEventType } from '../../src/domain/integration-events';
@@ -13,6 +12,8 @@ import {
   type PendingReferenceScheduleState,
 } from '../../src/domain/pending-reference-schedule';
 import { WagerTransaction, type WagerTransactionState } from '../../src/domain/wager-transaction';
+import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
+import { recordingLogger } from '../helpers/recording-logger';
 import { Wallet, type WalletState } from '../../src/domain/wallet';
 import type { WalletLedgerEntry } from '../../src/domain/wallet-ledger-entry';
 import type { OutboxMessage } from '../../src/domain/outbox-message';
@@ -23,6 +24,7 @@ const PROVIDER_ID = 'provider-acme';
 const ROUND_ID = 'round-7f3a';
 const BET_ID = '01a18266-39e0-758b-a289-fb48c2dd9c8b';
 const ROLLBACK_ID = '01a18268-f900-758e-8c3e-13ce27511119';
+const CORRELATION_ID = '01a18266-39e0-7597-812c-a89950b9acf2';
 
 const OPENED_AT = new Date('2026-10-28T12:00:00.000Z');
 /** When the reversal arrived, which is what its waiting window is counted from (`ref.ttl`). */
@@ -68,6 +70,7 @@ const transactionStateOf = (transaction: WagerTransaction): WagerTransactionStat
 
 const scheduleStateOf = (schedule: PendingReferenceSchedule): PendingReferenceScheduleState => ({
   transactionId: schedule.transactionId,
+  correlationId: schedule.correlationId,
   attempts: schedule.attempts,
   nextAttemptAt: schedule.nextAttemptAt,
   expiresAt: schedule.expiresAt,
@@ -158,7 +161,7 @@ function storeOf(fixture: Fixture): Store {
 
   for (const transaction of parked) {
     store.transactions.set(transaction.id, transactionStateOf(transaction));
-    const schedule = PendingReferenceSchedule.open(transaction);
+    const schedule = PendingReferenceSchedule.open(transaction, CORRELATION_ID);
     store.schedules.set(schedule.transactionId, scheduleStateOf(schedule));
   }
 
@@ -317,6 +320,7 @@ function repositoriesOver(
       findByEventId: unreachable('outbox lookup'),
       claimPending: unreachable('outbox claim'),
       recordAttempt: unreachable('publication attempt'),
+      backlog: unreachable('outbox backlog'),
     },
     pendingReferences: {
       insert: (schedule) => {
@@ -350,11 +354,6 @@ function repositoriesOver(
   };
 }
 
-interface LogRecord {
-  readonly event: string;
-  readonly fields: LogFields;
-}
-
 /** `id-1`, `id-2`, ...: the mint, so a test can name every id the attempt wrote. */
 function sequencedIds(): IdGenerator {
   let minted = 0;
@@ -371,26 +370,30 @@ function sequencedIds(): IdGenerator {
 function reprocessPendingReference(fixture: Fixture = {}, startedAt: Date = ATTEMPTED_AT) {
   const store = storeOf(fixture);
   const calls: string[] = [];
-  const records: LogRecord[] = [];
+  const log = recordingLogger();
+  const metrics = new MetricsRegistry();
   let now = startedAt;
   const clock: Clock = { now: () => now };
-  const logger: Logger = {
-    error: (event, fields) => {
-      records.push({ event, fields });
-    },
-  };
   const useCase = new ReprocessPendingReference({
     unitOfWork: fakeUnitOfWork(store, calls, fixture.intercept ?? (() => undefined)),
     clock,
     ids: sequencedIds(),
-    logger,
+    logger: log.logger,
+    metrics,
   });
 
   const advanceBy = (seconds: number) => {
     now = new Date(now.getTime() + seconds * SECOND);
   };
 
-  return { execute: () => useCase.execute(), advanceBy, store, calls, records };
+  return {
+    execute: () => useCase.execute(),
+    advanceBy,
+    store,
+    calls,
+    metrics,
+    log,
+  };
 }
 
 const eventTypes = (store: Store): IntegrationEventType[] =>
@@ -442,7 +445,9 @@ describe('rollback-before-bet-resolves', () => {
 
     const attempts = await execute();
 
-    expect(attempts).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'settled' }]);
+    expect(attempts).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'settled' },
+    ]);
     expect(parkedTransaction(store)).toMatchObject({
       status: 'PROCESSED',
       failureCode: null,
@@ -487,7 +492,9 @@ describe('rollback-before-bet-resolves', () => {
 
     const attempts = await execute();
 
-    expect(attempts).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'settled' }]);
+    expect(attempts).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'settled' },
+    ]);
     expect(parkedTransaction(store)).toMatchObject({
       status: 'REJECTED',
       failureCode: 'REFERENCE_ALREADY_REVERSED',
@@ -503,7 +510,9 @@ describe('pending-reference-stays-parked', () => {
 
     const attempts = await execute();
 
-    expect(attempts).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'pending' }]);
+    expect(attempts).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'pending' },
+    ]);
     expect(parkedTransaction(store)).toMatchObject({
       status: 'PENDING_REFERENCE',
       failureCode: null,
@@ -531,7 +540,9 @@ describe('pending-reference-expires', () => {
 
     const attempts = await execute();
 
-    expect(attempts).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'expired' }]);
+    expect(attempts).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'expired' },
+    ]);
     expect(parkedTransaction(store)).toMatchObject({
       status: 'REJECTED',
       failureCode: 'REFERENCE_NOT_FOUND',
@@ -569,7 +580,9 @@ describe('pending-reference-expires', () => {
 
     const attempts = await execute();
 
-    expect(attempts).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'settled' }]);
+    expect(attempts).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'settled' },
+    ]);
     expect(parkedTransaction(store)?.status).toBe('PROCESSED');
   });
 });
@@ -579,7 +592,7 @@ describe('pending-reference-failure-classes', () => {
   const unavailable = () => new ServiceUnavailableError('the database is unavailable', 5);
 
   test('a transient failure records no outcome and only reschedules the attempt', async () => {
-    const { execute, store } = reprocessPendingReference({
+    const { execute, store, metrics } = reprocessPendingReference({
       referenceArrived: true,
       intercept: (call) => {
         if (call === 'record PROCESSED') {
@@ -590,7 +603,14 @@ describe('pending-reference-failure-classes', () => {
 
     const attempts = await execute();
 
-    expect(attempts).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'retried' }]);
+    expect(attempts).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'retried' },
+    ]);
+    // `obs.metrics`: the attempt is counted by what it ended in, and a transient failure is also a
+    // retry of this component, which is what separates an outage from a reference that has not
+    // arrived (OBS-003).
+    expect(await metrics.total('wager_pending_reference_total', { outcome: 'retried' })).toBe(1);
+    expect(await metrics.total('wager_retries_total', { component: 'pending-reference' })).toBe(1);
     expect(parkedTransaction(store)?.status).toBe('PENDING_REFERENCE');
     expect(store.wallets.get(WALLET_ID)).toEqual(WALLET);
     expect(store.entries).toEqual([]);
@@ -613,7 +633,9 @@ describe('pending-reference-failure-classes', () => {
     });
 
     for (let sweep = 0; sweep < 5; sweep += 1) {
-      expect(await execute()).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'retried' }]);
+      expect(await execute()).toEqual([
+        { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'retried' },
+      ]);
       advanceBy(300);
     }
 
@@ -621,7 +643,9 @@ describe('pending-reference-failure-classes', () => {
     expect(schedule(store)?.attempts).toBe(5);
     expect(parkedTransaction(store)?.status).toBe('PENDING_REFERENCE');
 
-    expect(await execute()).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'settled' }]);
+    expect(await execute()).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'settled' },
+    ]);
     expect(parkedTransaction(store)?.status).toBe('PROCESSED');
     expect(store.wallets.get(WALLET_ID)?.balance.toString()).toBe('500.00');
   });
@@ -638,12 +662,14 @@ describe('pending-reference-failure-classes', () => {
 
     const attempts = await execute();
 
-    expect(attempts).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'retried' }]);
+    expect(attempts).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'retried' },
+    ]);
     expect(parkedTransaction(store)?.status).toBe('PENDING_REFERENCE');
   });
 
   test('a permanent failure marks the transaction FAILED with PROCESSING_FAILED and emits nothing', async () => {
-    const { execute, store, records } = reprocessPendingReference({
+    const { execute, store, log } = reprocessPendingReference({
       referenceArrived: true,
       intercept: (call) => {
         if (call === 'insert entry') {
@@ -654,7 +680,9 @@ describe('pending-reference-failure-classes', () => {
 
     const attempts = await execute();
 
-    expect(attempts).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'failed' }]);
+    expect(attempts).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'failed' },
+    ]);
     expect(parkedTransaction(store)).toMatchObject({
       status: 'FAILED',
       failureCode: 'PROCESSING_FAILED',
@@ -664,8 +692,11 @@ describe('pending-reference-failure-classes', () => {
     expect(store.wallets.get(WALLET_ID)).toEqual(WALLET);
     expect(store.entries).toEqual([]);
     expect(eventTypes(store)).toEqual([]);
-    expect(records).toHaveLength(1);
-    expect(records[0]?.fields).toMatchObject({ transactionId: ROLLBACK_ID });
+    expect(log.at('error')).toHaveLength(1);
+    expect(log.at('error')[0]?.fields).toMatchObject({
+      correlationId: CORRELATION_ID,
+      transactionId: ROLLBACK_ID,
+    });
   });
 
   test('a FAILED transaction leaves the claim list, so no later sweep attempts it again', async () => {
@@ -692,7 +723,9 @@ describe('pending-reference-wallet-vanished', () => {
 
     const attempts = await execute();
 
-    expect(attempts).toEqual([{ transactionId: ROLLBACK_ID, outcome: 'failed' }]);
+    expect(attempts).toEqual([
+      { transactionId: ROLLBACK_ID, correlationId: CORRELATION_ID, outcome: 'failed' },
+    ]);
     expect(parkedTransaction(store)).toMatchObject({
       status: 'FAILED',
       failureCode: 'PROCESSING_FAILED',

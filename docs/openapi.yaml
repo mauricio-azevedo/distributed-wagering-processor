@@ -779,8 +779,12 @@ paths:
       operationId: getMetrics
       summary: Prometheus metrics
       description: |
-        Prometheus text exposition of the operational metrics (`obs.metrics`). The metric names are
-        part of the operational contract:
+        Prometheus text exposition of the operational metrics (`obs.metrics`). Every name below is
+        declared when an instance starts, so a scrape of an idle one carries it with its type and a
+        panel reads zero rather than nothing, and a scrape measures the outbox backlog before it
+        renders, so the two gauges answer on any instance and not only on one running a publisher
+        (`outbox.lag-metrics`). Counters are per instance; aggregating across them is the scraper's
+        job. The metric names are part of the operational contract:
 
         - `wager_transactions_total{kind,status}`
         - `wager_duplicates_detected_total{source}`

@@ -108,6 +108,7 @@ function fakeUnitOfWork(options: {
       findByEventId: unreachable('outbox lookup'),
       claimPending: unreachable('outbox claim'),
       recordAttempt: unreachable('publication attempt'),
+      backlog: unreachable('outbox backlog'),
     },
     pendingReferences: {
       insert: unreachable('pending reference schedule'),

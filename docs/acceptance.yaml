@@ -1933,15 +1933,15 @@ entries:
     requirement: The correlation id is echoed or generated and propagated.
     contract: [api.correlation-header, obs.correlation-propagation]
     enforcement:
-      - Middleware binds X-Correlation-Id to the request context, logs and events.
+      - ObserveRequest binds the id before any handler runs — so a payload the body parser refuses carries one too — writes it on the response and runs the request inside the log context every line reads; the use case carries the id of the command into every event it enqueues (ADR 0012).
     scenario:
-      - Submit with a header; submit without.
+      - Submit with a header and submit without, with the service's own sink captured, and read the stored events of each.
     expected:
-      - The response echoes the header or carries a generated id; the emitted event and the log lines carry the same value.
-    evidence: { testId: correlation-id-propagates, layer: integration }
-    deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+      - The response echoes the header or carries a generated id; every captured line and every stored event of that submission carries the same value.
+    evidence: { testId: correlation-reaches-events, layer: integration }
+    deliverySlice: http-observability-shutdown
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-005
     priority: required
@@ -2196,7 +2196,7 @@ entries:
     requirement: Transient failures back off through visibility and exhaust into the dead-letter queue.
     contract: msg.transient-backoff
     enforcement:
-      - ChangeMessageVisibility with the base doubled per receive and capped by SQS_RETRY_BACKOFF_MAX_SECONDS; redrive maxReceiveCount 5 ends the sequence, so the consumer counts nothing; wager_retries_total arrives with OBS-003.
+      - ChangeMessageVisibility with the base doubled per receive and capped by SQS_RETRY_BACKOFF_MAX_SECONDS; redrive maxReceiveCount 5 ends the sequence, so the consumer gives up on nothing; wager_retries_total{component="queue"} counts a visibility the broker accepted.
     scenario:
       - Keep the database unreachable for one message's whole retry sequence, and poll past the receives the redrive policy allows.
     expected:
@@ -2211,7 +2211,7 @@ entries:
     requirement: Permanent failures go straight to the dead-letter queue, including unknown wallets.
     contract: [msg.permanent-to-dlq, msg.unknown-wallet-permanent]
     enforcement:
-      - Consumer sends the body unchanged to the dead-letter queue, then deletes from the input queue; a forward the broker refuses deletes nothing and leaves the message to the redrive policy; wager_dlq_messages_total arrives with OBS-003.
+      - Consumer sends the body unchanged to the dead-letter queue, then deletes from the input queue; a forward the broker refuses deletes nothing, leaves the message to the redrive policy and counts nothing; wager_dlq_messages_total counts a forward that was followed by the delete.
     scenario:
       - Send a message for a wallet that does not exist, and send one again with the forward aimed at a queue that does not exist.
     expected:
@@ -2362,7 +2362,7 @@ entries:
     requirement: A failed publication is retried with capped backoff and never dropped.
     contract: outbox.retry-backoff
     enforcement:
-      - OutboxMessage.scheduleRetry increments attempts and sets next_attempt_at to the capped backoff; the claim leaves a row that is not due alone; no transition discards a row; from the tenth attempt the publisher records outbox.publication-stalled at error level, and the backlog metrics that raise the alert condition arrive with OUTBOX-008.
+      - OutboxMessage.scheduleRetry increments attempts and sets next_attempt_at to the capped backoff; the claim leaves a row that is not due alone; no transition discards a row; from the tenth attempt the publisher records outbox.publication-stalled at error level and every rescheduled publication raises wager_retries_total{component="outbox"}, with the backlog gauges of OUTBOX-008 beside it.
     scenario:
       - Run cycles against an unreachable broker over a clock the case moves, one row already at nine attempts, then make the broker reachable again.
     expected:
@@ -2377,15 +2377,15 @@ entries:
     requirement: Outbox pending count and lag are exported.
     contract: outbox.lag-metrics
     enforcement:
-      - Gauges updated on every publisher cycle.
+      - ObserveOutboxBacklog reads count(*) and min(occurred_at) over the unpublished rows in the read-only snapshot and sets both gauges; the /metrics endpoint measures before it renders, so the backlog is answered by any instance and not only by one running a publisher. A database that cannot be reached fails the measurement and not the scrape.
     scenario:
-      - Enqueue rows with the publisher stopped; read /metrics; start the publisher.
+      - Enqueue rows with no publisher running, backdate their occurred_at, scrape /metrics, run one publisher cycle and scrape again.
     expected:
-      - wager_outbox_pending and wager_outbox_lag_seconds rise, then return to zero.
+      - wager_outbox_pending is the number of unpublished rows and wager_outbox_lag_seconds is at least the age of the oldest; both are zero once the cycle published them.
     evidence: { testId: outbox-metrics, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OUTBOX-009
     priority: required
@@ -2546,15 +2546,15 @@ entries:
     contract: [ref.transient-failure, ref.permanent-failure]
     enforcement:
       - Error classification in ReprocessPendingReference: ServiceUnavailableError, which the unit of work raises for every database failure a retry can clear, and anything nobody classified are transient and only reschedule; any other ApplicationError or a DomainError is permanent and marks FAILED (ADR 0011).
-      - The counters wager_retries_total{component="scheduler"} and wager_transactions_total{status="FAILED"} arrive with the metrics (#20), which is why this entry is not yet green; the permanent failure is already logged at error level through the Logger port.
+      - Every attempt raises wager_pending_reference_total{outcome}, a rescheduled one also wager_retries_total{component="pending-reference"}, and the write that records FAILED also wager_transactions_total{kind,status="FAILED"} (OBS-003).
     scenario:
       - Park a transaction whose reference has arrived and make the attempt fail transiently, then sweep again cleanly. Park another and make its attempt hit a permanent failure, then replay the original request.
     expected:
-      - The transient failure records nothing at all, counts one attempt and leaves expires_at where it was, and the next attempt applies the transaction; the permanent one is FAILED with PROCESSING_FAILED, emits no event, is logged with its transaction id and replays as 500.
+      - The transient failure records nothing at all, counts one attempt and leaves expires_at where it was, and the next attempt applies the transaction; the permanent one is FAILED with PROCESSING_FAILED, emits no event, is logged with its transaction id and the correlation id of the arrival that parked it, and replays as 500; both attempts are counted by what they ended in.
     evidence: { testId: pending-reference-failure-classes, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- RECON
   - id: RECON-001
@@ -2644,45 +2644,45 @@ entries:
     requirement: Logs are JSON lines with the correlation and identity fields.
     contract: obs.structured-logs
     enforcement:
-      - pino through nestjs-pino with request and message context.
+      - jsonLinesLogger writes one JSON line per record — time, level, component, event, then the bound identity and the caller's fields — behind the Logger port every use case and adapter reports through; the entry points bind the correlation id and, on the queue, the message id, and the use case that recorded the outcome names the transaction, wallet and provider identity (ADR 0012).
     scenario:
-      - Process one HTTP request and one message; capture the logs.
+      - Process one HTTP request and one message with the service's own sink captured.
     expected:
       - Every line parses as JSON and carries correlationId, transactionId, walletId, providerId, externalTransactionId and, for the message, messageId.
     evidence: { testId: structured-log-fields, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OBS-002
     priority: required
     requirement: Logs never contain bodies, amounts or balances, except the reconciliation divergence record.
     contract: obs.no-sensitive-data
     enforcement:
-      - Redaction list; no body logging middleware.
+      - The log adapter redacts, on every line of info and error, a field named for money or a payload and any value shaped like a MoneyProps amount; divergence is a method of its own with a type naming the amount it may carry, and nothing logs a request body. The guarantee is therefore a property of the output rather than of each caller's discipline (ADR 0012).
     scenario:
-      - Process a bet with a recognizable amount; create a divergence and reconcile.
+      - Process a bet and a message with a recognizable amount against a wallet with a recognizable balance, then diverge a stored balance and reconcile, with the service's own sink captured.
     expected:
-      - The amount string appears in no log line of the bet; it appears only in the divergence record.
+      - Neither the amount nor either balance appears in any line of the submissions; the divergence record is the one line carrying the signed difference, and it still parses as JSON.
     evidence: { testId: logs-redact-financial-data, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OBS-003
     priority: required
     requirement: The documented metrics are exported with their labels.
     contract: obs.metrics
     enforcement:
-      - prom-client registry; one metric definition per documented name.
+      - MetricsRegistry declares every documented name on a prom-client Registry of the instance's own when it is constructed, so an idle instance already exposes each with its type; the Metrics port spells the names and label vocabularies as a mapped type, so a name or a label value outside the contract does not compile. Each counter is raised by the path that owns it: the submission use case counts recorded outcomes and replays, the inbox claim counts absorbed redeliveries and reused message ids, the consumer counts an accepted visibility and a completed dead-letter forward, the publisher and the scheduler count their own backoffs, the unit of work counts a lock wait, and reconciliation counts a divergence.
     scenario:
-      - Drive one event of each kind and scrape /metrics.
+      - Scrape /metrics on an instance that has done nothing, then drive each path and scrape or read its counter.
     expected:
-      - Every documented metric name is present with the documented labels.
+      - Every documented name is present with its type before anything raises it, and each series rises by one for the path that owns it, with the labels the contract names.
     evidence: { testId: metrics-exported, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OBS-004
     priority: required
@@ -2706,15 +2706,15 @@ entries:
     requirement: The correlation id reaches every log line and event of a request or message.
     contract: obs.correlation-propagation
     enforcement:
-      - AsyncLocalStorage-bound context used by the logger and the event factory.
+      - An AsyncLocalStorage context, bound by the HTTP middleware before any handler runs and by the consumer for the whole handling of one message, which the log adapter merges under the caller's own fields; the use cases carry the id of the command into every event they enqueue. Work that outlives its arrival takes that arrival's id rather than a fresh one: the publisher from the stored envelope, a scheduled attempt from the correlation_id of its claim row (ADR 0012).
     scenario:
-      - Process a message with a correlationId that produces two events.
+      - Submit with a correlation id and process a message with one and without one; park a transaction, then sweep it and publish what it enqueued.
     expected:
-      - Both events and every log line carry that correlationId.
+      - The response echoes the id; every captured line and every stored event of the operation carries it, a message without one using its messageId; the claim row, the later attempt and the publication of its event carry the id of the arrival that parked the transaction.
     evidence: { testId: correlation-reaches-events, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- OPS
   - id: OPS-001

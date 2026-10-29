@@ -2,8 +2,6 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 
 import type { Clock } from '../../src/application/ports/clock';
-import type { LogFields, Logger } from '../../src/application/ports/logger';
-import type { CounterName, Metrics } from '../../src/application/ports/metrics';
 import type { UnitOfWork } from '../../src/application/ports/unit-of-work';
 import { sha256Hex } from '../../src/application/sha256';
 import { OpenWallet } from '../../src/application/use-cases/open-wallet';
@@ -16,8 +14,10 @@ import { Wallet } from '../../src/domain/wallet';
 import { systemClock } from '../../src/infrastructure/clock';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
+import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
+import { type RecordingLogger, recordingLogger } from '../helpers/recording-logger';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
 /**
@@ -93,31 +93,6 @@ let minted = 0;
 const uuid = (): string =>
   `0193f0c0-0009-7000-9000-${(minted += 1).toString(16).padStart(12, '0')}`;
 
-interface RecordedLog {
-  readonly event: string;
-  readonly fields: LogFields;
-}
-
-class RecordingLogger implements Logger {
-  readonly errors: RecordedLog[] = [];
-
-  error(event: string, fields: LogFields): void {
-    this.errors.push({ event, fields });
-  }
-}
-
-class CountingMetrics implements Metrics {
-  private readonly counters = new Map<CounterName, number>();
-
-  increment(counter: CounterName): void {
-    this.counters.set(counter, this.total(counter) + 1);
-  }
-
-  total(counter: CounterName): number {
-    return this.counters.get(counter) ?? 0;
-  }
-}
-
 const touched = new TouchedWallets();
 
 let schema: MikroORM;
@@ -125,8 +100,8 @@ let runtime: MikroORM;
 let unitOfWork: UnitOfWork;
 let openWallet: OpenWallet;
 let reconcileWallet: ReconcileWallet;
-let logger: RecordingLogger;
-let metrics: CountingMetrics;
+let log: RecordingLogger;
+let metrics: MetricsRegistry;
 
 beforeAll(async () => {
   schema = await MikroORM.init(ormConfig(migrationEnv.MIGRATION_DATABASE_URL));
@@ -149,8 +124,8 @@ afterAll(async () => {
 // The migrator owns the tables, so it is the role that may truncate them (ADR 0003).
 beforeEach(async () => {
   await asMigrator(`truncate table ${TABLES.join(', ')}`);
-  logger = new RecordingLogger();
-  metrics = new CountingMetrics();
+  log = recordingLogger();
+  metrics = new MetricsRegistry();
   reconcileWallet = reconcilingOver(unitOfWork);
 });
 
@@ -162,7 +137,7 @@ afterEach(async () => {
 });
 
 function reconcilingOver(over: UnitOfWork): ReconcileWallet {
-  return new ReconcileWallet({ unitOfWork: over, clock: fixedClock, logger, metrics });
+  return new ReconcileWallet({ unitOfWork: over, clock: fixedClock, logger: log.logger, metrics });
 }
 
 function asMigrator(statement: string, params: Column[] = []): Promise<unknown> {
@@ -493,16 +468,16 @@ describe('reconciliation-calculation', () => {
       code: 'WALLET_NOT_FOUND',
       walletId: UNKNOWN_WALLET_ID,
     });
-    expect(logger.errors).toEqual([]);
-    expect(metrics.total('wager_reconciliation_divergence_total')).toBe(0);
+    expect(log.at('divergence')).toEqual([]);
+    expect(await metrics.total('wager_reconciliation_divergence_total')).toBe(0);
   });
 
   test('a consistent wallet is neither logged nor counted', async () => {
     const wallet = await open('500.00');
 
     expect((await reconcileWallet.execute(wallet.id)).consistent).toBe(true);
-    expect(logger.errors).toEqual([]);
-    expect(metrics.total('wager_reconciliation_divergence_total')).toBe(0);
+    expect(log.at('divergence')).toEqual([]);
+    expect(await metrics.total('wager_reconciliation_divergence_total')).toBe(0);
   });
 });
 
@@ -523,7 +498,7 @@ describe('reconciliation-snapshot-is-consistent', () => {
       checkedEntries: 1,
     });
     expect(await storedBalanceOf(wallet.id)).toBe('460.00');
-    expect(logger.errors).toEqual([]);
+    expect(log.at('divergence')).toEqual([]);
   });
 
   test('the snapshot is read only, so no reconciliation can write even by mistake', async () => {
@@ -564,13 +539,13 @@ describe('reconciliation-divergence', () => {
       consistent: false,
       checkedEntries: 1,
     });
-    expect(logger.errors).toHaveLength(1);
-    expect(logger.errors[0]?.fields).toMatchObject({
+    expect(log.at('divergence')).toHaveLength(1);
+    expect(log.at('divergence')[0]?.fields).toMatchObject({
       walletId: wallet.id,
       difference: '-40.00',
       checkedEntries: 1,
     });
-    expect(metrics.total('wager_reconciliation_divergence_total')).toBe(1);
+    expect(await metrics.total('wager_reconciliation_divergence_total')).toBe(1);
   });
 
   test('a stored balance above the ledger carries a positive difference', async () => {
@@ -594,7 +569,7 @@ describe('reconciliation-divergence', () => {
       consistent: false,
       checkedEntries: 1,
     });
-    expect(metrics.total('wager_reconciliation_divergence_total')).toBe(1);
+    expect(await metrics.total('wager_reconciliation_divergence_total')).toBe(1);
   });
 
   test('a divergence is reported again on every call and the balance is never corrected', async () => {
@@ -607,7 +582,7 @@ describe('reconciliation-divergence', () => {
     ];
 
     expect(reports.map((report) => report.difference.toString())).toEqual(['-40.00', '-40.00']);
-    expect(metrics.total('wager_reconciliation_divergence_total')).toBe(2);
+    expect(await metrics.total('wager_reconciliation_divergence_total')).toBe(2);
     expect(await storedBalanceOf(wallet.id)).toBe('460.00');
   });
 });
@@ -620,9 +595,9 @@ describe('reconciliation-rejects-non-finite-data', () => {
       const refusal = await rejection(reconcileWallet.execute(wallet.id));
 
       expect(refusal).toBeInstanceOf(MoneyValidationError);
-      expect(logger.errors).toHaveLength(1);
-      expect(logger.errors[0]?.fields).toMatchObject({ walletId: wallet.id });
-      expect(metrics.total('wager_reconciliation_divergence_total')).toBe(1);
+      expect(log.at('divergence')).toHaveLength(1);
+      expect(log.at('divergence')[0]?.fields).toMatchObject({ walletId: wallet.id });
+      expect(await metrics.total('wager_reconciliation_divergence_total')).toBe(1);
       expect(await storedBalanceOf(wallet.id)).toBe('NaN');
     });
   });

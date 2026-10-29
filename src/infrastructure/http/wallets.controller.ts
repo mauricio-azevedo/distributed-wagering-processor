@@ -1,10 +1,18 @@
-import { Body, Controller, Get, HttpCode, Param, Post, Res } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, Query, Res } from '@nestjs/common';
 
 import { GetWallet } from '../../application/use-cases/get-wallet';
 import { OpenWallet } from '../../application/use-cases/open-wallet';
+import { PageWalletLedger } from '../../application/use-cases/page-wallet-ledger';
 import { ReconcileWallet } from '../../application/use-cases/reconcile-wallet';
 import { uuidSchema } from '../transport/contract.dto';
 import { CorrelationId } from './correlation-id';
+import {
+  type LedgerPageQueryParameters,
+  type LedgerPageResponse,
+  afterWalletVersionOf,
+  ledgerPageQuerySchema,
+  ledgerPageResponse,
+} from './ledger.dto';
 import { ZodValidationPipe } from './request-validation';
 import {
   type OpenWalletRequest,
@@ -31,6 +39,7 @@ export class WalletsController {
   constructor(
     private readonly openWallet: OpenWallet,
     private readonly getWallet: GetWallet,
+    private readonly pageWalletLedger: PageWalletLedger,
     private readonly reconcileWallet: ReconcileWallet,
   ) {}
 
@@ -58,6 +67,29 @@ export class WalletsController {
     @Param('walletId', new ZodValidationPipe(uuidSchema, '/path/walletId')) walletId: string,
   ): Promise<WalletResponse> {
     return walletResponse(await this.getWallet.execute(walletId));
+  }
+
+  /**
+   * `200` with one page of the wallet's ledger (`api.ledger-read`). The controller decodes the
+   * cursor into the position the use case takes and encodes the next one back, which is the whole
+   * of its share: the two refusals are different codes — a `limit` outside the contract is the
+   * `VALIDATION_FAILED` the pipe reports at `/query/limit`, a cursor the service did not issue is
+   * `INVALID_CURSOR` — so the cursor is carried past the schema unparsed and refused by its own
+   * decoder.
+   */
+  @Get(':walletId/ledger')
+  async ledger(
+    @Param('walletId', new ZodValidationPipe(uuidSchema, '/path/walletId')) walletId: string,
+    @Query(new ZodValidationPipe(ledgerPageQuerySchema, '/query'))
+    query: LedgerPageQueryParameters,
+  ): Promise<LedgerPageResponse> {
+    return ledgerPageResponse(
+      await this.pageWalletLedger.execute({
+        walletId,
+        afterWalletVersion: afterWalletVersionOf(query.cursor),
+        limit: query.limit,
+      }),
+    );
   }
 
   /**

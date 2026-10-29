@@ -4,7 +4,8 @@ import { ApplicationError } from '../../application/errors';
 import type { SubmissionOutcome } from '../../application/use-cases/submit-wager-transaction';
 import type { FailureCode } from '../../domain/failure-code';
 import { isIdempotencyKey } from '../../domain/idempotency';
-import type { MoneyProps } from '../../domain/money';
+import type { Money, MoneyProps } from '../../domain/money';
+import type { TransactionKind } from '../../domain/transaction-kind';
 import type { RecordedTransactionStatus, WagerTransaction } from '../../domain/wager-transaction';
 import {
   type WagerOperationFields,
@@ -111,21 +112,87 @@ export function statusOfOutcome(transaction: WagerTransaction): number {
 /** The outcome as the four members of the contract, read off the row that carries it (ADR 0004). */
 export function transactionOutcomeResponse(outcome: SubmissionOutcome): TransactionOutcomeResponse {
   const transaction = outcome.transaction;
-  const observedBalance = transaction.observedBalance;
-
-  if (observedBalance === null) {
-    throw new Error(
-      `transaction ${transaction.id} is ${transaction.status} without an observed balance, so its outcome cannot be answered (tx.observed-balance)`,
-    );
-  }
 
   return {
     transactionId: transaction.id,
     status: recordedStatusOf(transaction),
-    balance: observedBalance.toJSON(),
+    balance: observedBalanceOf(transaction).toJSON(),
     idempotentReplay: outcome.idempotentReplay,
     ...(transaction.failureCode === null ? {} : { failureCode: transaction.failureCode }),
   };
+}
+
+/**
+ * `WagerTransaction`: the full view of a recorded transaction (`tx.read-shape`), the one body both
+ * read endpoints answer with. The four conditional members are present exactly when the row carries
+ * them, so a reader never has to tell an absent reference from a `null` one, and the kind is
+ * `TransactionKind` rather than the submittable subset because the internal `OPENING` credit is
+ * readable like any other transaction (`tx.opening-internal`).
+ */
+export interface WagerTransactionResponse {
+  readonly transactionId: string;
+  readonly providerId: string;
+  readonly externalTransactionId: string;
+  readonly idempotencyKey: string;
+  readonly payloadHash: string;
+  readonly walletId: string;
+  readonly playerId: string;
+  readonly roundId: string;
+  readonly gameId: string;
+  readonly kind: TransactionKind;
+  readonly money: MoneyProps;
+  readonly status: RecordedTransactionStatus;
+  readonly failureCode?: FailureCode;
+  readonly observedBalance: MoneyProps;
+  readonly referenceExternalTransactionId?: string;
+  readonly referenceTransactionId?: string;
+  readonly createdAt: string;
+  readonly processedAt?: string;
+}
+
+export function wagerTransactionResponse(transaction: WagerTransaction): WagerTransactionResponse {
+  return {
+    transactionId: transaction.id,
+    providerId: transaction.providerId,
+    externalTransactionId: transaction.externalTransactionId,
+    idempotencyKey: transaction.idempotencyKey,
+    payloadHash: transaction.payloadHash,
+    walletId: transaction.walletId,
+    playerId: transaction.playerId,
+    roundId: transaction.roundId,
+    gameId: transaction.gameId,
+    kind: transaction.kind,
+    money: transaction.money.toJSON(),
+    status: recordedStatusOf(transaction),
+    ...(transaction.failureCode === null ? {} : { failureCode: transaction.failureCode }),
+    observedBalance: observedBalanceOf(transaction).toJSON(),
+    ...(transaction.referenceExternalTransactionId === null
+      ? {}
+      : { referenceExternalTransactionId: transaction.referenceExternalTransactionId }),
+    ...(transaction.referenceTransactionId === null
+      ? {}
+      : { referenceTransactionId: transaction.referenceTransactionId }),
+    createdAt: transaction.createdAt.toISOString(),
+    ...(transaction.processedAt === null
+      ? {}
+      : { processedAt: transaction.processedAt.toISOString() }),
+  };
+}
+
+/**
+ * `tx.observed-balance`: every recorded outcome carries the balance observed when it was taken, so
+ * a stored row without one is a defect and not an answer with a member missing.
+ */
+function observedBalanceOf(transaction: WagerTransaction): Money {
+  const observedBalance = transaction.observedBalance;
+
+  if (observedBalance === null) {
+    throw new Error(
+      `transaction ${transaction.id} is ${transaction.status} without an observed balance, so it cannot be answered (tx.observed-balance)`,
+    );
+  }
+
+  return observedBalance;
 }
 
 function recordedStatusOf(transaction: WagerTransaction): RecordedTransactionStatus {

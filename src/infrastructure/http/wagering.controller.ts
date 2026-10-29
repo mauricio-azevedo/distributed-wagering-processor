@@ -1,15 +1,19 @@
-import { Body, Controller, Post, Res } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Res } from '@nestjs/common';
 
+import { GetWagerTransaction } from '../../application/use-cases/get-wager-transaction';
 import { SubmitWagerTransaction } from '../../application/use-cases/submit-wager-transaction';
+import { uuidSchema } from '../transport/contract.dto';
 import { submittedOperationOf } from '../transport/wager-operation.dto';
 import { CorrelationId } from './correlation-id';
 import { ZodValidationPipe } from './request-validation';
 import {
   IdempotencyKey,
   type SubmitWagerTransactionRequest,
+  type WagerTransactionResponse,
   statusOfOutcome,
   submitWagerTransactionRequestSchema,
   transactionOutcomeResponse,
+  wagerTransactionResponse,
 } from './wager-transaction.dto';
 
 /**
@@ -36,7 +40,10 @@ interface OutcomeResponse {
  */
 @Controller('wagering/transactions')
 export class WageringController {
-  constructor(private readonly submitWagerTransaction: SubmitWagerTransaction) {}
+  constructor(
+    private readonly submitWagerTransaction: SubmitWagerTransaction,
+    private readonly getWagerTransaction: GetWagerTransaction,
+  ) {}
 
   @Post()
   async submit(
@@ -60,5 +67,19 @@ export class WageringController {
     }
 
     response.status(statusOfOutcome(outcome.transaction)).json(transactionOutcomeResponse(outcome));
+  }
+
+  /**
+   * `200` with the full transaction view, or the `404 TRANSACTION_NOT_FOUND` the use case raises
+   * (`api.transaction-read`). It returns a body rather than writing the response, unlike the
+   * submission beside it: a read has one status, because the transaction's own status is a member
+   * of what is being read and not a statement about this request.
+   */
+  @Get(':transactionId')
+  async read(
+    @Param('transactionId', new ZodValidationPipe(uuidSchema, '/path/transactionId'))
+    transactionId: string,
+  ): Promise<WagerTransactionResponse> {
+    return wagerTransactionResponse(await this.getWagerTransaction.execute({ transactionId }));
   }
 }

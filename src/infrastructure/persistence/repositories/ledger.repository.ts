@@ -1,6 +1,7 @@
 import type { EntityManager } from '@mikro-orm/postgresql';
 
 import type {
+  LedgerPageQuery,
   LedgerRepository,
   LedgerSummary,
   LedgerSummaryQuery,
@@ -55,6 +56,31 @@ export class MikroOrmLedgerRepository implements LedgerRepository {
     const row = await this.em.findOne(WalletLedgerEntryRow, { transactionId });
 
     return row === null ? null : toWalletLedgerEntry(row);
+  }
+
+  /**
+   * One range scan of `wallet_ledger_entries_wallet_id_wallet_version_unique`, the index the chain
+   * triggers of ADR 0003 already require: the wallet is the equality and the version the range, so
+   * the rows come back ordered without a sort and a page deep in the ledger costs what the first
+   * one does. `limit` is applied by PostgreSQL, so a long ledger never arrives in the heap.
+   *
+   * The absent bound is a missing predicate rather than version `0`, because what "from the
+   * beginning" means is the absence of a lower bound; comparing against a version no entry can
+   * carry would make the first page a special case of a value instead of a case of its own.
+   */
+  async page(query: LedgerPageQuery): Promise<WalletLedgerEntry[]> {
+    const rows = await this.em.find(
+      WalletLedgerEntryRow,
+      {
+        walletId: query.walletId,
+        ...(query.afterWalletVersion === null
+          ? {}
+          : { walletVersion: { $gt: query.afterWalletVersion } }),
+      },
+      { orderBy: { walletVersion: 'asc' }, limit: query.limit },
+    );
+
+    return rows.map(toWalletLedgerEntry);
   }
 
   /**

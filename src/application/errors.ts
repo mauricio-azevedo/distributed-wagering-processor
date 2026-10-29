@@ -1,5 +1,6 @@
 import type { ErrorCode } from '../domain/error-code';
 import type { IdempotencyConflictCode } from '../domain/idempotency';
+import type { WagerTransactionLookup } from './ports/repositories';
 
 /**
  * The refusals a use case answers with when a request cannot be carried out at all: the stored
@@ -47,6 +48,24 @@ export class WalletNotFoundError extends ApplicationError {
 
   constructor(readonly walletId: string) {
     super(`No wallet has id ${walletId}.`);
+  }
+}
+
+/**
+ * `api.transaction-read`: no transaction matches the lookup. One error for both read endpoints,
+ * because the absence is the same fact however the caller named the row; the detail names the
+ * identity that was used, which is what the caller has to check, and never anything of a row the
+ * caller did not reach.
+ */
+export class TransactionNotFoundError extends ApplicationError {
+  override readonly code = 'TRANSACTION_NOT_FOUND' as const;
+
+  constructor(readonly lookup: WagerTransactionLookup) {
+    super(
+      'transactionId' in lookup
+        ? `No transaction has id ${lookup.transactionId}.`
+        : `Provider ${lookup.providerId} has no transaction ${lookup.externalTransactionId}.`,
+    );
   }
 }
 

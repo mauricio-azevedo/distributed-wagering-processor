@@ -4,6 +4,15 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 
+import { loadEnv } from '../../src/infrastructure/config/env';
+import {
+  WAGER_INTEGRATION_EVENTS_QUEUE,
+  WAGER_TRANSACTIONS_DLQ,
+  WAGER_TRANSACTIONS_QUEUE,
+  type WagerQueues,
+  wagerQueues,
+} from '../../src/infrastructure/messaging/sqs';
+
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const STACK_SH = path.join(ROOT, 'docker', 'stack.sh');
 
@@ -97,10 +106,14 @@ function withRepository(
 
 const portSchema = z.object({ target: z.number(), published: z.string() });
 const serviceSchema = z.object({ image: z.string(), ports: z.array(portSchema) });
+/** A role of the service image: what it is configured with matters here, not what it publishes. */
+const roleSchema = z.object({ environment: z.record(z.string(), z.string()) });
 const composeSchema = z.object({
   name: z.string(),
   services: z.object({
-    api: serviceSchema,
+    api: serviceSchema.extend(roleSchema.shape),
+    worker: roleSchema,
+    migrate: roleSchema,
     postgres: serviceSchema,
     localstack: serviceSchema,
   }),
@@ -276,5 +289,72 @@ describe('stack-addresses-match-the-started-containers', () => {
 
   test('the SQS endpoint carries this checkout published LocalStack port', () => {
     expect(port('SQS_ENDPOINT')).toBe(reported(makeStack(), 'LOCALSTACK_PORT'));
+  });
+});
+
+/**
+ * One checkout runs two things against its containers: the demonstrations of `make demo`, which
+ * need the `api` and `worker` instances, and the suites, which drive the queues and claim the
+ * outbox rows themselves. They must not meet. Running both used to mean `make down` in between,
+ * which is a note in three documents rather than a property of the tooling: a reviewer who misses
+ * it watches the suite that proves determinism flake, and loses the data of the walkthrough they
+ * were reading. The suites therefore address a database and a set of queues of their own, on the
+ * same containers, and this suite proves the two namespaces are disjoint.
+ */
+describe('suites-are-isolated-from-the-stack', () => {
+  const stack = composeConfig({});
+
+  /** The database a URL names, which is the last segment of its path. */
+  const databaseOf = (url: string) => new URL(url).pathname.replace(/^\//, '');
+
+  const required = (service: { environment: Record<string, string> }, variable: string): string => {
+    const value = service.environment[variable];
+    if (value === undefined) {
+      throw new Error(`the stack sets no ${variable}`);
+    }
+    return value;
+  };
+
+  test('the suites write to a database no instance of the stack writes to', () => {
+    const suites = [
+      databaseOf(process.env['DATABASE_URL'] ?? ''),
+      databaseOf(process.env['MIGRATION_DATABASE_URL'] ?? ''),
+    ];
+    const started = [
+      databaseOf(required(stack.services.api, 'DATABASE_URL')),
+      databaseOf(required(stack.services.worker, 'DATABASE_URL')),
+      databaseOf(required(stack.services.migrate, 'MIGRATION_DATABASE_URL')),
+    ];
+
+    expect(new Set(suites).size).toBe(1);
+    expect(suites.filter((database) => started.includes(database))).toEqual([]);
+  });
+
+  /** The three names of a trio, as an array the comparison below can be typed over. */
+  const names = (queues: WagerQueues): readonly string[] => [
+    queues.input,
+    queues.deadLetter,
+    queues.events,
+  ];
+
+  test('the suites drive queues no instance of the stack polls', () => {
+    const suites = names(wagerQueues(loadEnv(process.env).SQS_QUEUE_PREFIX));
+    const started = names(wagerQueues(stack.services.worker.environment['SQS_QUEUE_PREFIX'] ?? ''));
+
+    expect(suites.filter((name) => started.includes(name))).toEqual([]);
+  });
+
+  test('a deployment that sets no prefix addresses the names the transport contract fixes', () => {
+    expect(wagerQueues('')).toEqual({
+      input: WAGER_TRANSACTIONS_QUEUE,
+      deadLetter: WAGER_TRANSACTIONS_DLQ,
+      events: WAGER_INTEGRATION_EVENTS_QUEUE,
+    });
+  });
+
+  test('a prefix keeps every name a FIFO name SQS accepts', () => {
+    for (const name of names(wagerQueues(loadEnv(process.env).SQS_QUEUE_PREFIX))) {
+      expect(name).toMatch(/^[A-Za-z0-9_-]{1,75}\.fifo$/);
+    }
   });
 });

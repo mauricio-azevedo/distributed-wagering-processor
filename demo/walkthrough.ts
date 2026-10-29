@@ -28,11 +28,7 @@ import {
 
 import type { IntegrationEventEnvelope } from '../src/domain/integration-events';
 import { loadEnv } from '../src/infrastructure/config/env';
-import {
-  WAGER_INTEGRATION_EVENTS_QUEUE,
-  WAGER_TRANSACTIONS_QUEUE,
-  queueUrlResolver,
-} from '../src/infrastructure/messaging/sqs';
+import { queueUrlResolver, wagerQueues } from '../src/infrastructure/messaging/sqs';
 import type { WagerOperationFields } from '../src/infrastructure/transport/wager-operation.dto';
 
 const env = loadEnv(process.env);
@@ -41,8 +37,9 @@ const sqs = new SQSClient({
   region: env.AWS_REGION,
   ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
 });
-const transactionsQueueUrl = queueUrlResolver(sqs, WAGER_TRANSACTIONS_QUEUE);
-const eventsQueueUrl = queueUrlResolver(sqs, WAGER_INTEGRATION_EVENTS_QUEUE);
+const queues = wagerQueues(env.SQS_QUEUE_PREFIX);
+const transactionsQueueUrl = queueUrlResolver(sqs, queues.input);
+const eventsQueueUrl = queueUrlResolver(sqs, queues.events);
 
 /**
  * One token per run, in the provider id and in every message id the walkthrough sends. Nothing it

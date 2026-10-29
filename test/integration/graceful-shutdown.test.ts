@@ -16,7 +16,7 @@ import {
 import { Money } from '../../src/domain/money';
 import { OutboxMessage } from '../../src/domain/outbox-message';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
-import { WAGER_TRANSACTIONS_QUEUE } from '../../src/infrastructure/messaging/sqs';
+import { wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
 import { DRAIN_INCOMPLETE_EXIT } from '../../src/infrastructure/runtime/shutdown';
@@ -26,6 +26,8 @@ import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
 const env = loadEnv(process.env);
+/** The trio this run addresses: the suites namespace theirs away from the stack. */
+const queues = wagerQueues(env.SQS_QUEUE_PREFIX);
 const migrationEnv = loadMigrationEnv(process.env);
 
 /**
@@ -98,12 +100,10 @@ beforeAll(async () => {
     region: env.AWS_REGION,
     ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
   });
-  const { QueueUrl } = await sqs.send(
-    new GetQueueUrlCommand({ QueueName: WAGER_TRANSACTIONS_QUEUE }),
-  );
+  const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queues.input }));
 
   if (QueueUrl === undefined) {
-    throw new Error(`the stack has no queue ${WAGER_TRANSACTIONS_QUEUE}`);
+    throw new Error(`the stack has no queue ${queues.input}`);
   }
   queueUrl = QueueUrl;
   events = await EventsQueue.open(env);

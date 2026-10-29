@@ -19,6 +19,10 @@ info:
 
     ## Delivery semantics
 
+    Queue names below are the contract. A deployment may address them under a namespace by setting
+    `SQS_QUEUE_PREFIX`, which is empty unless set, so a producer reading this document addresses
+    these names (`msg.queues`, `ops.suite-isolation`).
+
     **Input, `wager-transactions.fifo`**
 
     - Identity is `(consumerName, messageId)`, where `messageId` is the body field assigned by the

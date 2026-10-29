@@ -18,6 +18,7 @@ import { Money } from '../../src/domain/money';
 import { OutboxMessage } from '../../src/domain/outbox-message';
 import { type LedgerOperation, WalletLedgerEntry } from '../../src/domain/wallet-ledger-entry';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
+import { wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event-publisher';
 import { silentLogger } from '../../src/infrastructure/observability/logger';
 import { uncountedMetrics } from '../../src/infrastructure/observability/metrics';
@@ -227,6 +228,9 @@ function movableClock(start: Date) {
   };
 }
 
+/** The events queue this run publishes to (`ops.suite-isolation`). */
+const eventsQueue = wagerQueues(env.SQS_QUEUE_PREFIX).events;
+
 /** The real adapter, against LocalStack. */
 const sqsPublisher = (): SqsEventPublisher =>
   new SqsEventPublisher(
@@ -234,7 +238,7 @@ const sqsPublisher = (): SqsEventPublisher =>
       region: env.AWS_REGION,
       ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
     }),
-    { timeoutMs: 5000 },
+    { queueName: eventsQueue, timeoutMs: 5000 },
   );
 
 /**
@@ -244,7 +248,7 @@ const sqsPublisher = (): SqsEventPublisher =>
 const unreachablePublisher = (): SqsEventPublisher =>
   new SqsEventPublisher(
     new SQSClient({ region: env.AWS_REGION, endpoint: 'http://127.0.0.1:1', maxAttempts: 1 }),
-    { timeoutMs: 1000 },
+    { queueName: eventsQueue, timeoutMs: 1000 },
   );
 
 /** Every envelope the publisher handed to the broker, whether or not the cycle committed. */

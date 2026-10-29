@@ -36,6 +36,21 @@ const serviceSchema = z.object({
   /** Set for LocalStack; absent, the SDK resolves the regional endpoint. */
   SQS_ENDPOINT: z.url({ protocol: /^https?$/ }).optional(),
   /**
+   * What the three queue names of `msg.queues` are addressed under. Empty by default, so a
+   * deployment that says nothing addresses exactly the names the transport contract fixes.
+   *
+   * It is a setting because the names are the contract and the namespace is the deployment's:
+   * several environments of this service can share one broker account, and in this repository the
+   * suites drive a trio of their own while the Compose stack holds the contract names
+   * (`ops.suite-isolation`). The pattern is what SQS accepts in a queue name, bounded so that the
+   * longest name under it stays inside the eighty characters SQS allows.
+   */
+  SQS_QUEUE_PREFIX: z
+    .string()
+    .regex(/^[A-Za-z0-9_-]*$/, 'must be empty or alphanumeric with - and _')
+    .max(32)
+    .default(''),
+  /**
    * The three knobs of the outbox publisher (ADR 0005). They are configuration and not
    * correctness: whatever they are set to, every row is published at least once and none is lost.
    *

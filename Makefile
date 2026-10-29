@@ -32,15 +32,28 @@ LOCALSTACK_PORT ?= $(shell expr $(STACK_PORT_BASE) + 2)
 endif
 export COMPOSE_PROJECT_NAME STACK_IMAGE HTTP_PORT POSTGRES_PORT LOCALSTACK_PORT
 
+# Where the suites run, which is never where the stack runs (`ops.suite-isolation`). One set of
+# containers serves both: docker/postgres creates wagering_test beside wagering and
+# docker/localstack creates the three queues a second time under this prefix, so `make demo` and
+# `make check` no longer have to take turns. The addresses follow this checkout's PostgreSQL port
+# like every other one, and `make stack` reports them. The prefix is kept in step with the one
+# docker/localstack/queues.sh creates.
+TEST_DATABASE_URL ?= postgres://wagering_app:wagering_app@localhost:$(POSTGRES_PORT)/wagering_test
+TEST_MIGRATION_DATABASE_URL ?= \
+  postgres://wagering_migrator:wagering_migrator@localhost:$(POSTGRES_PORT)/wagering_test
+TEST_QUEUE_PREFIX ?= test-
+
 .PHONY: help stack check fmt fmt-check lint typecheck test audit build dev infra migrate up down demo
 
 help: ## List the targets
 	@awk 'BEGIN { FS = ":.*## " } /^[a-zA-Z_-]+:.*## / { printf "  %-10s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-stack: ## Print this checkout's Compose project, image and published ports
+stack: ## Print this checkout's Compose project, image, published ports and suite addresses
 	@printf '%s=%s\n' COMPOSE_PROJECT_NAME '$(COMPOSE_PROJECT_NAME)' STACK_SLOT '$(STACK_SLOT)' \
 	  STACK_IMAGE '$(STACK_IMAGE)' HTTP_PORT '$(HTTP_PORT)' POSTGRES_PORT '$(POSTGRES_PORT)' \
-	  LOCALSTACK_PORT '$(LOCALSTACK_PORT)'
+	  LOCALSTACK_PORT '$(LOCALSTACK_PORT)' TEST_DATABASE_URL '$(TEST_DATABASE_URL)' \
+	  TEST_MIGRATION_DATABASE_URL '$(TEST_MIGRATION_DATABASE_URL)' \
+	  TEST_QUEUE_PREFIX '$(TEST_QUEUE_PREFIX)'
 
 # `make-check-gate` (OPS-001, `ops.repository-gate`): this target is the gate, and the `ci` workflow
 # runs this same target, so green locally means green in CI and nothing merges red.
@@ -58,8 +71,14 @@ lint: ## Lint with ESLint
 typecheck: ## Type-check with tsc, no emit
 	$(BUN) x tsc --noEmit
 
-test: infra ## Run the test suites with bun test, against the Compose dependencies
-	$(BUN) test
+# The suites read their addresses from here and not from .env: an exported variable wins over it,
+# so the database and the queues of the stack stay out of reach of a truncation or a receive even
+# when .env names them. Everything else they need, .env still carries. TESTS is whatever `bun test`
+# takes, so one suite is iterated on inside the same isolation the gate runs under:
+# `make test TESTS=test/unit`.
+test: infra ## Run the test suites with bun test, against the suites' database and queues
+	DATABASE_URL='$(TEST_DATABASE_URL)' MIGRATION_DATABASE_URL='$(TEST_MIGRATION_DATABASE_URL)' \
+	  SQS_QUEUE_PREFIX='$(TEST_QUEUE_PREFIX)' $(BUN) test $(TESTS)
 
 audit: ## Fail on a known vulnerability in the dependency tree
 	$(BUN) audit
@@ -84,6 +103,7 @@ down: ## Stop the stack and drop its data
 
 # The one target that drives the containers instead of an application a suite boots, which is why it
 # starts the whole stack and not just the dependencies: what it demonstrates is the topology of
-# compose.yaml. `make down` before `make test`, because the suites drive the same queues.
+# compose.yaml. It needs no `make down` around it: the suites address their own database and their
+# own queues (`ops.suite-isolation`).
 demo: up ## Walk through the demonstrations of docs/demonstrations.md against the running stack
 	$(BUN) run demo/walkthrough.ts

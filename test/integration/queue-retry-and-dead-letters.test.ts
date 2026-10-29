@@ -20,10 +20,7 @@ import {
 import { systemClock } from '../../src/infrastructure/clock';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
-import {
-  WAGER_TRANSACTIONS_DLQ,
-  WAGER_TRANSACTIONS_QUEUE,
-} from '../../src/infrastructure/messaging/sqs';
+import { wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import {
   type DeliveryReport,
   WAGER_TRANSACTIONS_CONSUMER,
@@ -54,6 +51,8 @@ import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
 // Runs against the Compose dependencies (make infra); .env carries their addresses.
 const env = loadEnv(process.env);
+/** The trio this run addresses: the suites namespace theirs away from the stack. */
+const queues = wagerQueues(env.SQS_QUEUE_PREFIX);
 const migrationEnv = loadMigrationEnv(process.env);
 
 /**
@@ -163,8 +162,8 @@ beforeAll(async () => {
     region: env.AWS_REGION,
     ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
   });
-  queueUrl = await urlOf(WAGER_TRANSACTIONS_QUEUE);
-  deadLetterQueueUrl = await urlOf(WAGER_TRANSACTIONS_DLQ);
+  queueUrl = await urlOf(queues.input);
+  deadLetterQueueUrl = await urlOf(queues.deadLetter);
   consumer = consumerWith();
 });
 

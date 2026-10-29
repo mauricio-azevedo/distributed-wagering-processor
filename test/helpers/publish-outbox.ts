@@ -26,6 +26,7 @@ import type { EventPublisher } from '../../src/application/ports/event-publisher
 import type { OutboxMessage } from '../../src/domain/outbox-message';
 import { loadEnv } from '../../src/infrastructure/config/env';
 import { outboxPublisher } from '../../src/infrastructure/messaging/outbox-publisher';
+import { wagerQueues } from '../../src/infrastructure/messaging/sqs';
 import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event-publisher';
 import { jsonLinesLogger } from '../../src/infrastructure/observability/logger';
 import { onShutdownSignal } from '../../src/infrastructure/runtime/shutdown';
@@ -101,7 +102,10 @@ const publisher = outboxPublisher({
         region: env.AWS_REGION,
         ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
       }),
-      { timeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS },
+      {
+        queueName: wagerQueues(env.SQS_QUEUE_PREFIX).events,
+        timeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS,
+      },
     ),
   ),
 });

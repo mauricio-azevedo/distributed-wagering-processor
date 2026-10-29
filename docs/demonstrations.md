@@ -16,9 +16,11 @@ service itself uses, so there is no AWS CLI to install.
 
 Two things to know before running it:
 
-- **The demonstrations and the suites must not share the stack.** `make demo` needs the `api` and
-  `worker` instances running; `make test` drives the same queues itself and expects no worker
-  competing for them. Run `make down` (or `docker compose stop api worker`) between the two.
+- **The demonstrations and the suites do not share a namespace.** `make demo` needs the `api` and
+  `worker` instances running and writes to the stack's database and queues; the suites address
+  `wagering_test` and a prefixed trio of their own on the same containers. Running the gate while
+  the stack is up takes nothing from it, and nothing has to be stopped between the two
+  (`ops.suite-isolation`).
 - **It writes and cleans nothing up.** Every wallet, provider id and transaction id is minted for
   the run, so a second run shares nothing with the first, and `make down` discards all of it.
 
@@ -110,8 +112,7 @@ publication reached the broker and whose commit never happened — each at a bar
 pre-kill state at, so a window that never opened fails the run instead of passing it:
 
 ```sh
-make down                                           # the suites need the dependencies alone
-bun test test/concurrency/crash-recovery.test.ts
+make test TESTS=test/concurrency/crash-recovery.test.ts
 ```
 
 - Rules: `msg.ack-after-commit`, `outbox.publish-after-commit`, `conc.multi-instance`, `recon.final-invariant`

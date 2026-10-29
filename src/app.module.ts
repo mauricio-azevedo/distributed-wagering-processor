@@ -10,7 +10,7 @@ import {
   type Type,
 } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
-import { TerminusModule } from '@nestjs/terminus';
+import { HealthIndicatorService, TerminusModule } from '@nestjs/terminus';
 
 import type { ProviderIdentityPort } from './application/ports/provider-identity';
 import { unauthenticatedProviderIdentity } from './application/ports/provider-identity';
@@ -40,12 +40,7 @@ import { WageringController } from './infrastructure/http/wagering.controller';
 import { WalletsController } from './infrastructure/http/wallets.controller';
 import { uuidV7IdGenerator } from './infrastructure/id-generator';
 import { OutboxPublisher, outboxPublisher } from './infrastructure/messaging/outbox-publisher';
-import {
-  WAGER_TRANSACTIONS_DLQ,
-  WAGER_TRANSACTIONS_QUEUE,
-  queueUrlResolver,
-  sqsClientProvider,
-} from './infrastructure/messaging/sqs';
+import { queueUrlResolver, sqsClientProvider, wagerQueues } from './infrastructure/messaging/sqs';
 import {
   WAGER_TRANSACTIONS_CONSUMER,
   WagerTransactionsConsumer,
@@ -136,6 +131,10 @@ export class AppModule implements NestModule {
     env: Env,
     adapters: { readonly providerIdentity?: ProviderIdentityPort } = {},
   ): DynamicModule {
+    // The three queues this deployment addresses, resolved once from the prefix so that the
+    // consumer, the publisher and the readiness probe cannot disagree about which trio they mean.
+    const queues = wagerQueues(env.SQS_QUEUE_PREFIX);
+
     return {
       module: AppModule,
       imports: [MikroOrmModule.forRoot(ormConfig(env.DATABASE_URL)), TerminusModule],
@@ -143,7 +142,12 @@ export class AppModule implements NestModule {
       providers: [
         sqsClientProvider(env),
         PostgresHealthIndicator,
-        SqsHealthIndicator,
+        {
+          provide: SqsHealthIndicator,
+          useFactory: (sqs: SQSClient, indicators: HealthIndicatorService) =>
+            new SqsHealthIndicator(sqs, indicators, queues.input),
+          inject: [SQSClient, HealthIndicatorService],
+        },
         { provide: APP_FILTER, useClass: ProblemDetailsFilter },
         { provide: APP_GUARD, useClass: ProviderIdentityGuard },
         {
@@ -235,8 +239,8 @@ export class AppModule implements NestModule {
           useFactory: (sqs: SQSClient, submit: SubmitWagerTransaction, metrics: MetricsRegistry) =>
             new WagerTransactionsConsumer({
               sqs,
-              queueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_QUEUE),
-              deadLetterQueueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_DLQ),
+              queueUrl: queueUrlResolver(sqs, queues.input),
+              deadLetterQueueUrl: queueUrlResolver(sqs, queues.deadLetter),
               submit,
               metrics,
               logger: jsonLinesLogger(WAGER_TRANSACTIONS_CONSUMER),

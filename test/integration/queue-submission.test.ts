@@ -386,6 +386,14 @@ const inboxRows = () =>
     `select consumer_name, message_id, payload_hash, processed_at from inbox_messages order by received_at`,
   );
 
+/** The claim row a parked transaction was handed to the scheduler with (ADR 0011). */
+const scheduleRowsOf = (transactionId: string) =>
+  rows<{ attempts: number; next_attempt_at: Date; expires_at: Date; correlation_id: string }>(
+    `select attempts, next_attempt_at, expires_at, correlation_id
+       from pending_reference_schedule where transaction_id = ?`,
+    [transactionId],
+  );
+
 /** The events one transaction's processing produced (`event.correlation-causation`). */
 const eventsOf = (transactionId: string) =>
   rows<{ event_type: string; payload: { correlationId: string } }>(
@@ -862,4 +870,144 @@ describe('lock-timeout-is-transient', () => {
     expect(await transactionsOf(walletId)).toMatchObject([{ status: 'PROCESSED' }]);
     expect(await balanceOf(walletId)).toEqual({ balance: '460.00', version: 2 });
   }, 40_000);
+});
+
+/**
+ * TX-001 on the queue. The two identities the service keeps for itself are unrepresentable in a
+ * submission rather than refused by a rule — `kind` is the provider enum and `providerId` excludes
+ * `system` — and the message `data` is that same object (`msg.same-use-case`), so what the HTTP
+ * entry point answers `400` the queue classifies permanent and forwards. Interpretation 20.1 D is
+ * that pair of sentences; the HTTP half of it is in `bet-submission.test.ts`.
+ */
+describe('internal-kind-and-provider-are-refused', () => {
+  const internal: [string, Record<string, unknown>][] = [
+    ['the internal kind OPENING', { kind: 'OPENING' }],
+    ['the reserved provider id system', { providerId: 'system' }],
+  ];
+
+  for (const [name, data] of internal) {
+    test(`a message carrying ${name} is permanent and persists nothing`, async () => {
+      const walletId = await openWallet('500.00');
+      const member = Object.keys(data)[0] ?? '';
+      const messageId = `acme-msg-${member}`;
+
+      await send(betMessage(walletId, { messageId }, data), walletId);
+      const report = await pollOne();
+      const failure = failureOf(report);
+
+      expect(report.classification).toBe('permanent');
+      expect(report.disposition).toBe('dead-lettered');
+      expect(failure).toBeInstanceOf(MessageContractError);
+      expect(failure instanceof MessageContractError ? failure.violations : '').toContain(member);
+      // The contract refused the body, so the delivery has no identity to claim and the inbox row
+      // that would absorb a redelivery was never inserted either.
+      expect(report.messageId).toBeNull();
+      expect(await transactionsOf(walletId)).toEqual([]);
+      expect(await inboxRows()).toEqual([]);
+      expect(await deadLetterContents()).toEqual([messageId]);
+      expect(await queueContents()).toEqual([]);
+    });
+  }
+});
+
+/**
+ * IDEM-001 on the queue: the key is mandatory on both entry points, and the one format of
+ * `isIdempotencyKey` is what both validate against. Over HTTP a missing header is
+ * `400 IDEMPOTENCY_KEY_REQUIRED` and a malformed one is `400 VALIDATION_FAILED`
+ * (`bet-submission.test.ts`); here there is no caller to answer, so the same refusals are permanent
+ * and the message is forwarded with its body for an operator to read.
+ */
+describe('request-errors-are-stateless', () => {
+  const malformed: [string, Record<string, unknown>][] = [
+    ['no idempotency key at all', {}],
+    ['a key of 300 characters', { idempotencyKey: 'k'.repeat(300) }],
+    ['a key with a space in it', { idempotencyKey: 'has a space' }],
+  ];
+
+  for (const [name, replacement] of malformed) {
+    test(`a message with ${name} is dead-lettered with nothing persisted`, async () => {
+      const walletId = await openWallet('500.00');
+      const message = betMessage(walletId);
+      const data = { ...(message['data'] as Record<string, unknown>), ...replacement };
+      if (!('idempotencyKey' in replacement)) {
+        delete data['idempotencyKey'];
+      }
+
+      await send({ ...message, data }, walletId);
+      const report = await pollOne();
+      const failure = failureOf(report);
+
+      expect(report.classification).toBe('permanent');
+      expect(report.disposition).toBe('dead-lettered');
+      expect(failure).toBeInstanceOf(MessageContractError);
+      expect(failure instanceof MessageContractError ? failure.violations : '').toContain(
+        'idempotencyKey',
+      );
+      expect(await transactionsOf(walletId)).toEqual([]);
+      expect(await inboxRows()).toEqual([]);
+      expect(await balanceOf(walletId)).toEqual({ balance: '500.00', version: 1 });
+      expect(await deadLetterContents()).toEqual(['acme-msg-000123']);
+      expect(await queueContents()).toEqual([]);
+    });
+  }
+});
+
+/**
+ * REF-001 through the consumer, which is what the HTTP half (`pending-reference.test.ts`) cannot
+ * show: a parked transaction is a business outcome, and `msg.classification` makes every business
+ * outcome terminal for the message. So the delivery that parked it is acknowledged — deleted, not
+ * returned for another receive and not dead-lettered — and the wait is carried by the schedule row
+ * rather than by the message sitting in the queue.
+ */
+describe('missing-reference-is-parked', () => {
+  test('a reversal delivered before its target is parked, announced once and acknowledged', async () => {
+    const walletId = await openWallet('500.00');
+
+    await send(
+      betMessage(
+        walletId,
+        { messageId: 'acme-msg-rollback-1', correlationId: 'acme-req-rollback' },
+        {
+          kind: 'ROLLBACK',
+          externalTransactionId: 'acme-rollback-1',
+          referenceExternalTransactionId: 'acme-bet-unknown',
+        },
+      ),
+      walletId,
+    );
+    const report = await pollOne();
+
+    expect(report).toMatchObject({ classification: 'business', disposition: 'acknowledged' });
+    expect(report.classification === 'business' && report.outcome.absorbed).toBe(false);
+
+    const [parked] = await transactionsOf(walletId);
+
+    expect(parked).toMatchObject({
+      status: 'PENDING_REFERENCE',
+      kind: 'ROLLBACK',
+      failure_code: null,
+      observed_balance: '500.00',
+    });
+    // Parked, so nothing moved: the balance it observed is the balance it left behind.
+    expect(await entriesOf(walletId)).toEqual([]);
+    expect(await balanceOf(walletId)).toEqual({ balance: '500.00', version: 1 });
+
+    // The wait is a row in the claim list, not a message held in the queue, and it carries the
+    // correlation id of the message, so a sweep an hour later is searchable under this arrival.
+    expect(await scheduleRowsOf(parked?.id ?? '')).toMatchObject([
+      { attempts: 0, correlation_id: 'acme-req-rollback' },
+    ]);
+    expect((await eventsOf(parked?.id ?? '')).map(({ event_type }) => event_type)).toEqual([
+      'WagerTransactionPendingReference',
+    ]);
+
+    // Acknowledged: the message is gone from the input queue and was forwarded nowhere.
+    expect(await queueContents()).toEqual([]);
+    expect(await deadLetterContents()).toEqual([]);
+
+    // The inbox completed with the parking, so a redelivery is absorbed rather than parked twice.
+    expect(await inboxRows()).toMatchObject([
+      { consumer_name: WAGER_TRANSACTIONS_CONSUMER, message_id: 'acme-msg-rollback-1' },
+    ]);
+  });
 });

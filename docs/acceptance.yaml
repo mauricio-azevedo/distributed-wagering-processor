@@ -20,6 +20,14 @@
 #   verificationStatus    not-run | passing | failing (passing requires implemented)
 #
 # A test id is traceability, not evidence: an entry is verified only when its status says so.
+#
+# Release report
+#   Every `required` entry is `implemented` and `passing`: the named test exists, runs in
+#   `make check` and carries the evidence of that entry. The three `optional` entries —
+#   LEDGER-010 (double-entry bookkeeping), OPS-008 (a load-test report) and OPS-009 (OpenTelemetry
+#   tracing) — are extensions this version deliberately does not build, not gaps in it; each one
+#   names, in its own `enforcement`, what building it would add. Nothing else is outstanding.
+#   The demonstrations of docs/demonstrations.md walk the same guarantees against a running stack.
 
 version: 1
 entries:
@@ -525,8 +533,8 @@ entries:
       - HTTP answers 400 VALIDATION_FAILED; the messages land in the dead-letter queue; nothing is persisted.
     evidence: { testId: internal-kind-and-provider-are-refused, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: TX-002
     priority: required
@@ -617,8 +625,8 @@ entries:
       - observedBalance is 460.00, 460.00 and 460.00 respectively, and the processed one equals its entry's balanceAfter.
     evidence: { testId: observed-balance-is-recorded, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: TX-008
     priority: required
@@ -739,8 +747,8 @@ entries:
       - The ledger has no entry for any of the three; the wallet version is unchanged.
     evidence: { testId: no-ledger-entry-without-effect, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: LEDGER-006
     priority: required
@@ -770,8 +778,8 @@ entries:
       - walletVersion runs 1..6 without gaps; ordering by walletVersion matches the balance chain even where UUID order does not.
     evidence: { testId: ledger-sequence-by-wallet-version, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: LEDGER-008
     priority: required
@@ -1144,8 +1152,8 @@ entries:
       - 400 IDEMPOTENCY_KEY_REQUIRED; 400 VALIDATION_FAILED; the message goes to the dead-letter queue.
     evidence: { testId: request-errors-are-stateless, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-002
     priority: required
@@ -1272,8 +1280,8 @@ entries:
       - B answers the stored outcome with idempotentReplay true; one debit exists.
     evidence: { testId: idempotency-survives-restart, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-010
     priority: required
@@ -2481,15 +2489,17 @@ entries:
     contract: [ref.parked-state, rule.reference.missing-is-pending]
     enforcement:
       - PENDING_REFERENCE status, schedule row and a single WagerTransactionPendingReference, all committed by the arrival that parked the transaction.
-      - The HTTP half is implemented and asserted; the queue acknowledges a parked submission by the classification of msg.classification, and no case drives one through the consumer yet, which is why this entry is not yet green.
+      - A parked submission is a business outcome, so msg.classification makes it terminal for the message: the delivery that parked it is acknowledged, and the wait is carried by the schedule row rather than by the message.
     scenario:
       - Submit a ROLLBACK and a REFUND before their BET over HTTP, then sweep the scheduler once with the reference still missing.
+      - Deliver one such reversal through the SQS consumer instead.
     expected:
       - 202 with Location; one schedule row at attempts 0, due a second after the receipt and expiring an hour after it; one pending event, and none from the retry attempt.
+      - The delivered one is parked with the same row, schedule and event, and its message is deleted rather than returned or dead-lettered.
     evidence: { testId: missing-reference-is-parked, layer: integration }
     deliverySlice: reversals-references
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: REF-002
     priority: required

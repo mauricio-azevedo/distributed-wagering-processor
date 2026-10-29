@@ -2,6 +2,8 @@ import type { MikroORM } from '@mikro-orm/postgresql';
 import { expect } from 'bun:test';
 
 /**
+ * `final-invariant-every-suite`
+ *
  * `recon.final-invariant` (RECON-004): the assertion every suite that moves money ends with. For
  * each wallet it touched, the stored balance has to equal the balance rebuilt from its ledger, both
  * as the sum of credits minus debits and as the `balanceAfter` of the entry carrying the wallet's

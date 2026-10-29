@@ -78,6 +78,8 @@ function repositoriesOver(staged: Committed, options: { rejectWallet?: Error }):
         return Promise.resolve();
       },
       findById: unreachable('wallet lookup'),
+      lockById: unreachable('wallet lock'),
+      update: unreachable('wallet update'),
     },
     transactions: {
       insert: (transaction) => {
@@ -86,6 +88,7 @@ function repositoriesOver(staged: Committed, options: { rejectWallet?: Error }):
         return Promise.resolve();
       },
       reserve: unreachable('reservation'),
+      recordOutcome: unreachable('outcome update'),
       findById: unreachable('transaction lookup'),
     },
     ledger: {

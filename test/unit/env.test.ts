@@ -10,7 +10,11 @@ const complete = {
 
 describe('config-validation', () => {
   test('a complete environment parses, with the port defaulted and unrelated variables dropped', () => {
-    expect(loadEnv({ ...complete, PATH: '/usr/bin' })).toEqual({ ...complete, HTTP_PORT: 3000 });
+    expect(loadEnv({ ...complete, PATH: '/usr/bin' })).toEqual({
+      ...complete,
+      HTTP_PORT: 3000,
+      LOCK_TIMEOUT_MS: 3000,
+    });
   });
 
   test('the SQS endpoint is optional, so the SDK can resolve the regional endpoint', () => {
@@ -19,7 +23,11 @@ describe('config-validation', () => {
       AWS_REGION: complete.AWS_REGION,
     };
 
-    expect(loadEnv(withoutEndpoint)).toEqual({ ...withoutEndpoint, HTTP_PORT: 3000 });
+    expect(loadEnv(withoutEndpoint)).toEqual({
+      ...withoutEndpoint,
+      HTTP_PORT: 3000,
+      LOCK_TIMEOUT_MS: 3000,
+    });
   });
 
   test('a missing variable is refused by name', () => {

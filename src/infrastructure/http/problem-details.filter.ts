@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import type { ServerResponse } from 'node:http';
 
-import { ApplicationError } from '../../application/errors';
+import { ApplicationError, ServiceUnavailableError } from '../../application/errors';
 import { correlationIdFor } from './correlation-id';
 import { PROBLEM_CONTENT_TYPE, type ProblemDetails, problemDetails } from './problem-details';
 import { RequestValidationError } from './request-validation';
@@ -39,6 +39,17 @@ export class ProblemDetailsFilter implements ExceptionFilter {
     const problem = problemOf(exception, correlationIdFor(http.getRequest(), response));
 
     response.setHeader('Content-Type', PROBLEM_CONTENT_TYPE);
+
+    /*
+     * `api.retry-after`: a transient refusal says when to resend, and it is the only problem that
+     * carries the header — the readiness `503` is a health signal and carries none. The seconds come
+     * from the error, because what the caller should wait for is a property of the failure and not
+     * of the endpoint that reported it.
+     */
+    if (exception instanceof ServiceUnavailableError) {
+      response.setHeader('Retry-After', exception.retryAfterSeconds.toString());
+    }
+
     response.status(problem.status).json(problem);
   }
 }

@@ -28,6 +28,29 @@ export interface WalletRepository {
 
   /** The wallet as the database holds it, or `null` when the id names none. */
   findById(walletId: string): Promise<Wallet | null>;
+
+  /**
+   * The wallet, locked for the rest of the transaction (`conc.row-lock`): the second statement of
+   * a financial operation, after the reservation and before any decision (`conc.lock-order`). Every
+   * other operation on that wallet queues behind it in PostgreSQL's lock queue, so the balance this
+   * returns is the true one for as long as the transaction lives (`conc.no-unguarded-rmw`).
+   *
+   * `null` means no wallet has the id. A submission cannot reach it: the reservation's foreign key
+   * fails first and the adapter reports the absence there (`msg.unknown-wallet-permanent`), so the
+   * case exists for the port to be answerable rather than for a path the database leaves open.
+   */
+  lockById(walletId: string): Promise<Wallet | null>;
+
+  /**
+   * Writes a balance change, guarded by the version the wallet carried when it was locked
+   * (`conc.version-guard`): the statement updates the row only while it still holds
+   * `expectedVersion`, so a write that bypassed the lock cannot lose an update, it fails.
+   *
+   * Taking the expected version as an argument rather than deriving it from the new wallet is what
+   * makes the guard the version the operation actually read; a derived one would guard against
+   * whatever the aggregate produced and agree with itself.
+   */
+  update(wallet: Wallet, expectedVersion: number): Promise<void>;
 }
 
 /**
@@ -57,6 +80,13 @@ export interface WagerTransactionRepository {
    * commit outcome: it commits exactly when the financial effect does (`api.indeterminate-commit`).
    */
   reserve(transaction: WagerTransaction): Promise<Reservation>;
+
+  /**
+   * Writes the outcome a transition recorded onto the row the reservation claimed: the five columns
+   * of `tx.row-append-only` and nothing else. The row is already there, so this never inserts, and
+   * what it may write is what the trigger of ADR 0003 admits on a row that is not terminal yet.
+   */
+  recordOutcome(transaction: WagerTransaction): Promise<void>;
 
   /** The transaction row of a service id, the identity the read endpoints use (`tx.read-shape`). */
   findById(transactionId: string): Promise<WagerTransaction | null>;

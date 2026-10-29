@@ -6,6 +6,15 @@ import { MikroOrmLedgerRepository } from './repositories/ledger.repository';
 import { MikroOrmOutboxRepository } from './repositories/outbox.repository';
 import { MikroOrmWagerTransactionRepository } from './repositories/wager-transaction.repository';
 import { MikroOrmWalletRepository } from './repositories/wallet.repository';
+import { transientDatabaseFailure } from './transient-failure';
+
+/**
+ * ADR 0002's "about three seconds": long enough that a wallet under ordinary contention waits its
+ * turn, short enough that a caller is told to retry instead of holding a connection open. It is the
+ * fallback for a unit of work built without the environment — a test helper or a probe — so that
+ * such a caller still cannot wait without bound; the service passes `LOCK_TIMEOUT_MS`.
+ */
+const DEFAULT_LOCK_TIMEOUT_MS = 3000;
 
 /**
  * `UnitOfWork` over MikroORM: one database transaction per operation, on an entity manager forked
@@ -20,12 +29,26 @@ import { MikroOrmWalletRepository } from './repositories/wallet.repository';
  * own manager.
  */
 export class MikroOrmUnitOfWork implements UnitOfWork {
-  constructor(private readonly em: EntityManager) {}
+  constructor(
+    private readonly em: EntityManager,
+    private readonly lockTimeoutMs: number = DEFAULT_LOCK_TIMEOUT_MS,
+  ) {}
 
+  /**
+   * `SET LOCAL lock_timeout` opens the transaction, so every lock wait inside it is bounded and the
+   * wallet lock of ADR 0002 gives up instead of queueing without end. `LOCAL` scopes the setting to
+   * this transaction, which is what keeps it a property of a financial operation rather than of
+   * whatever connection the pool handed over. The value is interpolated because `SET` takes no
+   * bound parameter; it is an integer the environment loader validated (`ops.config-env`).
+   */
   transactional<T>(work: (repositories: Repositories) => Promise<T>): Promise<T> {
-    return this.em
-      .fork({ clear: true })
-      .transactional((transactional) => work(repositoriesOf(transactional)));
+    return this.classifying(() =>
+      this.em.fork({ clear: true }).transactional(async (transactional) => {
+        await transactional.execute(`set local lock_timeout = ${this.lockTimeoutMs.toString()}`);
+
+        return work(repositoriesOf(transactional));
+      }),
+    );
   }
 
   /**
@@ -36,12 +59,31 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
    * belong to the transaction and not to the process.
    */
   snapshot<T>(work: (repositories: Repositories) => Promise<T>): Promise<T> {
-    return this.em
-      .fork({ clear: true })
-      .transactional((transactional) => work(repositoriesOf(transactional)), {
-        isolationLevel: IsolationLevel.REPEATABLE_READ,
-        readOnly: true,
-      });
+    return this.classifying(() =>
+      this.em
+        .fork({ clear: true })
+        .transactional((transactional) => work(repositoriesOf(transactional)), {
+          isolationLevel: IsolationLevel.REPEATABLE_READ,
+          readOnly: true,
+        }),
+    );
+  }
+
+  /**
+   * The one place a database failure becomes the transient refusal of `api.transient-failure`. It
+   * wraps the whole transaction, commit included, because the commit is where an unknown outcome
+   * arises: a connection lost after `COMMIT` is sent and before its confirmation arrives is
+   * indistinguishable from one lost before, and both answer the same (`api.indeterminate-commit`).
+   *
+   * Only a classified failure is translated, so a constraint violation, a defect or an application
+   * error still reaches the caller as itself.
+   */
+  private async classifying<T>(run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (error) {
+      throw transientDatabaseFailure(error, { lockTimeoutMs: this.lockTimeoutMs }) ?? error;
+    }
   }
 }
 

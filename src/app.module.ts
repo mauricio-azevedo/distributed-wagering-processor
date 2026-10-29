@@ -13,6 +13,7 @@ import { sha256Hex } from './application/sha256';
 import { GetWallet } from './application/use-cases/get-wallet';
 import { OpenWallet } from './application/use-cases/open-wallet';
 import { ReconcileWallet } from './application/use-cases/reconcile-wallet';
+import { SubmitWagerTransaction } from './application/use-cases/submit-wager-transaction';
 import { systemClock } from './infrastructure/clock';
 import type { Env } from './infrastructure/config/env';
 import { HealthController } from './infrastructure/health/health.controller';
@@ -20,6 +21,7 @@ import { PostgresHealthIndicator } from './infrastructure/health/postgres.health
 import { SqsHealthIndicator } from './infrastructure/health/sqs.health';
 import { bindCorrelationId } from './infrastructure/http/correlation-id';
 import { ProblemDetailsFilter } from './infrastructure/http/problem-details.filter';
+import { WageringController } from './infrastructure/http/wagering.controller';
 import { WalletsController } from './infrastructure/http/wallets.controller';
 import { uuidV7IdGenerator } from './infrastructure/id-generator';
 import { sqsClientProvider } from './infrastructure/messaging/sqs';
@@ -44,7 +46,7 @@ export class AppModule implements NestModule {
     return {
       module: AppModule,
       imports: [MikroOrmModule.forRoot(ormConfig(env.DATABASE_URL)), TerminusModule],
-      controllers: [HealthController, WalletsController],
+      controllers: [HealthController, WalletsController, WageringController],
       providers: [
         sqsClientProvider(env),
         PostgresHealthIndicator,
@@ -52,7 +54,7 @@ export class AppModule implements NestModule {
         { provide: APP_FILTER, useClass: ProblemDetailsFilter },
         {
           provide: MikroOrmUnitOfWork,
-          useFactory: (em: EntityManager) => new MikroOrmUnitOfWork(em),
+          useFactory: (em: EntityManager) => new MikroOrmUnitOfWork(em, env.LOCK_TIMEOUT_MS),
           inject: [EntityManager],
         },
         {
@@ -77,6 +79,17 @@ export class AppModule implements NestModule {
               metrics,
             }),
           inject: [MikroOrmUnitOfWork, CounterRegistry],
+        },
+        {
+          provide: SubmitWagerTransaction,
+          useFactory: (unitOfWork: MikroOrmUnitOfWork) =>
+            new SubmitWagerTransaction({
+              unitOfWork,
+              clock: systemClock,
+              ids: uuidV7IdGenerator,
+              sha256Hex,
+            }),
+          inject: [MikroOrmUnitOfWork],
         },
       ],
     };

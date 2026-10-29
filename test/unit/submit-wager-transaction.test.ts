@@ -14,11 +14,13 @@ import {
   SubmitWagerTransaction,
   type SubmittedWagerOperation,
 } from '../../src/application/use-cases/submit-wager-transaction';
+import type { FailureCode } from '../../src/domain/failure-code';
 import { payloadHashOf } from '../../src/domain/idempotency';
 import type { IntegrationEventType } from '../../src/domain/integration-events';
 import { Money } from '../../src/domain/money';
 import type { OutboxMessage } from '../../src/domain/outbox-message';
-import { WagerTransaction } from '../../src/domain/wager-transaction';
+import type { TransactionKind, WagerOperationKind } from '../../src/domain/transaction-kind';
+import { WagerTransaction, requiresReference } from '../../src/domain/wager-transaction';
 import { Wallet } from '../../src/domain/wallet';
 import type { WalletLedgerEntry } from '../../src/domain/wallet-ledger-entry';
 
@@ -80,6 +82,10 @@ interface Ports {
   readonly reservation?: Reservation;
   /** Raised by the ledger port, to prove a failure mid-operation commits nothing. */
   readonly rejectLedger?: Error;
+  /** What the reference resolves to; absent is a provider transaction id nothing carries yet. */
+  readonly reference?: WagerTransaction;
+  /** Whether a processed reversal of the resolved reference already exists (RULE-016). */
+  readonly reversed?: boolean;
 }
 
 /**
@@ -149,6 +155,16 @@ function repositoriesOver(staged: Committed, calls: string[], ports: Ports): Rep
         return Promise.resolve();
       },
       findById: unreachable('transaction lookup'),
+      findByProviderTransaction: (identity) => {
+        calls.push(`resolve ${identity.providerId}:${identity.externalTransactionId}`);
+
+        return Promise.resolve(ports.reference ?? null);
+      },
+      hasProcessedReversal: (transactionId) => {
+        calls.push(`reversals of ${transactionId}`);
+
+        return Promise.resolve(ports.reversed ?? false);
+      },
     },
     ledger: {
       insert: (entry) => {
@@ -246,6 +262,49 @@ function storedOutcome(payloadHash: string): WagerTransaction {
 }
 
 const hashOfBet = payloadHashOf(BET, sha256Hex);
+
+/** The provider transaction id every reference in this file names, and the row that carries it. */
+const REFERENCE_EXTERNAL_ID = 'acme-tx-000099';
+const REFERENCE_TRANSACTION_ID = 'reference-transaction';
+
+/**
+ * The transaction a reference resolves to: a `PROCESSED` operation of the same provider, player,
+ * wallet, currency and round as the submissions below (`rule.reference.same-context`).
+ */
+function processedReference(kind: TransactionKind = 'BET', amount = '40.00'): WagerTransaction {
+  const reference = WagerTransaction.create({
+    id: REFERENCE_TRANSACTION_ID,
+    providerId: BET.providerId,
+    externalTransactionId: REFERENCE_EXTERNAL_ID,
+    idempotencyKey: `${BET.providerId}:${REFERENCE_EXTERNAL_ID}`,
+    payloadHash: hashOfBet,
+    walletId: WALLET_ID,
+    playerId: PLAYER_ID,
+    roundId: BET.roundId,
+    gameId: BET.gameId,
+    kind,
+    money: brl(amount),
+    // A REFUND is itself a reversal, so the row that carries one names its own target.
+    referenceExternalTransactionId: requiresReference(kind) ? 'acme-tx-000098' : null,
+    createdAt: OPENED_AT,
+  });
+  reference.markProcessed({ observedBalance: brl('460.00'), processedAt: OPENED_AT });
+
+  return reference;
+}
+
+/** The same submission under another kind, carrying the reference that kind requires. */
+function operationOf(
+  kind: WagerOperationKind,
+  overrides: Partial<SubmittedWagerOperation> = {},
+): SubmittedWagerOperation {
+  return {
+    ...BET,
+    kind,
+    ...(requiresReference(kind) ? { referenceExternalTransactionId: REFERENCE_EXTERNAL_ID } : {}),
+    ...overrides,
+  };
+}
 
 describe('submit-bet-debits-under-the-wallet-lock', () => {
   test('a covered bet records PROCESSED, the new balance, one DEBIT entry and both events', async () => {
@@ -546,5 +605,327 @@ describe('submit-bet-commits-everything-or-nothing', () => {
 
     expect(failure).toBe(injected);
     expect(committed).toEqual(empty());
+  });
+});
+
+describe('submit-applies-the-movement-of-every-kind', () => {
+  test('a WIN credits its own amount with one CREDIT entry', async () => {
+    const { execute, committed } = submitWagerTransaction({ wallet: walletHolding('460.00') });
+
+    const outcome = await execute(
+      operationOf('WIN', { money: { amount: '65.00', currency: 'BRL' } }),
+    );
+
+    expect(outcome.transaction.status).toBe('PROCESSED');
+    expect(outcome.transaction.observedBalance?.toString()).toBe('525.00');
+    expect(committed.wallets[0]?.balance.toString()).toBe('525.00');
+    expect(committed.wallets[0]?.version).toBe(2);
+    expect(committed.entries[0]).toMatchObject({ kind: 'WIN', direction: 'CREDIT' });
+    expect(eventTypes(committed)).toEqual(['WagerTransactionProcessed', 'WalletBalanceChanged']);
+  });
+
+  test('a REFUND credits the amount of the BET it references', async () => {
+    const { execute, committed } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: processedReference(),
+    });
+
+    const outcome = await execute(operationOf('REFUND'));
+
+    expect(outcome.transaction.status).toBe('PROCESSED');
+    expect(outcome.transaction.observedBalance?.toString()).toBe('500.00');
+    expect(outcome.transaction.referenceTransactionId).toBe(REFERENCE_TRANSACTION_ID);
+    expect(committed.entries[0]).toMatchObject({ kind: 'REFUND', direction: 'CREDIT' });
+  });
+
+  test.each<[TransactionKind, string]>([
+    ['BET', 'CREDIT'],
+    ['WIN', 'DEBIT'],
+    ['REFUND', 'DEBIT'],
+  ])('a ROLLBACK of a %s writes the opposite %s entry', async (referenced, direction) => {
+    const { execute, committed } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: processedReference(referenced),
+    });
+
+    const outcome = await execute(operationOf('ROLLBACK'));
+
+    expect(outcome.transaction.status).toBe('PROCESSED');
+    expect(committed.entries[0]).toMatchObject({ kind: 'ROLLBACK', direction });
+    expect(committed.wallets[0]?.balance.toString()).toBe(
+      direction === 'CREDIT' ? '500.00' : '420.00',
+    );
+  });
+
+  test('the resolved reference reaches the row and the processed event', async () => {
+    const { execute, committed } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: processedReference(),
+    });
+
+    await execute(operationOf('REFUND'));
+
+    expect(committed.outbox[0]?.payload.data).toMatchObject({
+      referenceTransactionId: REFERENCE_TRANSACTION_ID,
+      referenceExternalTransactionId: REFERENCE_EXTERNAL_ID,
+    });
+    expect(committed.outcomes[0]?.referenceTransactionId).toBe(REFERENCE_TRANSACTION_ID);
+  });
+
+  test('the reference is resolved after the wallet lock and before any write', async () => {
+    const { execute, calls } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: processedReference(),
+    });
+
+    await execute(operationOf('REFUND'));
+
+    expect(calls).toEqual([
+      `reserve ${TRANSACTION_ID}`,
+      `lock ${WALLET_ID}`,
+      `resolve ${BET.providerId}:${REFERENCE_EXTERNAL_ID}`,
+      `reversals of ${REFERENCE_TRANSACTION_ID}`,
+      'record PROCESSED',
+      'update wallet from version 1',
+      'insert entry',
+      'enqueue WagerTransactionProcessed',
+      'enqueue WalletBalanceChanged',
+    ]);
+  });
+
+  test('a WIN with no reference resolves nothing and reports none', async () => {
+    const { execute, calls, committed } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+    });
+
+    await execute(operationOf('WIN'));
+
+    expect(calls).not.toContain(`resolve ${BET.providerId}:${REFERENCE_EXTERNAL_ID}`);
+    expect(committed.outcomes[0]?.referenceTransactionId).toBeNull();
+    expect(committed.outbox[0]?.payload.data).not.toHaveProperty('referenceTransactionId');
+  });
+
+  test('a WIN may reference the BET of its round, whatever the two amounts are', async () => {
+    const { execute, committed } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: processedReference(),
+    });
+
+    const outcome = await execute(
+      operationOf('WIN', {
+        money: { amount: '65.00', currency: 'BRL' },
+        referenceExternalTransactionId: REFERENCE_EXTERNAL_ID,
+      }),
+    );
+
+    expect(outcome.transaction.status).toBe('PROCESSED');
+    expect(outcome.transaction.referenceTransactionId).toBe(REFERENCE_TRANSACTION_ID);
+    expect(committed.entries[0]?.money.toString()).toBe('65.00');
+  });
+});
+
+describe('submit-loss-has-no-balance-effect', () => {
+  test.each(['40.00', '0.00', '100000.00'])(
+    'a LOSS of %s is PROCESSED against the balance it observed and moves nothing',
+    async (amount) => {
+      const { execute, committed, calls } = submitWagerTransaction({
+        wallet: walletHolding('460.00'),
+      });
+
+      const outcome = await execute(operationOf('LOSS', { money: { amount, currency: 'BRL' } }));
+
+      expect(outcome.transaction.status).toBe('PROCESSED');
+      expect(outcome.transaction.processedAt).toEqual(SUBMITTED_AT);
+      expect(outcome.transaction.observedBalance?.toString()).toBe('460.00');
+      expect(committed.wallets).toEqual([]);
+      expect(committed.entries).toEqual([]);
+      expect(eventTypes(committed)).toEqual(['WagerTransactionProcessed']);
+      expect(calls).toEqual([
+        `reserve ${TRANSACTION_ID}`,
+        `lock ${WALLET_ID}`,
+        'record PROCESSED',
+        'enqueue WagerTransactionProcessed',
+      ]);
+    },
+  );
+
+  test('the processed event of a LOSS reports the wallet as it stands', async () => {
+    const { execute, committed } = submitWagerTransaction({ wallet: walletHolding('460.00') });
+
+    await execute(operationOf('LOSS'));
+
+    expect(committed.outbox[0]?.payload.data).toMatchObject({
+      kind: 'LOSS',
+      balanceAfter: { amount: '460.00', currency: 'BRL' },
+      walletVersion: 1,
+    });
+  });
+
+  test('a LOSS aimed at another owner is still REJECTED and writes no entry', async () => {
+    const { execute, committed } = submitWagerTransaction({ wallet: walletHolding('460.00') });
+
+    const outcome = await execute(operationOf('LOSS', { playerId: OTHER_PLAYER_ID }));
+
+    expect(outcome.transaction.failureCode).toBe('WALLET_PLAYER_MISMATCH');
+    expect(committed.entries).toEqual([]);
+    expect(eventTypes(committed)).toEqual(['WagerTransactionRejected']);
+  });
+
+  test('a LOSS in another currency than the wallet is REJECTED', async () => {
+    const { execute } = submitWagerTransaction({ wallet: walletHolding('460.00') });
+
+    const outcome = await execute(
+      operationOf('LOSS', { money: { amount: '40.00', currency: 'USD' } }),
+    );
+
+    expect(outcome.transaction.failureCode).toBe('CURRENCY_MISMATCH');
+  });
+});
+
+describe('submit-persists-every-reference-refusal', () => {
+  test.each<[string, TransactionKind, Partial<SubmittedWagerOperation>, FailureCode]>([
+    ['a REFUND of a WIN', 'WIN', {}, 'REFERENCE_KIND_NOT_ALLOWED'],
+    ['a REFUND of another round', 'BET', { roundId: 'round-other' }, 'REFERENCE_MISMATCH'],
+    [
+      'a REFUND of another amount',
+      'BET',
+      { money: { amount: '39.99', currency: 'BRL' } },
+      'REFERENCE_AMOUNT_MISMATCH',
+    ],
+  ])('%s is REJECTED with %s and moves nothing', async (_case, kind, overrides, failureCode) => {
+    const { execute, committed } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: processedReference(kind),
+    });
+
+    const outcome = await execute(operationOf('REFUND', overrides));
+
+    expect(outcome.transaction.status).toBe('REJECTED');
+    expect(outcome.transaction.failureCode).toBe(failureCode);
+    expect(outcome.transaction.observedBalance?.toString()).toBe('460.00');
+    expect(committed.wallets).toEqual([]);
+    expect(committed.entries).toEqual([]);
+    expect(eventTypes(committed)).toEqual(['WagerTransactionRejected']);
+  });
+
+  test('a rejection still records which transaction the reference resolved to', async () => {
+    const { execute, committed } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: processedReference('WIN'),
+    });
+
+    await execute(operationOf('REFUND'));
+
+    expect(committed.outcomes[0]?.referenceTransactionId).toBe(REFERENCE_TRANSACTION_ID);
+    expect(committed.outbox[0]?.payload.data).toMatchObject({
+      referenceExternalTransactionId: REFERENCE_EXTERNAL_ID,
+    });
+  });
+
+  test('a target already reversed by any kind is REJECTED with REFERENCE_ALREADY_REVERSED', async () => {
+    const { execute, committed, calls } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: processedReference(),
+      reversed: true,
+    });
+
+    const outcome = await execute(operationOf('ROLLBACK'));
+
+    expect(outcome.transaction.failureCode).toBe('REFERENCE_ALREADY_REVERSED');
+    expect(committed.wallets).toEqual([]);
+    expect(committed.entries).toEqual([]);
+    expect(calls).toContain(`reversals of ${REFERENCE_TRANSACTION_ID}`);
+  });
+
+  test('a WIN never asks whether its reference was reversed, because it reverses nothing', async () => {
+    const { execute, calls } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: processedReference(),
+      reversed: true,
+    });
+
+    const outcome = await execute(
+      operationOf('WIN', { referenceExternalTransactionId: REFERENCE_EXTERNAL_ID }),
+    );
+
+    expect(outcome.transaction.status).toBe('PROCESSED');
+    expect(calls).not.toContain(`reversals of ${REFERENCE_TRANSACTION_ID}`);
+  });
+
+  test('a ROLLBACK the balance cannot absorb carries the reversal-specific code', async () => {
+    const { execute, committed } = submitWagerTransaction({
+      wallet: walletHolding('10.00'),
+      reference: processedReference('WIN'),
+    });
+
+    const outcome = await execute(operationOf('ROLLBACK'));
+
+    expect(outcome.transaction.failureCode).toBe('REVERSAL_INSUFFICIENT_BALANCE');
+    expect(committed.entries).toEqual([]);
+  });
+
+  test('a credit past the money bound is REJECTED with BALANCE_LIMIT_EXCEEDED', async () => {
+    const { execute, committed } = submitWagerTransaction({
+      wallet: walletHolding('999999999999999999.99'),
+    });
+
+    const outcome = await execute(
+      operationOf('WIN', { money: { amount: '0.01', currency: 'BRL' } }),
+    );
+
+    expect(outcome.transaction.failureCode).toBe('BALANCE_LIMIT_EXCEEDED');
+    expect(outcome.transaction.observedBalance?.toString()).toBe('999999999999999999.99');
+    expect(committed.wallets).toEqual([]);
+    expect(committed.entries).toEqual([]);
+  });
+});
+
+describe('submit-parks-a-reference-it-cannot-resolve', () => {
+  test('a reference no transaction carries yet parks the submission with no other effect', async () => {
+    const { execute, committed, calls } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+    });
+
+    const outcome = await execute(operationOf('ROLLBACK'));
+
+    expect(outcome.transaction.status).toBe('PENDING_REFERENCE');
+    expect(outcome.transaction.failureCode).toBeNull();
+    expect(outcome.transaction.observedBalance?.toString()).toBe('460.00');
+    expect(outcome.transaction.referenceTransactionId).toBeNull();
+    expect(committed.wallets).toEqual([]);
+    expect(committed.entries).toEqual([]);
+    expect(calls).toEqual([
+      `reserve ${TRANSACTION_ID}`,
+      `lock ${WALLET_ID}`,
+      `resolve ${BET.providerId}:${REFERENCE_EXTERNAL_ID}`,
+      'record PENDING_REFERENCE',
+    ]);
+  });
+
+  test('a reference that has not reached an outcome yet is waited for, not refused', async () => {
+    const pending = WagerTransaction.create({
+      id: REFERENCE_TRANSACTION_ID,
+      providerId: BET.providerId,
+      externalTransactionId: REFERENCE_EXTERNAL_ID,
+      idempotencyKey: `${BET.providerId}:${REFERENCE_EXTERNAL_ID}`,
+      payloadHash: hashOfBet,
+      walletId: WALLET_ID,
+      playerId: PLAYER_ID,
+      roundId: BET.roundId,
+      gameId: BET.gameId,
+      kind: 'BET',
+      money: brl('40.00'),
+      referenceExternalTransactionId: null,
+      createdAt: OPENED_AT,
+    });
+
+    const { execute } = submitWagerTransaction({
+      wallet: walletHolding('460.00'),
+      reference: pending,
+    });
+
+    const outcome = await execute(operationOf('REFUND'));
+
+    expect(outcome.transaction.status).toBe('PENDING_REFERENCE');
   });
 });

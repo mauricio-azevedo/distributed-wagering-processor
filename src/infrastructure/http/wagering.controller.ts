@@ -52,8 +52,9 @@ export class WageringController {
       correlationId,
     });
 
-    // `api.location-on-pending`: a parked transaction is answered with where to read it. Only the
-    // kinds that carry a reference can park (#14); a `BET` never does.
+    // `api.location-on-pending`: a parked transaction is answered with where to read it. Only a
+    // submission whose reference has not resolved parks (`rule.reference.missing-is-pending`); a
+    // `BET` carries none and never does.
     if (outcome.transaction.status === 'PENDING_REFERENCE') {
       response.setHeader('Location', `/wagering/transactions/${outcome.transaction.id}`);
     }

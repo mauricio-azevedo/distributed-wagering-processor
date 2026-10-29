@@ -16,7 +16,7 @@ import {
   allowsReference,
   requiresReference,
 } from '../../domain/wager-transaction';
-import { isPositiveAmount, externalIdSchema, moneyPropsSchema, uuidSchema } from './contract.dto';
+import { externalIdSchema, moneyPropsSchema, movesNoMoney, uuidSchema } from './contract.dto';
 import { RequestValidationError } from './request-validation';
 
 /**
@@ -68,10 +68,10 @@ type WagerOperationFields = z.infer<typeof wagerOperationFieldsSchema>;
  * moves money and `0.00` only on a `LOSS` (`money.positive-in-operations`), and a reference to the
  * operation's own id is refused (`tx.self-reference-invalid`).
  *
- * `BET` is the one kind the service applies today; the four that need their reference resolved are
- * refused here, with their own violation, so a provider learns it from the request boundary instead
- * of from an outcome the service cannot record. The rules above are validated for every kind all
- * the same, because they are what the contract says and they are what the remaining kinds inherit.
+ * Whether the referenced transaction exists, is of a kind this one may reference, shares its
+ * context and has not been reversed already is decided nowhere near here: it depends on stored
+ * state, so it is the use case's decision and comes back as a persisted outcome with its failure
+ * code (`rule.reference.*`).
  */
 export const submitWagerTransactionRequestSchema = wagerOperationFieldsSchema.check((context) => {
   const operation = context.value;
@@ -104,22 +104,14 @@ export const submitWagerTransactionRequestSchema = wagerOperationFieldsSchema.ch
     });
   }
 
-  // The amount has already matched `MoneyProps` here, so the domain parser cannot refuse it.
-  if (operation.kind !== 'LOSS' && !isPositiveAmount(operation.money)) {
+  // `money.positive-in-operations`: every kind but a `LOSS` becomes a ledger entry, and an entry
+  // records a movement. An amount the pattern already refused is not this rule's violation.
+  if (operation.kind !== 'LOSS' && movesNoMoney(operation.money)) {
     context.issues.push({
       code: 'custom',
       input: operation.money.amount,
       path: ['money', 'amount'],
       message: 'must be greater than 0.00',
-    });
-  }
-
-  if (operation.kind !== 'BET') {
-    context.issues.push({
-      code: 'custom',
-      input: operation.kind,
-      path: ['kind'],
-      message: 'must be BET; the service does not accept the other kinds yet',
     });
   }
 });

@@ -16,10 +16,18 @@ import {
   allowsReference,
   requiresReference,
 } from '../../src/domain/wager-transaction';
+import {
+  type LedgerDirection,
+  type LedgerOperation,
+  type ReversibleKind,
+  ledgerDirectionFor,
+} from '../../src/domain/wallet-ledger-entry';
 
 const TRANSACTION_ID = '01a18266-39e0-758b-a289-fb48c2dd9c8b';
 const WALLET_ID = '01a18261-a600-7589-8768-3d958460eced';
+const OTHER_WALLET_ID = '01a18261-a600-7589-8768-3d958460ecee';
 const PLAYER_ID = '01a17cb1-f5c0-7588-9a61-47a9444c049e';
+const OTHER_PLAYER_ID = '01a17cb1-f5c0-7588-9a61-47a9444c049f';
 const REFERENCE_TRANSACTION_ID = '01a18265-1d00-758a-9f4c-6a1b2c3d4e5f';
 const EXTERNAL_TRANSACTION_ID = 'acme-tx-000123';
 const REFERENCE_EXTERNAL_ID = 'acme-tx-000099';
@@ -160,6 +168,52 @@ const pairsOf = (statuses: readonly TransactionStatus[]): [TransactionStatus, Tr
     TRANSITIONS.map((transition) => [status, transition] as [TransactionStatus, TransitionName]),
   );
 
+/**
+ * A transaction a reference resolved to, as the database handed it back: a `PROCESSED` `BET` of
+ * 80.00 in the same context as the submission above (`rule.reference.resolution`). Overrides are
+ * what a case differs in, one at a time.
+ */
+const resolvedReference = (overrides: Partial<WagerTransactionState> = {}): WagerTransaction =>
+  WagerTransaction.rehydrate({
+    ...SUBMISSION,
+    id: REFERENCE_TRANSACTION_ID,
+    externalTransactionId: REFERENCE_EXTERNAL_ID,
+    idempotencyKey: `provider-acme:${REFERENCE_EXTERNAL_ID}`,
+    kind: 'BET',
+    money: brl('80.00'),
+    status: 'PROCESSED',
+    failureCode: null,
+    observedBalance: brl('20.00'),
+    referenceExternalTransactionId: null,
+    referenceTransactionId: null,
+    processedAt: PROCESSED_AT,
+    ...overrides,
+  });
+
+/** The same reference in another status, with the outcome columns that status admits. */
+const referenceIn = (status: TransactionStatus): WagerTransaction =>
+  resolvedReference({
+    status,
+    failureCode: STORED_FAILURE_CODE[status] ?? null,
+    processedAt: status === 'PROCESSED' ? PROCESSED_AT : null,
+  });
+
+/** The direction a movement takes, or `null` when the kind applies none (`rule.loss.no-effect`). */
+const directionOf = (movement: LedgerOperation | null): LedgerDirection | null =>
+  movement === null ? null : ledgerDirectionFor(movement);
+
+/** The submission under test, of 80.00, carrying the reference the fixtures above resolve. */
+const reversalOf = (
+  kind: TransactionKind,
+  overrides: Partial<NewWagerTransaction> = {},
+): WagerTransaction =>
+  betOf({
+    kind,
+    money: brl('80.00'),
+    referenceExternalTransactionId: REFERENCE_EXTERNAL_ID,
+    ...overrides,
+  });
+
 describe('reference-requirement-by-kind', () => {
   test.each<[TransactionKind, boolean, boolean]>([
     ['OPENING', false, false],
@@ -297,6 +351,8 @@ describe('status-transition-table', () => {
       'markPendingReference',
       'markProcessed',
       'matchesPayload',
+      'movement',
+      'refuseReference',
       'reject',
     ]);
   });
@@ -546,5 +602,144 @@ describe('rehydrate-trusts-stored-state', () => {
 
     expect(stored.status).toBe('PROCESSED');
     expect(stored.observedBalance?.toString()).toBe('525.00');
+  });
+});
+
+describe('reversal-eligibility-is-a-domain-decision', () => {
+  test('a REFUND of the exact amount of a PROCESSED BET in the same context is refused by nothing', () => {
+    expect(reversalOf('REFUND').refuseReference(resolvedReference())).toBeNull();
+  });
+
+  test.each<[TransactionKind, TransactionKind]>([
+    ['WIN', 'BET'],
+    ['LOSS', 'BET'],
+    ['REFUND', 'BET'],
+    ['ROLLBACK', 'BET'],
+    ['ROLLBACK', 'WIN'],
+    ['ROLLBACK', 'REFUND'],
+  ])('a %s may reference a %s', (kind, referenced) => {
+    expect(reversalOf(kind).refuseReference(resolvedReference({ kind: referenced }))).toBeNull();
+  });
+
+  test.each<[TransactionKind, TransactionKind]>([
+    ['REFUND', 'WIN'],
+    ['REFUND', 'LOSS'],
+    ['REFUND', 'REFUND'],
+    ['REFUND', 'ROLLBACK'],
+    ['REFUND', 'OPENING'],
+    ['ROLLBACK', 'ROLLBACK'],
+    ['ROLLBACK', 'LOSS'],
+    ['ROLLBACK', 'OPENING'],
+    ['WIN', 'WIN'],
+    ['WIN', 'ROLLBACK'],
+    ['LOSS', 'LOSS'],
+  ])('a %s may not reference a %s', (kind, referenced) => {
+    expect(reversalOf(kind).refuseReference(resolvedReference({ kind: referenced }))).toBe(
+      'REFERENCE_KIND_NOT_ALLOWED',
+    );
+  });
+
+  test.each<TransactionStatus>(['PENDING', 'PENDING_REFERENCE', 'REJECTED', 'FAILED'])(
+    'a reference that is %s is not processed',
+    (status) => {
+      expect(reversalOf('REFUND').refuseReference(referenceIn(status))).toBe(
+        'REFERENCE_NOT_PROCESSED',
+      );
+    },
+  );
+
+  test.each<[string, Partial<WagerTransactionState>]>([
+    ['provider', { providerId: 'provider-other' }],
+    ['player', { playerId: OTHER_PLAYER_ID }],
+    ['wallet', { walletId: OTHER_WALLET_ID }],
+    ['currency', { money: Money.from('80.00', 'USD') }],
+    ['round', { roundId: 'round-other' }],
+  ])('a reference in another %s is a mismatch', (_context, difference) => {
+    expect(reversalOf('REFUND').refuseReference(resolvedReference(difference))).toBe(
+      'REFERENCE_MISMATCH',
+    );
+  });
+
+  test('the currency is compared as context, so no amount is ever compared across currencies', () => {
+    const reversal = reversalOf('REFUND', { money: Money.from('80.00', 'USD') });
+
+    expect(reversal.refuseReference(resolvedReference())).toBe('REFERENCE_MISMATCH');
+  });
+
+  test('a reference of another game is still the same context, because the round decides it', () => {
+    expect(
+      reversalOf('REFUND').refuseReference(resolvedReference({ gameId: 'another-game' })),
+    ).toBeNull();
+  });
+
+  test.each<TransactionKind>(['REFUND', 'ROLLBACK'])(
+    'a %s of an amount other than the referenced one is refused',
+    (kind) => {
+      const reversal = reversalOf(kind, { money: brl('50.00') });
+
+      expect(reversal.refuseReference(resolvedReference())).toBe('REFERENCE_AMOUNT_MISMATCH');
+    },
+  );
+
+  test.each<TransactionKind>(['WIN', 'LOSS'])(
+    'the amount of a %s is independent of the amount it references',
+    (kind) => {
+      const reported = reversalOf(kind, { money: brl('50.00') });
+
+      expect(reported.refuseReference(resolvedReference())).toBeNull();
+    },
+  );
+
+  test('the kind matrix is read before the context, so an OPENING is refused for what it is', () => {
+    const opening = resolvedReference({
+      kind: 'OPENING',
+      providerId: 'system',
+      roundId: WALLET_ID,
+      externalTransactionId: WALLET_ID,
+    });
+
+    expect(reversalOf('ROLLBACK').refuseReference(opening)).toBe('REFERENCE_KIND_NOT_ALLOWED');
+  });
+});
+
+describe('reversal-movement-inverts-its-reference', () => {
+  test.each<[ReversibleKind, LedgerDirection]>([
+    ['BET', 'DEBIT'],
+    ['WIN', 'CREDIT'],
+    ['REFUND', 'CREDIT'],
+  ])('a %s moves money as a %s of its own amount', (kind, direction) => {
+    const movement = transactionOf(kind).movement(resolvedReference());
+
+    expect(movement).toMatchObject({ kind });
+    expect(directionOf(movement)).toBe(direction);
+  });
+
+  test.each<[ReversibleKind, LedgerDirection]>([
+    ['BET', 'CREDIT'],
+    ['WIN', 'DEBIT'],
+    ['REFUND', 'DEBIT'],
+  ])('a ROLLBACK of a %s is the opposite %s', (referenced, direction) => {
+    const movement = transactionOf('ROLLBACK').movement(resolvedReference({ kind: referenced }));
+
+    expect(movement).toMatchObject({ kind: 'ROLLBACK', reverses: referenced });
+    expect(directionOf(movement)).toBe(direction);
+  });
+
+  test('a LOSS moves nothing, so it has no movement to apply', () => {
+    expect(transactionOf('LOSS').movement(resolvedReference())).toBeNull();
+  });
+
+  test('a WIN keeps its own movement whether or not it resolved a reference', () => {
+    expect(transactionOf('WIN').movement(null)).toEqual({ kind: 'WIN' });
+  });
+
+  test('a ROLLBACK without a resolved reference has no direction, which is a defect', () => {
+    expect(() => transactionOf('ROLLBACK').movement(null)).toThrow(InvalidWagerTransactionError);
+  });
+
+  test('a ROLLBACK of a kind the matrix refuses has no inverse either', () => {
+    expect(() => transactionOf('ROLLBACK').movement(resolvedReference({ kind: 'LOSS' }))).toThrow(
+      InvalidWagerTransactionError,
+    );
   });
 });

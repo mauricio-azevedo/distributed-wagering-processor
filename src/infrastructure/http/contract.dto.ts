@@ -42,11 +42,21 @@ export const moneyPropsSchema = z.strictObject({
 export type MoneyPropsRequest = z.infer<typeof moneyPropsSchema>;
 
 /**
- * `PositiveMoneyProps`, as the question rather than as a second pattern: whether an amount that
- * already matched `MoneyProps` moves money (`money.positive-in-operations`). The amount reaches the
- * domain parser, so "strictly positive" has one definition and the one the ledger enforces
+ * `PositiveMoneyProps`, as the question rather than as a second pattern: whether an amount is
+ * refused for not moving money (`money.positive-in-operations`). The amount reaches the domain
+ * parser, so "strictly positive" has one definition and the one the ledger enforces
  * (`ledger.positive-amount`).
+ *
+ * It answers `false` for an amount that is not a `MoneyProps` amount at all, because that is not
+ * this rule's refusal: the pattern of the member has already reported it. The guard is required
+ * rather than defensive — an object-level rule still runs after a member of the object was refused,
+ * since a failed pattern records its issue and parsing carries on — and without it an amount like
+ * `-5.00` would reach the domain parser and leave as a `500` where a violation belongs.
  */
-export function isPositiveAmount(money: MoneyPropsRequest): boolean {
-  return Money.from(money.amount, money.currency).isPositive();
+export function movesNoMoney(money: MoneyPropsRequest): boolean {
+  return (
+    AMOUNT_PATTERN.test(money.amount) &&
+    CURRENCY_PATTERN.test(money.currency) &&
+    !Money.from(money.amount, money.currency).isPositive()
+  );
 }

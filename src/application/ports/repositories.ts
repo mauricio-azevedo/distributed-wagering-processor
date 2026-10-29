@@ -65,9 +65,39 @@ export type Reservation =
   | { readonly reserved: true }
   | { readonly reserved: false; readonly keyHolder: WagerTransaction | null };
 
+/** `rule.reference.resolution`: how a reference names a transaction, which is never a service id. */
+export interface ProviderTransactionIdentity {
+  readonly providerId: string;
+  readonly externalTransactionId: string;
+}
+
 export interface WagerTransactionRepository {
   /** Records a submission (`tx.born-pending`) or the outcome it was created with. */
   insert(transaction: WagerTransaction): Promise<void>;
+
+  /**
+   * The transaction a reference names (`rule.reference.resolution`): the lookup is on
+   * `(providerId, referenceExternalTransactionId)` and never on the service id, so two providers
+   * can share an external id without reaching each other's transactions, and the service's own
+   * `OPENING` credits, which carry the reserved provider id, are unreachable from any submission
+   * (`tx.opening-internal`).
+   *
+   * `null` means no transaction of that provider carries the id yet. That is a wait and not a
+   * refusal: the reversal may simply have arrived before the operation it applies to
+   * (`rule.reference.missing-is-pending`).
+   */
+  findByProviderTransaction(
+    identity: ProviderTransactionIdentity,
+  ): Promise<WagerTransaction | null>;
+
+  /**
+   * Whether a `PROCESSED` `REFUND` or `ROLLBACK` already reverses this transaction
+   * (`rule.reference.reversed-once`). It is a question about rows rather than about the pair of
+   * transactions, which is why it is a port call and not part of the domain decision (RULE-020),
+   * and the partial unique index over processed reversals is what holds the answer whatever writes
+   * (SCHEMA-015).
+   */
+  hasProcessedReversal(transactionId: string): Promise<boolean>;
 
   /**
    * Claims the operation's identity: the first statement of a financial transaction, before the

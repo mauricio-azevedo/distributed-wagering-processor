@@ -477,7 +477,7 @@ describe('replay-after-wallet-change', () => {
 });
 
 describe('version-tracks-balance-changes-only', () => {
-  test('the version moves with the debit and stands still for the replay and the rejection', async () => {
+  test('the version moves with the debit and stands still for the replay, the rejection and the LOSS', async () => {
     const walletId = await openWallet('100.00');
     expect(await walletRow(walletId)).toEqual({ balance: '100.00', version: 1 });
 
@@ -491,6 +491,12 @@ describe('version-tracks-balance-changes-only', () => {
       bet(walletId, { externalTransactionId: 'acme-tx-000125', money: brl('100.00') }),
     );
     expect(rejected.status).toBe(422);
+    expect(await walletRow(walletId)).toEqual({ balance: '60.00', version: 2 });
+
+    const loss = await submit(
+      bet(walletId, { externalTransactionId: 'acme-tx-000126', kind: 'LOSS' }),
+    );
+    expect(loss.status).toBe(200);
     expect(await walletRow(walletId)).toEqual({ balance: '60.00', version: 2 });
   });
 });
@@ -677,17 +683,53 @@ describe('submission-validation-follows-the-contract', () => {
     });
   });
 
-  test('a BET of 0.00 is 400, because it would need a ledger entry that moves nothing', async () => {
-    const walletId = await openWallet('500.00');
+  test.each(['BET', 'WIN', 'REFUND', 'ROLLBACK'])(
+    'a %s of 0.00 is 400, because it would need a ledger entry that moves nothing',
+    async (kind) => {
+      const walletId = await openWallet('500.00');
 
-    const answer = await submit(bet(walletId, { money: brl('0.00') }));
+      const answer = await submit(
+        bet(walletId, {
+          kind,
+          money: brl('0.00'),
+          ...(kind === 'REFUND' || kind === 'ROLLBACK'
+            ? { referenceExternalTransactionId: 'acme-tx-000122' }
+            : {}),
+        }),
+      );
 
-    expect(answer.status).toBe(400);
-    expect(answer.body.errors).toContainEqual({
-      path: '/body/money/amount',
-      message: 'must be greater than 0.00',
-    });
-    expect(await transactionRows(walletId)).toHaveLength(1);
+      expect(answer.status).toBe(400);
+      expect(answer.body.errors).toContainEqual({
+        path: '/body/money/amount',
+        message: 'must be greater than 0.00',
+      });
+      expect(await transactionRows(walletId)).toHaveLength(1);
+    },
+  );
+
+  test.each(['BET', 'LOSS'])(
+    'a %s of -5.00 is 400, because no input is ever negative',
+    async (kind) => {
+      const walletId = await openWallet('500.00');
+
+      const answer = await submit(bet(walletId, { kind, money: brl('-5.00') }));
+
+      expect(answer.status).toBe(400);
+      expect(answer.body.errors).toMatchObject([{ path: '/body/money/amount' }]);
+      expect(await transactionRows(walletId)).toHaveLength(1);
+    },
+  );
+
+  test('a LOSS of 0.00 is PROCESSED, because it moves nothing and writes no entry', async () => {
+    const walletId = await openWallet('460.00');
+
+    const answer = await submit(bet(walletId, { kind: 'LOSS', money: brl('0.00') }));
+
+    expect(answer.status).toBe(200);
+    expect(answer.body.status).toBe('PROCESSED');
+    expect(answer.body.balance).toEqual(brl('460.00'));
+    expect(await walletRow(walletId)).toEqual({ balance: '460.00', version: 1 });
+    expect(await ledgerRows(walletId)).toHaveLength(1);
   });
 
   test('a reference equal to the operation own id is 400, whatever the kind', async () => {
@@ -731,6 +773,21 @@ describe('submission-validation-follows-the-contract', () => {
       path: '/body/nickname',
       message: 'is not a member of this request',
     });
+  });
+
+  test('an amount or a currency the pattern refuses is a 400, never an unhandled parse', async () => {
+    const walletId = await openWallet('500.00');
+
+    const malformedAmount = await submit(bet(walletId, { money: brl('4') }));
+    const malformedCurrency = await submit(
+      bet(walletId, { money: { amount: '40.00', currency: 'brl' } }),
+    );
+
+    expect(malformedAmount.status).toBe(400);
+    expect(malformedAmount.body.errors).toMatchObject([{ path: '/body/money/amount' }]);
+    expect(malformedCurrency.status).toBe(400);
+    expect(malformedCurrency.body.errors).toMatchObject([{ path: '/body/money/currency' }]);
+    expect(await transactionRows(walletId)).toHaveLength(1);
   });
 
   test('an amount sent as a JSON number is refused, never rounded into money', async () => {

@@ -38,12 +38,20 @@ export interface OpenedWallet {
   readonly openingEntry: WalletLedgerEntry | null;
 }
 
-/** What an operation asks a wallet to apply. `playerId` is the owner it claims to act on. */
-interface WalletOperationRequest {
-  readonly transactionId: string;
-  readonly entryId: string;
+/**
+ * An operation that moves no money, which is a `LOSS` (`tx.affects-balance`): it names the owner it
+ * claims to act on and the amount it reports, and nothing else, because it produces neither a
+ * balance nor an entry for an id or a moment to belong to.
+ */
+export interface WalletUnmovedOperation {
   readonly playerId: string;
   readonly money: Money;
+}
+
+/** What an operation asks a wallet to apply. `playerId` is the owner it claims to act on. */
+interface WalletOperationRequest extends WalletUnmovedOperation {
+  readonly transactionId: string;
+  readonly entryId: string;
   readonly occurredAt: Date;
 }
 
@@ -212,11 +220,27 @@ export class Wallet implements WalletState {
   }
 
   /**
+   * `rule.loss.no-effect`: what an operation that moves no money is answered with. A `LOSS` is
+   * still an operation on this wallet, so the refusals that do not depend on a movement apply to it
+   * (`wallet.owner-match`, `wallet.currency-match`); its amount is never compared, which is why
+   * `0.00` and an amount larger than the balance are both accepted
+   * (`money.positive-in-operations`).
+   *
+   * It answers with a code or with `null` rather than with a `WalletOperationOutcome`, because
+   * there is no outcome to carry: no balance was produced and no entry exists
+   * (`ledger.no-entry-without-effect`). The wallet this was asked of stays current either way, so
+   * the caller records the transaction against the balance it already holds.
+   */
+  refuseUnmoved(operation: WalletUnmovedOperation): WalletRefusalCode | null {
+    return this.refuseForeign(operation)?.failureCode ?? null;
+  }
+
+  /**
    * The refusals that depend on neither direction nor amount, checked first so that an operation
    * aimed at the wrong wallet is never answered with a reason about its amount.
    */
   private refuseForeign(
-    request: WalletOperationRequest,
+    request: WalletUnmovedOperation,
   ): { applied: false; failureCode: WalletRefusalCode } | null {
     if (request.playerId !== this.playerId) {
       return { applied: false, failureCode: 'WALLET_PLAYER_MISMATCH' };

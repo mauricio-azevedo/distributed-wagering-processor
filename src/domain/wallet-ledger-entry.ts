@@ -1,6 +1,6 @@
 import { InvalidLedgerEntryError } from './errors';
 import { Money } from './money';
-import type { BalanceChangingKind } from './transaction-kind';
+import type { BalanceChangingKind, TransactionKind } from './transaction-kind';
 
 /** `ledger.direction-by-kind`: where the money went. The amount itself is always positive. */
 export type LedgerDirection = 'DEBIT' | 'CREDIT';
@@ -25,6 +25,31 @@ export type CreditOperation =
  */
 export type LedgerOperation = DebitOperation | CreditOperation;
 
+/**
+ * `rule.rollback.allowed-kinds`: the kinds a `ROLLBACK` can invert, which are exactly the ones
+ * that wrote an entry for it to mirror in the opposite direction. The two `reverses` unions above
+ * partition this one by the direction the inverse takes.
+ */
+export type ReversibleKind = 'BET' | 'WIN' | 'REFUND';
+
+export const REVERSIBLE_KINDS: readonly ReversibleKind[] = ['BET', 'WIN', 'REFUND'];
+
+export function isReversibleKind(kind: TransactionKind): kind is ReversibleKind {
+  return (REVERSIBLE_KINDS as readonly TransactionKind[]).includes(kind);
+}
+
+/**
+ * `rule.rollback.inverse`: the movement a `ROLLBACK` of each reversible kind applies. It is a table
+ * because the union is split by direction: each entry is typed as the half it belongs to, so the
+ * inverse is read rather than recomputed and no caller has to name one of the two halves to build
+ * it.
+ */
+export const ROLLBACK_OF: Record<ReversibleKind, LedgerOperation> = {
+  BET: { kind: 'ROLLBACK', reverses: 'BET' },
+  WIN: { kind: 'ROLLBACK', reverses: 'WIN' },
+  REFUND: { kind: 'ROLLBACK', reverses: 'REFUND' },
+};
+
 /** `ledger.direction-by-kind`, as the use cases read it to choose a debit or a credit. */
 export function ledgerDirectionFor(operation: LedgerOperation): LedgerDirection {
   switch (operation.kind) {
@@ -37,6 +62,16 @@ export function ledgerDirectionFor(operation: LedgerOperation): LedgerDirection 
     case 'ROLLBACK':
       return operation.reverses === 'BET' ? 'CREDIT' : 'DEBIT';
   }
+}
+
+/**
+ * `ledger.direction-by-kind`, as the predicate that narrows a movement to the aggregate method it
+ * belongs to: a use case that holds a `LedgerOperation` asks the wallet to debit or to credit, and
+ * the direction is what decides which. The answer comes from `ledgerDirectionFor`, so the split
+ * stays one rule.
+ */
+export function isDebitOperation(operation: LedgerOperation): operation is DebitOperation {
+  return ledgerDirectionFor(operation) === 'DEBIT';
 }
 
 /** A ledger entry as the database holds it (`ledger.read-shape`). */

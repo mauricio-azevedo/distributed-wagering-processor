@@ -90,6 +90,8 @@ function repositoriesOver(staged: Committed, options: { rejectWallet?: Error }):
       reserve: unreachable('reservation'),
       recordOutcome: unreachable('outcome update'),
       findById: unreachable('transaction lookup'),
+      findByProviderTransaction: unreachable('reference resolution'),
+      hasProcessedReversal: unreachable('reversal lookup'),
     },
     ledger: {
       insert: (entry) => {

@@ -2905,6 +2905,56 @@ entries:
     implementationStatus: implemented
     verificationStatus: passing
 
+  - id: OPS-011
+    priority: required
+    requirement: A checkout publishes a slot whose ports are free and says which slot it took.
+    contract: [ops.compose, ops.suite-isolation]
+    enforcement:
+      - docker/stack.sh names the Compose project, then takes the first slot from its own position in git worktree list whose three ports are all free, stepping by the number of worktrees so that two checkouts searching at once cannot choose one slot. A port published by a container of this checkout's own stack counts as free, so a second make up keeps the slot the first one chose. A move is announced on stderr in one line naming the slot and the base URL; an explicit STACK_SLOT is used as given, with its ports in use and unannounced. Nothing is remembered, so a checkout returns to its own slot once those ports are free. The Makefile reads the project, the slot and the three ports from that one line.
+    scenario:
+      - Run the script for a fixture repository with a port of its slot held by a listener, by a container labelled as its own Compose project, and by a container labelled as another project.
+      - Run it with all three ports held and STACK_SLOT set to that slot.
+      - Read the slots of a repository with three checkouts, and what make exports for each slot.
+    expected:
+      - A held port moves the checkout to the next slot of its own series, announced in one line with the slot and the base URL; a port its own stack publishes moves it nowhere; releasing the port brings the same answer back as before.
+      - The pinned slot is answered unchanged and nothing is printed.
+      - No two checkouts of one repository can land on the same slot; slot 0 publishes 3000, 5433 and 4566, every slot publishes a fixed port below the ephemeral range, and no two slots share one.
+    evidence: { testId: docker-stack-is-per-checkout, layer: integration }
+    deliverySlice: reader-experience
+    implementationStatus: implemented
+    verificationStatus: passing
+
+  - id: OPS-012
+    priority: required
+    requirement: One command takes a clean clone to the running demonstrations.
+    contract: ops.compose
+    enforcement:
+      - make demo depends on the dependencies and on .env as files it produces: bun install --frozen-lockfile when node_modules is older than package.json or bun.lock, and a copy of .env.example when .env is missing, which is never overwritten. It is also the default target, and make help lists the rest. A dependency that does not come up and a stack that does not reach readiness each end with the command that shows why.
+    scenario:
+      - Clone the repository into an empty directory on a host already publishing 3000, 5433 and 4566, and run make.
+    expected:
+      - The dependencies are installed, .env is created from .env.example, the stack is built and started on a free slot the run names, and the eight demonstrations pass; an .env that already exists is left as it is.
+    evidence: { testId: first-run-from-a-clean-clone, layer: manual }
+    deliverySlice: reader-experience
+    implementationStatus: implemented
+    verificationStatus: passing
+
+  - id: OPS-013
+    priority: required
+    requirement: Breaking an invariant on purpose fails the cases that name it and leaves no file changed.
+    contract: [conc.row-lock, conc.parallel-wallets, conc.lock-order]
+    enforcement:
+      - make drill applies three mutations one at a time — the wallet lock removed, a process-local mutex around every transaction, and the lock taken FOR UPDATE — runs only the cases named for each through make test, and asserts the result each one should give them. It refuses to start unless the files it edits are as committed, restores each file in a signal and exit trap, and verifies the restore against the index before continuing.
+    scenario:
+      - Run make drill with the tree as committed, and with one of the files it edits modified.
+    expected:
+      - Each mutation fails the cases that name it and leaves the ones that cannot see it passing: the structural check refuses the missing clause and the wrong mode, two concurrent bets on one balance stop ending as one debit, the same-instance case of conc.parallel-wallets fails while the cross-process one passes, and FOR UPDATE deadlocks the pairs that queue otherwise. Every file is reported as committed again afterwards.
+      - A modified file stops the drill before anything is edited, naming the file and the diff to read.
+    evidence: { testId: mutation-drill, layer: manual }
+    deliverySlice: reader-experience
+    implementationStatus: implemented
+    verificationStatus: passing
+
   # ---------------------------------------------------------------- AUTH
   - id: AUTH-001
     priority: required

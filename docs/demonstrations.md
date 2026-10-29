@@ -1,18 +1,18 @@
 # Demonstrations
 
-Seven guarantees, watched happening against the deployed stack: an HTTP submission, a queue
-submission, a rejection, a replay, a reversal, a reconciliation and a recovery from a kill. Each
-one is a section below, and all seven run in one pass with
+Eight guarantees, watched happening against the deployed stack: an HTTP submission, a replay, a
+rejection, a reversal, a reversal that arrives before its bet, a queue submission, a reconciliation
+and a recovery from a kill. Each one is a section below, and all eight run in one pass with
 
 ```sh
 make demo
 ```
 
-which starts `compose.yaml` — PostgreSQL, LocalStack with the three queues, the migration step, one
-`api` and two `worker` instances — and then walks
-[demo/walkthrough.ts](../demo/walkthrough.ts) through them, printing every claim it checks. It needs
-Docker and the Bun of `.bun-version`, nothing else; the queue is reached with the SQS client the
-service itself uses, so there is no AWS CLI to install.
+which installs the dependencies, writes `.env` if it is missing, starts `compose.yaml` — PostgreSQL,
+LocalStack with the three queues, the migration step, one `api` and two `worker` instances — and
+then walks [demo/walkthrough.ts](../demo/walkthrough.ts) through them, printing every claim it
+checks. It needs Docker and the Bun of `.bun-version`, nothing else; the queue is reached with the
+SQS client the service itself uses, so there is no AWS CLI to install.
 
 Two things to know before running it:
 
@@ -68,7 +68,18 @@ target, whatever kind the second one is (additional policy 20.2 A).
 - Rules: `rule.refund.credit`, `rule.refund.bet-only`, `rule.reference.reversed-once`, `rule.reversal.chain-limits`
 - In the gate: `refund-credits-bet-once`, `reference-reversed-once`
 
-## 5. Queue submission
+## 5. A reversal before its bet
+
+A `ROLLBACK` of `30.00` naming a bet the service has never seen is neither applied nor refused:
+`202` with `PENDING_REFERENCE` and a `Location` to poll, persisted with a window it may wait in.
+The bet it names is then submitted and applied, and a worker's scheduler — nothing in the
+walkthrough — attempts the parked reversal again, applies it, and credits the stake back. Out of
+order on arrival, correct once settled (ADR 0011).
+
+- Rules: `ref.parked-state`, `api.location-on-pending`, `ref.scheduler`, `ref.resolution-on-arrival`
+- In the gate: `rollback-before-bet-resolves`, `missing-reference-is-parked`
+
+## 6. Queue submission
 
 A `WagerTransactionRequested` for a `WIN` of `25.00` is sent to `wager-transactions.fifo`. A worker
 picks it up, runs the same use case the controller runs, and the transaction becomes readable at
@@ -82,21 +93,24 @@ changes: no second debit, no new wallet version.
 - Rules: `msg.same-use-case`, `msg.inbox-identity`, `msg.redelivery-safe`, `msg.broker-features-optional`
 - In the gate: `consumer-uses-same-use-case`, `inbox-keyed-by-body-message-id`, `correct-without-fifo`
 
-## 6. Reconciliation
+## 7. Reconciliation
 
-`POST /wallets/{id}/reconciliation` compares the stored balance with the balance rebuilt from the
-ledger and answers `200` either way, with the signed difference. Here the two agree and the
-difference is `0.00`.
+The walkthrough prints the wallet's six ledger entries — version, direction, amount, balance after
+— and adds them up itself, so the balance under the entries is arithmetic the reader can check
+against the balance stored on the wallet row.
+`POST /wallets/{id}/reconciliation` then does the same sum inside one snapshot and answers `200`
+either way, with the signed difference. Here the three agree and the difference is `0.00`.
 
-The walkthrough then drains `wager-integration-events.fifo` and finds what the four processed
-operations and the two refusals announced: four `WagerTransactionProcessed`, four
-`WalletBalanceChanged` and two `WagerTransactionRejected`, each on the wallet as its aggregate,
-caused by its own transaction and carrying the correlation id of the arrival that asked for it.
+The walkthrough then drains `wager-integration-events.fifo` and finds what the six processed
+operations, the two refusals and the parked reversal announced: six `WagerTransactionProcessed`,
+six `WalletBalanceChanged`, two `WagerTransactionRejected` and one
+`WagerTransactionPendingReference`, each on the wallet as its aggregate, caused by its own
+transaction and carrying the correlation id of the arrival that asked for it.
 
 - Rules: `recon.calculation`, `recon.report-shape`, `recon.divergence-handling`, `event.processed-when`, `event.rejected-when`, `outbox.destination`
 - In the gate: `reconciliation-calculation`, `events-fire-when-specified`, `final-invariant-every-suite`
 
-## 7. Recovery
+## 8. Recovery
 
 Sixty bets are queued; once some are applied and some are not, both workers are killed with
 `SIGKILL`, which allows no cleanup, and restarted. Nothing is driven after that. Every one of the
@@ -106,7 +120,7 @@ nothing else. That the kill landed mid-drain is asserted and not assumed — a r
 already finished would prove nothing about recovery, so it fails instead of passing.
 
 Which failure window a kill lands in is the broker's business, so this shows the property rather
-than the mechanism. The mechanism is proven deterministically by the drill in the gate, which kills
+than the mechanism. The mechanism is proven deterministically in the gate, by cases that kill
 a worker that has committed a delivery and not acknowledged its message, and a publisher whose
 publication reached the broker and whose commit never happened — each at a barrier it asserts the
 pre-kill state at, so a window that never opened fails the run instead of passing it:
@@ -117,6 +131,31 @@ make test TESTS=test/concurrency/crash-recovery.test.ts
 
 - Rules: `msg.ack-after-commit`, `outbox.publish-after-commit`, `conc.multi-instance`, `recon.final-invariant`
 - In the gate: `crash-recovery-drill`, `crash-recovery-barriers`
+
+## Breaking it on purpose
+
+The demonstrations show the guarantees holding. What a passing suite cannot show is that it would
+notice them stop: a concurrency case that never meets the race it names passes exactly like one
+that does. One command breaks an invariant, runs only the cases that name it, and puts the file
+back:
+
+```sh
+make drill
+```
+
+It refuses to start unless the three files it edits are as committed, restores each one in a trap
+so an interrupt cannot leave a mutated file behind, and verifies the restore against the index
+before moving on. The three mutations are the three mistakes ADR 0002 was written against, and
+each one is caught by a different kind of case:
+
+| Mutation                                                            | What it proves                                                                                                                                                                                         |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `for no key update` dropped from the wallet lock                    | The structural check reads the source and refuses the missing clause without running anything, and two concurrent bets on one balance stop ending as a single debit.                                   |
+| A process-local mutex around every transaction, in the unit of work | The same-instance case of `conc.parallel-wallets` fails and the cross-process one still passes, which is why both exist: a mutex is invisible to a case that runs its two operations in two processes. |
+| The wallet lock taken `FOR UPDATE`                                  | The mode is pinned, not just the clause, and two submissions on one wallet deadlock instead of queueing — the outcome ADR 0002 chose `FOR NO KEY UPDATE` to avoid.                                     |
+
+It is not part of `make check`: it edits the source, so it is a command a reviewer runs, not a gate
+step.
 
 ## Reaching the stack by hand
 
@@ -129,9 +168,8 @@ eval "$(make -s stack)"          # export them into this shell
 curl -s "http://localhost:$HTTP_PORT/health/ready"
 curl -s "http://localhost:$HTTP_PORT/docs-json"   # docs/openapi.yaml, byte for byte
 curl -s "http://localhost:$HTTP_PORT/metrics"
-docker compose logs --follow worker
+make logs SERVICES=worker
 ```
 
-A single clone keeps `3000`, `5433` and `4566`. The request and message shapes to send are in
-[openapi.yaml](openapi.yaml) and [asyncapi.yaml](asyncapi.yaml), each with examples per operation;
-`/docs` renders the first one.
+The request and message shapes to send are in [openapi.yaml](openapi.yaml) and
+[asyncapi.yaml](asyncapi.yaml), each with examples per operation; `/docs` renders the first one.

@@ -99,3 +99,11 @@ Scope: `wagering_test` beside `wagering` and a second trio of queues under a pre
 Acceptance: OPS-010. Amended with it: MSG-001 and OPS-006, which now cover both namespaces.
 
 Exit evidence: `make up`, then the whole gate, then `make demo`, with no `make down` anywhere between them; the isolation cases compare what the suites address to what `docker compose config` resolves for the service roles.
+
+## 11. reader-experience — One command, and the evidence within reach
+
+Scope: `docker/stack.sh` choosing the first slot whose three published ports are free and announcing the move; `make demo` installing the dependencies and writing `.env` itself, as the default target; `make logs` and the failure paths that name it; `make drill`, which breaks an invariant on purpose and runs the cases that catch it; the demonstrations walking the refusals and printing the ledger the balance is rebuilt from; the paragraphs of `README.md` the tooling made unnecessary.
+
+Acceptance: OPS-011, OPS-012, OPS-013.
+
+Exit evidence: `make demo` in a fresh clone of this repository, on a host already publishing `3000`, `5433` and `4566`, from `git clone` to the eight demonstrations in one command; `make drill` catching all three mutations and leaving no file changed.

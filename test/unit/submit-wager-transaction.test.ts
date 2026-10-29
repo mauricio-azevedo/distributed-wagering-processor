@@ -210,6 +210,7 @@ function repositoriesOver(staged: Committed, calls: string[], ports: Ports): Rep
       },
       findByTransactionId: unreachable('ledger lookup'),
       summarize: unreachable('ledger summary'),
+      page: unreachable('ledger page'),
     },
     inbox: {
       claim: (message) => {

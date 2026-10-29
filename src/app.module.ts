@@ -11,8 +11,10 @@ import { APP_FILTER } from '@nestjs/core';
 import { TerminusModule } from '@nestjs/terminus';
 
 import { sha256Hex } from './application/sha256';
+import { GetWagerTransaction } from './application/use-cases/get-wager-transaction';
 import { GetWallet } from './application/use-cases/get-wallet';
 import { OpenWallet } from './application/use-cases/open-wallet';
+import { PageWalletLedger } from './application/use-cases/page-wallet-ledger';
 import { ReconcileWallet } from './application/use-cases/reconcile-wallet';
 import { SubmitWagerTransaction } from './application/use-cases/submit-wager-transaction';
 import { systemClock } from './infrastructure/clock';
@@ -22,6 +24,7 @@ import { PostgresHealthIndicator } from './infrastructure/health/postgres.health
 import { SqsHealthIndicator } from './infrastructure/health/sqs.health';
 import { bindCorrelationId } from './infrastructure/http/correlation-id';
 import { ProblemDetailsFilter } from './infrastructure/http/problem-details.filter';
+import { ProviderTransactionsController } from './infrastructure/http/provider-transactions.controller';
 import { WageringController } from './infrastructure/http/wagering.controller';
 import { WalletsController } from './infrastructure/http/wallets.controller';
 import { uuidV7IdGenerator } from './infrastructure/id-generator';
@@ -59,7 +62,12 @@ export class AppModule implements NestModule {
     return {
       module: AppModule,
       imports: [MikroOrmModule.forRoot(ormConfig(env.DATABASE_URL)), TerminusModule],
-      controllers: [HealthController, WalletsController, WageringController],
+      controllers: [
+        HealthController,
+        WalletsController,
+        WageringController,
+        ProviderTransactionsController,
+      ],
       providers: [
         sqsClientProvider(env),
         PostgresHealthIndicator,
@@ -79,6 +87,16 @@ export class AppModule implements NestModule {
         {
           provide: GetWallet,
           useFactory: (unitOfWork: MikroOrmUnitOfWork) => new GetWallet(unitOfWork),
+          inject: [MikroOrmUnitOfWork],
+        },
+        {
+          provide: PageWalletLedger,
+          useFactory: (unitOfWork: MikroOrmUnitOfWork) => new PageWalletLedger(unitOfWork),
+          inject: [MikroOrmUnitOfWork],
+        },
+        {
+          provide: GetWagerTransaction,
+          useFactory: (unitOfWork: MikroOrmUnitOfWork) => new GetWagerTransaction(unitOfWork),
           inject: [MikroOrmUnitOfWork],
         },
         CounterRegistry,

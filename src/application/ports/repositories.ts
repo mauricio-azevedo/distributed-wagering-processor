@@ -71,6 +71,15 @@ export interface ProviderTransactionIdentity {
   readonly externalTransactionId: string;
 }
 
+/**
+ * `api.transaction-read`: the two ways a read names a transaction — the service id, or the provider
+ * identity of `tx.identity`. The union is what makes the two read endpoints one decision: whichever
+ * identity a caller used, the answer is the transaction or `TransactionNotFoundError`, and the
+ * lookup a path admits is settled by its type rather than by the endpoint that happens to serve it.
+ */
+export type WagerTransactionLookup =
+  { readonly transactionId: string } | ProviderTransactionIdentity;
+
 export interface WagerTransactionRepository {
   /** Records a submission (`tx.born-pending`) or the outcome it was created with. */
   insert(transaction: WagerTransaction): Promise<void>;
@@ -142,6 +151,18 @@ export interface LedgerSummary {
   readonly headBalance: Money | null;
 }
 
+/**
+ * One page of a wallet's ledger (`api.ledger-read`). `afterWalletVersion` is an exclusive lower
+ * bound — the version the previous page ended at, `null` for the first page — because the cursor of
+ * `ledger.cursor` is a position in the version sequence and not an offset: entries committed while
+ * a caller holds a cursor land beyond it, so no page repeats or skips one.
+ */
+export interface LedgerPageQuery {
+  readonly walletId: string;
+  readonly afterWalletVersion: number | null;
+  readonly limit: number;
+}
+
 export interface LedgerRepository {
   /** Appends one entry; the ledger is never updated or deleted (`ledger.immutable`). */
   insert(entry: WalletLedgerEntry): Promise<void>;
@@ -151,6 +172,19 @@ export interface LedgerRepository {
    * when the transaction moved no money (`ledger.no-entry-without-effect`).
    */
   findByTransactionId(transactionId: string): Promise<WalletLedgerEntry | null>;
+
+  /**
+   * The entries of one wallet after `afterWalletVersion`, in ascending `walletVersion`, at most
+   * `limit` of them.
+   *
+   * `walletVersion` is the only ordering key a wallet's ledger has
+   * (`ledger.wallet-version-sequence`): it is unique per wallet, monotonic and backed by the index
+   * the chain triggers already need, so a page is a range scan whose cost does not grow with how
+   * far into the ledger it sits. Ordering by id would be wrong rather than slow — UUIDv7 is not
+   * monotonic across instances, so two entries committed at once by two of them can come back in
+   * either order and a page boundary would then skip or repeat one.
+   */
+  page(query: LedgerPageQuery): Promise<WalletLedgerEntry[]>;
 
   /**
    * The ledger's own account of a wallet, which is what reconciliation compares the stored balance

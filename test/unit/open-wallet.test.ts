@@ -101,6 +101,7 @@ function repositoriesOver(staged: Committed, options: { rejectWallet?: Error }):
       },
       findByTransactionId: unreachable('ledger lookup'),
       summarize: unreachable('ledger summary'),
+      page: unreachable('ledger page'),
     },
     inbox: {
       claim: unreachable('inbox'),

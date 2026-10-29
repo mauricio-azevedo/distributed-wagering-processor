@@ -659,8 +659,8 @@ entries:
       - 200 with the full view in the first three cases; 404 TRANSACTION_NOT_FOUND in the last.
     evidence: { testId: transaction-read-endpoints, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- LEDGER
   - id: LEDGER-001
@@ -782,8 +782,8 @@ entries:
       - Pages are contiguous and contain every entry exactly once; nextCursor is null on the last page; the malformed cursor answers 400 INVALID_CURSOR.
     evidence: { testId: ledger-cursor-pagination, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: LEDGER-009
     priority: required

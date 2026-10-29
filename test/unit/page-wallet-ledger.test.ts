@@ -109,6 +109,11 @@ function fakeUnitOfWork(options: {
       claimPending: unreachable('outbox claim'),
       recordAttempt: unreachable('publication attempt'),
     },
+    pendingReferences: {
+      insert: unreachable('pending reference schedule'),
+      claimNextDue: unreachable('pending reference claim'),
+      update: unreachable('pending reference reschedule'),
+    },
   };
 
   return {

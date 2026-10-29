@@ -16,6 +16,7 @@ import { GetWallet } from './application/use-cases/get-wallet';
 import { OpenWallet } from './application/use-cases/open-wallet';
 import { PageWalletLedger } from './application/use-cases/page-wallet-ledger';
 import { ReconcileWallet } from './application/use-cases/reconcile-wallet';
+import { ReprocessPendingReference } from './application/use-cases/reprocess-pending-reference';
 import { SubmitWagerTransaction } from './application/use-cases/submit-wager-transaction';
 import { systemClock } from './infrastructure/clock';
 import type { Env } from './infrastructure/config/env';
@@ -110,6 +111,23 @@ export class AppModule implements NestModule {
               metrics,
             }),
           inject: [MikroOrmUnitOfWork, CounterRegistry],
+        },
+        {
+          /*
+           * The recovery of a parked transaction (ADR 0011). It is constructed here and swept by
+           * nothing yet: the `worker` role that runs it on a timer, like the queue consumer and the
+           * outbox publisher beside it, arrives with the runtime roles (#19). Until then a parked
+           * transaction is reprocessed by whatever drives a sweep — the integration suites do.
+           */
+          provide: ReprocessPendingReference,
+          useFactory: (unitOfWork: MikroOrmUnitOfWork) =>
+            new ReprocessPendingReference({
+              unitOfWork,
+              clock: systemClock,
+              ids: uuidV7IdGenerator,
+              logger: nestLogger('pending-reference-scheduler'),
+            }),
+          inject: [MikroOrmUnitOfWork],
         },
         {
           provide: SubmitWagerTransaction,

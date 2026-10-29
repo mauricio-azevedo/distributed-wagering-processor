@@ -23,6 +23,7 @@ import type { IntegrationEventType } from '../../src/domain/integration-events';
 import { Money } from '../../src/domain/money';
 import type { OutboxMessage } from '../../src/domain/outbox-message';
 import type { TransactionKind, WagerOperationKind } from '../../src/domain/transaction-kind';
+import { PendingReferenceSchedule } from '../../src/domain/pending-reference-schedule';
 import { WagerTransaction, requiresReference } from '../../src/domain/wager-transaction';
 import { Wallet } from '../../src/domain/wallet';
 import type { WalletLedgerEntry } from '../../src/domain/wallet-ledger-entry';
@@ -94,6 +95,7 @@ interface Committed {
   readonly entries: WalletLedgerEntry[];
   readonly outbox: OutboxMessage[];
   readonly inbox: InboxMessage[];
+  readonly schedules: PendingReferenceSchedule[];
 }
 
 const empty = (): Committed => ({
@@ -102,6 +104,7 @@ const empty = (): Committed => ({
   entries: [],
   outbox: [],
   inbox: [],
+  schedules: [],
 });
 
 interface Ports {
@@ -143,6 +146,7 @@ function fakeUnitOfWork(ports: Ports = {}): {
       committed.entries.push(...staged.entries);
       committed.outbox.push(...staged.outbox);
       committed.inbox.push(...staged.inbox);
+      committed.schedules.push(...staged.schedules);
 
       return result;
     },
@@ -236,6 +240,16 @@ function repositoriesOver(staged: Committed, calls: string[], ports: Ports): Rep
       findByEventId: unreachable('outbox lookup'),
       claimPending: unreachable('outbox claim'),
       recordAttempt: unreachable('publication attempt'),
+    },
+    pendingReferences: {
+      insert: (schedule) => {
+        calls.push('schedule the first attempt');
+        staged.schedules.push(schedule);
+
+        return Promise.resolve();
+      },
+      claimNextDue: unreachable('pending reference claim'),
+      update: unreachable('pending reference reschedule'),
     },
   };
 }
@@ -970,7 +984,40 @@ describe('submit-parks-a-reference-it-cannot-resolve', () => {
       `lock ${WALLET_ID}`,
       `resolve ${BET.providerId}:${REFERENCE_EXTERNAL_ID}`,
       'record PENDING_REFERENCE',
+      'schedule the first attempt',
+      'enqueue WagerTransactionPendingReference',
     ]);
+  });
+
+  test('the park hands the transaction to the scheduler, due in a second and awaited for an hour', async () => {
+    const { execute, committed } = submitWagerTransaction({ wallet: walletHolding('460.00') });
+
+    await execute(operationOf('ROLLBACK'));
+
+    expect(committed.schedules).toHaveLength(1);
+    expect(committed.schedules[0]).toMatchObject({ transactionId: TRANSACTION_ID, attempts: 0 });
+    expect(committed.schedules[0]?.nextAttemptAt).toEqual(new Date(SUBMITTED_AT.getTime() + 1_000));
+    expect(committed.schedules[0]?.expiresAt).toEqual(new Date(SUBMITTED_AT.getTime() + 3_600_000));
+  });
+
+  test('the wait is announced once, with the reference awaited and when waiting stops', async () => {
+    const { execute, committed } = submitWagerTransaction({ wallet: walletHolding('460.00') });
+
+    await execute(operationOf('ROLLBACK'));
+
+    expect(eventTypes(committed)).toEqual(['WagerTransactionPendingReference']);
+    expect(committed.outbox[0]?.payload).toMatchObject({
+      aggregateId: WALLET_ID,
+      causationId: TRANSACTION_ID,
+      correlationId: CORRELATION_ID,
+    });
+    expect(committed.outbox[0]?.payload.data).toMatchObject({
+      transactionId: TRANSACTION_ID,
+      kind: 'ROLLBACK',
+      money: { amount: '40.00', currency: 'BRL' },
+      referenceExternalTransactionId: REFERENCE_EXTERNAL_ID,
+      expiresAt: new Date(SUBMITTED_AT.getTime() + 3_600_000).toISOString(),
+    });
   });
 
   test('a reference that has not reached an outcome yet is waited for, not refused', async () => {

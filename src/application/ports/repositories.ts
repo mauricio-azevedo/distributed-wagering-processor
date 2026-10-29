@@ -11,6 +11,7 @@
 import type { InboxMessage } from '../../domain/inbox-message';
 import type { Money } from '../../domain/money';
 import type { OutboxMessage } from '../../domain/outbox-message';
+import type { PendingReferenceSchedule } from '../../domain/pending-reference-schedule';
 import type { WagerTransaction } from '../../domain/wager-transaction';
 import type { Wallet } from '../../domain/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
@@ -197,6 +198,26 @@ export interface LedgerRepository {
    * accounted for while that wallet is being written (`recon.snapshot`).
    */
   summarize(query: LedgerSummaryQuery): Promise<LedgerSummary>;
+}
+
+export interface PendingReferenceScheduleRepository {
+  /** Adds a parked transaction to the claim list, in the transaction that parked it. */
+  insert(schedule: PendingReferenceSchedule): Promise<void>;
+
+  /**
+   * The next transaction whose attempt is due, claimed exclusively for the rest of the
+   * transaction, or `null` when none is (`ref.scheduler`).
+   *
+   * One row per call and one transaction per row: the claim is held while the attempt runs, so a
+   * worker that crashes mid-attempt releases it with its connection and the next sweep picks the
+   * row up, and several workers never pick the same one. A batch claimed in one transaction would
+   * couple the attempts instead — one failure would roll back every row in it, and one wallet lock
+   * would be held while another wallet's operation ran.
+   */
+  claimNextDue(at: Date): Promise<PendingReferenceSchedule | null>;
+
+  /** Writes what an attempt changed: how many have run and when the next one is due. */
+  update(schedule: PendingReferenceSchedule): Promise<void>;
 }
 
 /** `msg.inbox-identity`: the body message id, scoped to the consumer that received it. */

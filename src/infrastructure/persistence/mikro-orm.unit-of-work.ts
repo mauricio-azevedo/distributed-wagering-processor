@@ -4,6 +4,7 @@ import type { Repositories, UnitOfWork } from '../../application/ports/unit-of-w
 import { MikroOrmInboxRepository } from './repositories/inbox.repository';
 import { MikroOrmLedgerRepository } from './repositories/ledger.repository';
 import { MikroOrmOutboxRepository } from './repositories/outbox.repository';
+import { MikroOrmPendingReferenceScheduleRepository } from './repositories/pending-reference-schedule.repository';
 import { MikroOrmWagerTransactionRepository } from './repositories/wager-transaction.repository';
 import { MikroOrmWalletRepository } from './repositories/wallet.repository';
 import { transientDatabaseFailure } from './transient-failure';
@@ -87,7 +88,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
   }
 }
 
-/** The five repositories of one operation, all bound to the manager that holds its transaction. */
+/** The repositories of one operation, all bound to the manager that holds its transaction. */
 function repositoriesOf(em: EntityManager): Repositories {
   return {
     wallets: new MikroOrmWalletRepository(em),
@@ -95,5 +96,6 @@ function repositoriesOf(em: EntityManager): Repositories {
     ledger: new MikroOrmLedgerRepository(em),
     inbox: new MikroOrmInboxRepository(em),
     outbox: new MikroOrmOutboxRepository(em),
+    pendingReferences: new MikroOrmPendingReferenceScheduleRepository(em),
   };
 }

@@ -2,6 +2,7 @@ import type {
   InboxRepository,
   LedgerRepository,
   OutboxRepository,
+  PendingReferenceScheduleRepository,
   WagerTransactionRepository,
   WalletRepository,
 } from './repositories';
@@ -13,6 +14,7 @@ export interface Repositories {
   readonly ledger: LedgerRepository;
   readonly inbox: InboxRepository;
   readonly outbox: OutboxRepository;
+  readonly pendingReferences: PendingReferenceScheduleRepository;
 }
 
 /**

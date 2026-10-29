@@ -14,7 +14,7 @@ import {
   WagerTransaction,
   type WagerTransactionState,
 } from '../../src/domain/wager-transaction';
-import { Wallet } from '../../src/domain/wallet';
+import { type OpenedWallet, Wallet } from '../../src/domain/wallet';
 import type { WalletLedgerEntry } from '../../src/domain/wallet-ledger-entry';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
@@ -34,6 +34,8 @@ const REFERENCE_TRANSACTION_ID = '0193f0c0-0000-7000-8000-000000000007';
 const EVENT_ID = '0193f0c0-0000-7000-8000-000000000008';
 const OTHER_WALLET_ID = '0193f0c0-0000-7000-8000-000000000009';
 const OTHER_PLAYER_ID = '0193f0c0-0000-7000-8000-00000000000a';
+const OTHER_OPENING_TRANSACTION_ID = '0193f0c0-0000-7000-8000-00000000000b';
+const OTHER_OPENING_ENTRY_ID = '0193f0c0-0000-7000-8000-00000000000c';
 const CORRELATION_ID = '01a18266-39e0-7597-812c-a89950b9acf2';
 
 const OPENED_AT = new Date('2026-10-28T12:00:00.000Z');
@@ -106,31 +108,69 @@ function stored<T>(value: T | null, what: string): T {
   return value;
 }
 
-const openedWallet = (
-  balance: string,
-): { wallet: Wallet; openingEntry: WalletLedgerEntry | null } =>
-  Wallet.open({
-    id: WALLET_ID,
-    playerId: PLAYER_ID,
-    currency: 'BRL',
-    openedAt: OPENED_AT,
-    openingCredit: {
-      transactionId: OPENING_TRANSACTION_ID,
-      entryId: OPENING_ENTRY_ID,
-      money: brl(balance),
-    },
-  });
+/** Which wallet a fixture opens, when a case needs a second one beside the default. */
+interface WalletIdentity {
+  readonly id?: string;
+  readonly playerId?: string;
+  readonly currency?: string;
+  readonly transactionId?: string;
+  readonly entryId?: string;
+}
 
-/** A wallet as the database holds it, the shape `money.exact-persistence` has to return intact. */
-const storedWallet = (balance: string, currency = 'BRL'): Wallet =>
-  Wallet.rehydrate({
-    id: WALLET_ID,
-    playerId: PLAYER_ID,
-    balance: Money.from(balance, currency),
-    version: 4,
-    createdAt: OPENED_AT,
-    updatedAt: OCCURRED_AT,
+/**
+ * A wallet as `Wallet.open` leaves it: with its `OPENING` entry when the credit is positive
+ * (`wallet.opening-credit`), with none at `0.00` (`wallet.zero-opening`). Both halves are
+ * committed together by `given`, because a wallet row carrying a balance has to mirror the head of
+ * its ledger (ADR 0003, SCHEMA-017).
+ */
+const openedWallet = (balance: string, wallet: WalletIdentity = {}): OpenedWallet => {
+  const currency = wallet.currency ?? 'BRL';
+  return Wallet.open({
+    id: wallet.id ?? WALLET_ID,
+    playerId: wallet.playerId ?? PLAYER_ID,
+    currency,
+    openedAt: OPENED_AT,
+    openingCredit:
+      balance === '0.00'
+        ? null
+        : {
+            transactionId: wallet.transactionId ?? OPENING_TRANSACTION_ID,
+            entryId: wallet.entryId ?? OPENING_ENTRY_ID,
+            money: Money.from(balance, currency),
+          },
   });
+};
+
+/**
+ * A wallet as the database holds it past its opening: opened at `0.00` and credited once, so it
+ * carries version 2, an `updatedAt` later than its `createdAt`, and a ledger whose first entry is
+ * at version 2, the shape `ledger.chain` admits for a wallet opened with nothing.
+ */
+function creditedWallet(
+  balance: string,
+  currency = 'BRL',
+): { wallet: Wallet; transaction: WagerTransaction; entry: WalletLedgerEntry } {
+  const money = Money.from(balance, currency);
+  const outcome = openedWallet('0.00', { currency }).wallet.credit({
+    transactionId: TRANSACTION_ID,
+    entryId: ENTRY_ID,
+    playerId: PLAYER_ID,
+    operation: { kind: 'WIN' },
+    money,
+    occurredAt: OCCURRED_AT,
+  });
+  if (!outcome.applied) {
+    throw new Error(
+      `a credit inside the bound applies, it was refused with ${outcome.failureCode}`,
+    );
+  }
+
+  return {
+    wallet: outcome.wallet,
+    transaction: WagerTransaction.create(submission({ kind: 'WIN', money })),
+    entry: outcome.entry,
+  };
+}
 
 const submission = (overrides: Partial<NewWagerTransaction> = {}): NewWagerTransaction => ({
   id: TRANSACTION_ID,
@@ -150,30 +190,98 @@ const submission = (overrides: Partial<NewWagerTransaction> = {}): NewWagerTrans
 });
 
 /** `wallet.opening-credit`: the internal transaction an opening entry belongs to. */
-const openingTransaction = (amount: string): WagerTransaction =>
-  WagerTransaction.create(
+function openingTransactionOf(opened: OpenedWallet): WagerTransaction | null {
+  const { wallet, openingEntry } = opened;
+  if (openingEntry === null) {
+    return null;
+  }
+
+  return WagerTransaction.create(
     submission({
-      id: OPENING_TRANSACTION_ID,
+      id: openingEntry.transactionId,
       providerId: 'system',
-      externalTransactionId: WALLET_ID,
-      idempotencyKey: `system:${WALLET_ID}`,
-      roundId: WALLET_ID,
+      externalTransactionId: wallet.id,
+      idempotencyKey: `system:${wallet.id}`,
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      roundId: wallet.id,
       gameId: 'wallet-opening',
       kind: 'OPENING',
-      money: brl(amount),
+      money: openingEntry.money,
     }),
   );
+}
 
 /**
  * The rows the foreign keys of ADR 0003 require around whatever a case is really writing: a
- * transaction points at its wallet, a ledger entry at its transaction.
+ * transaction points at its wallet, a ledger entry at its transaction. A wallet opened with a
+ * credit arrives with that entry and the transaction it belongs to, because the commit-time mirror
+ * admits no balance without the head of a ledger behind it.
  */
-function given(wallet: Wallet, ...rows: WagerTransaction[]): Promise<void> {
-  return unitOfWork.transactional(async ({ wallets, transactions }) => {
-    await wallets.insert(wallet);
+function given(opened: OpenedWallet, ...rows: WagerTransaction[]): Promise<void> {
+  return unitOfWork.transactional(async ({ wallets, transactions, ledger }) => {
+    await wallets.insert(opened.wallet);
+    const opening = openingTransactionOf(opened);
+    if (opening !== null && opened.openingEntry !== null) {
+      await transactions.insert(opening);
+      await ledger.insert(opened.openingEntry);
+    }
     for (const row of rows) {
       await transactions.insert(row);
     }
+  });
+}
+
+/**
+ * A balance change committed by a writer that is not this unit of work: the submission through the
+ * repositories, then the entry and the wallet row as the schema owner, in one transaction, because
+ * the ledger and the balance are committed together or not at all (ADR 0003, SCHEMA-021).
+ */
+async function debitOutsideTheUnitOfWork(opened: OpenedWallet, money: Money): Promise<void> {
+  const outcome = opened.wallet.debit({
+    transactionId: TRANSACTION_ID,
+    entryId: ENTRY_ID,
+    playerId: opened.wallet.playerId,
+    operation: { kind: 'BET' },
+    money,
+    occurredAt: OCCURRED_AT,
+  });
+  if (!outcome.applied) {
+    throw new Error(`a covered debit applies, it was refused with ${outcome.failureCode}`);
+  }
+
+  await unitOfWork.transactional(({ transactions }) =>
+    transactions.insert(WagerTransaction.create(submission({ money }))),
+  );
+
+  const { entry, wallet } = outcome;
+  const connection = schema.em.getConnection();
+  await connection.transactional(async (context) => {
+    await connection.execute(
+      `insert into wallet_ledger_entries (id, wallet_id, transaction_id, kind, direction, currency,
+                                          amount, balance_before, balance_after, wallet_version,
+                                          created_at)
+            values (?, ?, ?, 'BET', 'DEBIT', ?, ?, ?, ?, ?, ?)`,
+      [
+        entry.id,
+        entry.walletId,
+        entry.transactionId,
+        entry.money.currency,
+        entry.money.toString(),
+        entry.balanceBefore.toString(),
+        entry.balanceAfter.toString(),
+        entry.walletVersion,
+        entry.createdAt,
+      ],
+      'run',
+      context,
+    );
+    await connection.execute(
+      'update wallets set balance = ?, version = ?, updated_at = ? where id = ?',
+      [wallet.balance.toString(), wallet.version, wallet.updatedAt, wallet.id],
+      'run',
+      context,
+    );
   });
 }
 
@@ -217,13 +325,13 @@ const stateOf = (transaction: WagerTransaction): WagerTransactionState => ({
 
 describe('persistence-mapping-round-trip', () => {
   test('a wallet rehydrates to the state the factory produced', async () => {
-    const { wallet } = openedWallet('500.00');
+    const opened = openedWallet('500.00');
 
-    await unitOfWork.transactional(({ wallets }) => wallets.insert(wallet));
+    await given(opened);
 
     expect(
       await unitOfWork.transactional(({ wallets }) => wallets.findById(WALLET_ID)),
-    ).toStrictEqual(wallet);
+    ).toStrictEqual(opened.wallet);
   });
 
   test('an unknown wallet is absent rather than an error', async () => {
@@ -232,22 +340,25 @@ describe('persistence-mapping-round-trip', () => {
 
   test('the opening entry rehydrates with its direction, kind and arithmetic', async () => {
     const opened = openedWallet('500.00');
-    const openingEntry = stored(opened.openingEntry, 'opening entry');
-    await given(opened.wallet, openingTransaction('500.00'));
 
-    await unitOfWork.transactional(({ ledger }) => ledger.insert(openingEntry));
+    await given(opened);
 
     const loaded = await unitOfWork.transactional(({ ledger }) =>
       ledger.findByTransactionId(OPENING_TRANSACTION_ID),
     );
 
-    expect(loaded).toStrictEqual(openingEntry);
+    expect(loaded).toStrictEqual(stored(opened.openingEntry, 'opening entry'));
     expect(loaded?.isBalanced()).toBe(true);
   });
 
+  /**
+   * The wallet row is inserted in the state the debit left it, because the balance and the head of
+   * its ledger are committed together (ADR 0003): the opening entry at version 1 and the debit
+   * entry at version 2 are the chain the row at version 2 mirrors.
+   */
   test('a debit entry rehydrates with the balances it recorded', async () => {
-    const { wallet } = openedWallet('500.00');
-    const outcome = wallet.debit({
+    const opened = openedWallet('500.00');
+    const outcome = opened.wallet.debit({
       transactionId: TRANSACTION_ID,
       entryId: ENTRY_ID,
       playerId: PLAYER_ID,
@@ -258,9 +369,14 @@ describe('persistence-mapping-round-trip', () => {
     if (!outcome.applied) {
       throw new Error(`a covered debit applies, it was refused with ${outcome.failureCode}`);
     }
-    await given(wallet, WagerTransaction.create(submission()));
 
-    await unitOfWork.transactional(({ ledger }) => ledger.insert(outcome.entry));
+    await unitOfWork.transactional(async ({ wallets, transactions, ledger }) => {
+      await wallets.insert(outcome.wallet);
+      await transactions.insert(stored(openingTransactionOf(opened), 'opening transaction'));
+      await ledger.insert(stored(opened.openingEntry, 'opening entry'));
+      await transactions.insert(WagerTransaction.create(submission()));
+      await ledger.insert(outcome.entry);
+    });
 
     expect(
       await unitOfWork.transactional(({ ledger }) => ledger.findByTransactionId(TRANSACTION_ID)),
@@ -269,7 +385,7 @@ describe('persistence-mapping-round-trip', () => {
 
   test('a pending transaction rehydrates with every outcome column still empty', async () => {
     const transaction = WagerTransaction.create(submission());
-    await given(openedWallet('500.00').wallet);
+    await given(openedWallet('500.00'));
 
     await unitOfWork.transactional(({ transactions }) => transactions.insert(transaction));
 
@@ -290,7 +406,7 @@ describe('persistence-mapping-round-trip', () => {
       referenceTransactionId: REFERENCE_TRANSACTION_ID,
     });
     await given(
-      openedWallet('500.00').wallet,
+      openedWallet('500.00'),
       // the transaction the refund reverses, which its resolved reference points at
       WagerTransaction.create(
         submission({
@@ -318,7 +434,7 @@ describe('persistence-mapping-round-trip', () => {
   test('a rejected transaction keeps the currency of its amount and of its observed balance', async () => {
     const transaction = WagerTransaction.create(submission({ money: Money.from('10.00', 'EUR') }));
     transaction.reject({ failureCode: 'CURRENCY_MISMATCH', observedBalance: brl('500.00') });
-    await given(openedWallet('500.00').wallet);
+    await given(openedWallet('500.00'));
 
     await unitOfWork.transactional(({ transactions }) => transactions.insert(transaction));
 
@@ -412,18 +528,18 @@ describe('persistence-mapping-round-trip', () => {
 describe('money-round-trips-through-postgres', () => {
   for (const amount of ['0.00', '0.01', '1.50', '40.00', '100000000000.10', BOUND]) {
     test(`a balance of ${amount} reads back to the cent`, async () => {
-      const wallet = storedWallet(amount);
+      const opened = openedWallet(amount);
 
-      await unitOfWork.transactional(({ wallets }) => wallets.insert(wallet));
+      await given(opened);
       const loaded = await unitOfWork.transactional(({ wallets }) => wallets.findById(WALLET_ID));
 
       expect(loaded?.balance.toString()).toBe(amount);
-      expect(loaded?.balance.equals(wallet.balance)).toBe(true);
+      expect(loaded?.balance.equals(opened.wallet.balance)).toBe(true);
     });
   }
 
   test('the column holds the amount as money, not as minor units', async () => {
-    await unitOfWork.transactional(({ wallets }) => wallets.insert(storedWallet(BOUND)));
+    await given(openedWallet(BOUND));
 
     const rows = await runtime.em
       .getConnection()
@@ -432,14 +548,25 @@ describe('money-round-trips-through-postgres', () => {
     expect(rows[0]?.balance).toBe(BOUND);
   });
 
-  test('a foreign currency survives the round trip with its amount', async () => {
-    const wallet = storedWallet('12.34', 'EUR');
+  /**
+   * A wallet past its opening, so the round trip covers a stored version other than 1 and an
+   * `updatedAt` later than the `createdAt` beside it, in a currency that is not the default.
+   */
+  test('a foreign currency survives the round trip with its version and times', async () => {
+    const credited = creditedWallet('12.34', 'EUR');
 
-    await unitOfWork.transactional(({ wallets }) => wallets.insert(wallet));
+    await unitOfWork.transactional(async ({ wallets, transactions, ledger }) => {
+      await wallets.insert(credited.wallet);
+      await transactions.insert(credited.transaction);
+      await ledger.insert(credited.entry);
+    });
 
-    expect(
-      await unitOfWork.transactional(({ wallets }) => wallets.findById(WALLET_ID)),
-    ).toStrictEqual(wallet);
+    const loaded = await unitOfWork.transactional(({ wallets }) => wallets.findById(WALLET_ID));
+
+    expect(loaded).toStrictEqual(credited.wallet);
+    expect(loaded?.version).toBe(2);
+    expect(loaded?.balance.toString()).toBe('12.34');
+    expect(loaded?.updatedAt).toEqual(OCCURRED_AT);
   });
 });
 
@@ -484,7 +611,7 @@ describe('unit-of-work', () => {
 
     const failure = unitOfWork.transactional(async ({ wallets, transactions, ledger }) => {
       await wallets.insert(opened.wallet);
-      await transactions.insert(openingTransaction('500.00'));
+      await transactions.insert(stored(openingTransactionOf(opened), 'opening transaction'));
       await ledger.insert(openingEntry);
       throw new Error('the use case failed after writing');
     });
@@ -509,15 +636,13 @@ describe('unit-of-work', () => {
    * its first read.
    */
   test('an operation never serves a wallet another operation already loaded', async () => {
-    const { wallet } = openedWallet('500.00');
-    await unitOfWork.transactional(({ wallets }) => wallets.insert(wallet));
+    const opened = openedWallet('500.00');
+    await given(opened);
 
     const first = await unitOfWork.transactional(({ wallets }) => wallets.findById(WALLET_ID));
     expect(first?.balance.toString()).toBe('500.00');
 
-    await schema.em
-      .getConnection()
-      .execute('update wallets set balance = 460.00, version = 2 where id = ?', [WALLET_ID]);
+    await debitOutsideTheUnitOfWork(opened, brl('40.00'));
 
     const second = await unitOfWork.transactional(({ wallets }) => wallets.findById(WALLET_ID));
     expect(second?.balance.toString()).toBe('460.00');
@@ -526,19 +651,14 @@ describe('unit-of-work', () => {
 
   test('concurrent operations commit their own rows', async () => {
     // another player, because one wallet per player and currency is a unique key of ADR 0003
-    const other = Wallet.rehydrate({
+    const other = openedWallet('10.00', {
       id: OTHER_WALLET_ID,
       playerId: OTHER_PLAYER_ID,
-      balance: brl('10.00'),
-      version: 1,
-      createdAt: OPENED_AT,
-      updatedAt: OPENED_AT,
+      transactionId: OTHER_OPENING_TRANSACTION_ID,
+      entryId: OTHER_OPENING_ENTRY_ID,
     });
 
-    await Promise.all([
-      unitOfWork.transactional(({ wallets }) => wallets.insert(openedWallet('500.00').wallet)),
-      unitOfWork.transactional(({ wallets }) => wallets.insert(other)),
-    ]);
+    await Promise.all([given(openedWallet('500.00')), given(other)]);
 
     const [first, second] = await unitOfWork.transactional(({ wallets }) =>
       Promise.all([wallets.findById(WALLET_ID), wallets.findById(OTHER_WALLET_ID)]),

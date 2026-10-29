@@ -1337,10 +1337,12 @@ entries:
     enforcement:
       - Row lock on the wallet; no shared lock.
     scenario:
-      - 200 wallets each receiving 20 bets, all submitted at once from three processes, then the same submissions aimed at one wallet as the baseline the first run is measured against.
+      - 200 wallets each receiving 20 bets, all submitted at once from three processes.
+      - "One wallet's bet driven through the production use case and stopped between its last statement and its commit, with everything it locked still held, while another wallet's bet is submitted the same way: once from another process, and once from the same instance that is holding the first."
     expected:
       - Every wallet ends at version 21 with twenty debits and consistent with its ledger.
-      - One operation on a wallet of its own costs a fraction of one queued behind the rest, measured per operation so the comparison calibrates itself on the machine it runs on. The margin asserted sits just above the ratio of one that a lock wider than the row would produce, rather than near the ratio measured, so a busy machine cannot fail the case and a global lock cannot pass it.
+      - "The other wallet's bet is processed and committed while the first is still held: read outside both transactions, its wallet already carries the debit and the held wallet does not. The held submission then commits its own outcome unchanged."
+      - 'No assertion reads a clock, so a failure means parallelism narrowed rather than that the machine was busy. The only time value is a safety timeout, which makes a blocked operation fail the case instead of hanging the suite. Both shapes are kept because they fall to different defects: a lock wider than the row stops the operation in the other process, and a mutex inside the application stops only the one in the same process.'
     evidence: { testId: distinct-wallets-in-parallel, layer: concurrency }
     deliverySlice: concurrent-debits
     implementationStatus: implemented

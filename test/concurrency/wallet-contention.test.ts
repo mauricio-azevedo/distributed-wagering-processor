@@ -2,12 +2,17 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import path from 'node:path';
 
+import type { Repositories, UnitOfWork } from '../../src/application/ports/unit-of-work';
 import { sha256Hex } from '../../src/application/sha256';
 import { OpenWallet } from '../../src/application/use-cases/open-wallet';
 import {
   ReconcileWallet,
   type ReconciliationReport,
 } from '../../src/application/use-cases/reconcile-wallet';
+import {
+  SubmitWagerTransaction,
+  type SubmissionOutcome,
+} from '../../src/application/use-cases/submit-wager-transaction';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import { systemClock } from '../../src/infrastructure/clock';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
@@ -15,7 +20,11 @@ import { silentLogger } from '../../src/infrastructure/observability/logger';
 import { uncountedMetrics } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
-import type { SubmissionReport, WagerCommand } from '../helpers/wager-command';
+import {
+  type SubmissionReport,
+  type WagerCommand,
+  wagerCommandSchema,
+} from '../helpers/wager-command';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
 /**
@@ -28,6 +37,11 @@ import { TouchedWallets } from '../helpers/wallet-reconciliation';
  * share — so what the assertions below describe is a deployment and not an event loop. A test that
  * raced promises in one runtime could pass with no locking at all: one event loop never interleaves
  * two transactions, it runs them one after the other.
+ *
+ * The one case that also runs an instance in the suite's own process is the same-instance shape of
+ * CONC-001, and it races nothing: it stops one operation with its transaction open and observes
+ * another wallet's operation getting past it. What that asks about is a mutex in this runtime,
+ * which is a question only one runtime can be asked.
  *
  * Every case ends by reconciling each wallet it touched against its ledger
  * (`recon.final-invariant`, RECON-004), because a count of outcomes is not a proof of correctness:
@@ -73,23 +87,14 @@ const WALLETS = 200;
 const BETS_PER_WALLET = 20;
 
 /**
- * The same submissions aimed at one wallet, as the baseline the parallel run is measured against.
- * It is a tenth of the load because its per-operation cost is what matters, not its total: every
- * one of them waits for the lock the one before it holds, so the two runs are compared per
- * operation and the measurement calibrates itself on the machine it runs on.
+ * How long an operation on a wallet of its own may take while another wallet's operation is held
+ * mid-transaction with its lock still open. It is not a performance bound: a submission that waits
+ * for nothing commits in milliseconds, and this is three orders of magnitude above that. What it
+ * is for is the failure — an operation that is blocked has to fail the case instead of hanging the
+ * suite, which it would do until the lock ceiling if a database lock stopped it and forever if an
+ * application mutex did.
  */
-const SERIALIZED = 400;
-
-/**
- * How much cheaper one operation on a wallet of its own has to be than one in a queue behind 399
- * others. What this has to catch is a lock wider than the row — an advisory lock, a table lock, a
- * mutex around the use case — and any of those makes the two runs equally slow: a ratio of about
- * one. The margin is set just above that rather than near what was measured (around six on a
- * developer machine, bounded by what the one PostgreSQL container can commit per second, not by the
- * thirty submissions in flight), so a busy machine cannot fail the case and a global lock cannot
- * pass it.
- */
-const PARALLEL_SPEEDUP = 2;
+const UNBLOCKED_MS = 15_000;
 
 /** `conc.lock-order`: the mixed load of CONC-008, as targets a reversal can name. */
 const MIXED_TARGETS = 30;
@@ -414,6 +419,27 @@ async function walletSummaries(): Promise<
   ).map((row) => ({ ...row, entries: Number(row.entries), debits: Number(row.debits) }));
 }
 
+/**
+ * One wallet row, read by the migrator outside every transaction a case opened. It is how a case
+ * observes what is committed while something else is still holding a transaction open: the role is
+ * not the service's, the statement is in no transaction under test, and `READ COMMITTED` means an
+ * uncommitted change is invisible to it by construction.
+ */
+async function walletRow(walletId: string): Promise<{ balance: string; version: number }> {
+  const [row] = await schema.em
+    .getConnection()
+    .execute<{ balance: string; version: number }[]>(
+      'select "balance"::text as "balance", "version" from "wallets" where "id" = ?',
+      [walletId],
+    );
+
+  if (row === undefined) {
+    throw new Error(`no wallet has the id ${walletId}`);
+  }
+
+  return row;
+}
+
 /** The ledger of one wallet, as the pairs of kind and direction its entries carry, in order. */
 async function ledgerOf(walletId: string): Promise<string[]> {
   const rows = await runtime.em
@@ -590,14 +616,26 @@ describe('fifty-duplicates-one-debit', () => {
 });
 
 /**
- * `conc.parallel-wallets` (CONC-001): the unit of concurrency is the wallet, so operations on
- * distinct wallets must not wait for each other. The claim is comparative and therefore measured
- * against the same load aimed at one wallet, on the same machine, through the same instances: what
- * the two runs differ in is the spread of wallets and nothing else.
+ * `conc.parallel-wallets` (CONC-001): the unit of concurrency is the wallet, so an operation on one
+ * wallet must not wait for an operation on another.
+ *
+ * That is a claim about the scope of a lock, and lock scope is observed rather than timed: one
+ * wallet's operation is stopped between its last statement and its commit, with everything it took
+ * still held, and another wallet's operation is applied and committed while it waits. What a
+ * failure then means is that the second operation could not get past the first — the narrowing
+ * this case exists to refuse — and never that the machine was busy, because no assertion here
+ * reads a clock. The one time value is the safety timeout that turns a blocked operation into a
+ * failed case instead of a hung suite.
+ *
+ * Both shapes are covered, because they fall to different mutations: the second operation in
+ * another process, which is where a lock wider than the row shows up, and in the same process,
+ * which is the only place an application-level mutex can be seen at all. Beside them, the load the
+ * acceptance scenario names — two hundred wallets taking twenty bets each, from three instances at
+ * once — is the case that every wallet ends holding exactly its own operations.
  */
 describe('distinct-wallets-in-parallel', () => {
   test(
-    `${WALLETS.toString()} wallets taking ${BETS_PER_WALLET.toString()} bets each cost a fraction per operation of one wallet taking ${SERIALIZED.toString()}`,
+    `${WALLETS.toString()} wallets taking ${BETS_PER_WALLET.toString()} bets each all apply, every wallet holding only its own`,
     async () => {
       const wallets = await walletsWith(WALLETS, '100.00');
 
@@ -635,32 +673,244 @@ describe('distinct-wallets-in-parallel', () => {
             wallet.debits === BETS_PER_WALLET,
         ),
       ).toBe(true);
-
-      const { walletId, playerId } = await walletWith(`${(SERIALIZED + 1).toString()}.00`);
-      const queued = Array.from({ length: SERIALIZED }, (_unused, index) =>
-        submission({
-          walletId,
-          playerId,
-          kind: 'BET',
-          amount: '1.00',
-          externalTransactionId: `acme-tx-${walletId}-${index.toString()}`,
-        }),
-      );
-
-      const serial = await instances.fire(dealt(queued));
-
-      expect(outcomesOf(serial).every((report) => recorded(report).status === 'PROCESSED')).toBe(
-        true,
-      );
-
-      const perOperationOnDistinctWallets = parallel.elapsedMs / (WALLETS * BETS_PER_WALLET);
-      const perOperationOnOneWallet = serial.elapsedMs / SERIALIZED;
-
-      expect(perOperationOnOneWallet / perOperationOnDistinctWallets).toBeGreaterThan(
-        PARALLEL_SPEEDUP,
-      );
     },
     BATCH_TIMEOUT_MS,
+  );
+
+  /** A promise and the call that resolves it: one direction of the handshake with a held operation. */
+  function signal(): { awaited: Promise<void>; send: () => void } {
+    let send!: () => void;
+    const awaited = new Promise<void>((resolve) => {
+      send = (): void => {
+        resolve();
+      };
+    });
+
+    return { awaited, send };
+  }
+
+  /**
+   * The production unit of work with one addition: the transaction it is armed for stops between
+   * its last statement and its commit, and resumes when the case releases it. Everything up to
+   * that point is the service's own — the reservation, the lock statement of ADR 0002 in its fixed
+   * place, the decision and the writes — so what stays held while the case submits elsewhere is the
+   * real lock of a real operation and not a hand-written `SELECT ... FOR NO KEY UPDATE` standing in
+   * for one. The difference is the point of the case: a stand-in would still be taken if the
+   * service's own lock were widened or replaced, and nothing would notice.
+   *
+   * Every other transaction passes straight through, the ones the same instance opens while the
+   * held one waits included. That is what lets one `SubmitWagerTransaction` apply both operations
+   * of the same-instance case, so a mutex anywhere in the path — around the module, in the
+   * instance, inside the unit of work — is held by the stopped operation and the second submission
+   * cannot pass it.
+   */
+  class HoldingUnitOfWork implements UnitOfWork {
+    private readonly arrived = signal();
+    private readonly released = signal();
+    private arming = false;
+
+    constructor(private readonly inner: UnitOfWork) {}
+
+    /** Resolves once the armed transaction has run its last statement and is waiting to commit. */
+    get reached(): Promise<void> {
+      return this.arrived.awaited;
+    }
+
+    /** Arms the hold on the next transaction, and answers the call that lets it commit. */
+    holdNext(): () => void {
+      this.arming = true;
+
+      return this.released.send;
+    }
+
+    transactional<T>(work: (repositories: Repositories) => Promise<T>): Promise<T> {
+      if (!this.arming) {
+        return this.inner.transactional(work);
+      }
+
+      this.arming = false;
+
+      return this.inner.transactional(async (repositories) => {
+        const done = await work(repositories);
+        this.arrived.send();
+        await this.released.awaited;
+
+        return done;
+      });
+    }
+
+    snapshot<T>(work: (repositories: Repositories) => Promise<T>): Promise<T> {
+      return this.inner.snapshot(work);
+    }
+  }
+
+  /** One instance of the service in this process: the use case, and the hold on its unit of work. */
+  interface HoldingInstance {
+    readonly submit: SubmitWagerTransaction;
+    readonly holder: HoldingUnitOfWork;
+  }
+
+  /**
+   * An instance in the suite's own process, wired from the same parts as the worker's
+   * (`submitterOf` in `test/helpers/wager-command.ts`) with the hold around its unit of work.
+   */
+  function instanceHere(): HoldingInstance {
+    const holder = new HoldingUnitOfWork(new MikroOrmUnitOfWork(runtime.em, LOCK_CEILING_MS));
+
+    return {
+      holder,
+      submit: new SubmitWagerTransaction({
+        unitOfWork: holder,
+        clock: systemClock,
+        ids: uuidV7IdGenerator,
+        sha256Hex,
+        logger: silentLogger,
+        metrics: uncountedMetrics,
+      }),
+    };
+  }
+
+  /**
+   * `work`, or a failure within `UNBLOCKED_MS` naming what did not finish. The bound asserts
+   * nothing about speed: it is what makes a blocked operation fail the case, which it would
+   * otherwise do only when the lock ceiling expired, or never at all if a mutex was what blocked it.
+   */
+  async function unblocked<T>(what: string, work: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expiry = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `${what} did not finish within ${UNBLOCKED_MS.toString()} ms while another wallet's operation held its transaction open`,
+          ),
+        );
+      }, UNBLOCKED_MS);
+    });
+
+    try {
+      return await Promise.race([work, expiry]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Submits `holdOn` through an instance of its own, stops it with its transaction open, runs `act`
+   * while it waits and then lets it commit. Answers the outcome the held submission recorded, so a
+   * case can assert that being held changed it in no way.
+   */
+  async function holdingMidTransaction(
+    holdOn: WagerCommand,
+    act: (instance: HoldingInstance) => Promise<void>,
+  ): Promise<SubmissionOutcome> {
+    const instance = instanceHere();
+    const release = instance.holder.holdNext();
+    const holding = instance.submit.execute(wagerCommandSchema.parse(holdOn));
+
+    // Either the hold is in place, or the held submission failed before reaching it: waiting on the
+    // barrier alone would spend the case's whole timeout on a submission that is never coming.
+    await Promise.race([instance.holder.reached, holding]);
+
+    try {
+      await act(instance);
+    } finally {
+      // Unconditional, so a failure in `act` leaves no transaction open and no promise pending
+      // behind the case; the held outcome is still what this returns, rejection included.
+      release();
+      await holding.catch(() => undefined);
+    }
+
+    return holding;
+  }
+
+  /**
+   * The observation CONC-001 rests on, in whichever shape `applyFree` submits the second operation:
+   * one wallet's operation is held with its transaction open, another wallet's operation is applied
+   * while it waits, and each wallet ends as its own operation left it.
+   *
+   * `applyFree` answers the statuses it recorded, which is all the two shapes have in common — one
+   * reads them off a pipe from another process, the other off an outcome in this one.
+   */
+  async function anotherWalletMovesWhileOneIsHeld(
+    applyFree: (instance: HoldingInstance, free: WagerCommand) => Promise<string[]>,
+  ): Promise<void> {
+    const stopped = await walletWith('100.00');
+    const free = await walletWith('100.00');
+
+    const held = await holdingMidTransaction(
+      submission({
+        ...stopped,
+        kind: 'BET',
+        amount: '30.00',
+        externalTransactionId: `acme-tx-${stopped.walletId}`,
+      }),
+      async (instance) => {
+        expect(
+          await applyFree(
+            instance,
+            submission({
+              ...free,
+              kind: 'BET',
+              amount: '40.00',
+              externalTransactionId: `acme-tx-${free.walletId}`,
+            }),
+          ),
+        ).toEqual(['PROCESSED']);
+
+        // Read by the migrator while the hold is still in place, which is the observation itself:
+        // the free wallet's debit is committed and the held wallet's is not, so the operation that
+        // did not wait is the one that committed, and the transaction it did not wait for is still
+        // open with its lock.
+        expect(await walletRow(free.walletId)).toEqual({ balance: '60.00', version: 2 });
+        expect(await walletRow(stopped.walletId)).toEqual({ balance: '100.00', version: 1 });
+      },
+    );
+
+    // Being held changed the held submission in no way: it commits its own outcome afterwards.
+    expect(held.transaction.status).toBe('PROCESSED');
+    expect(held.idempotentReplay).toBe(false);
+
+    expect(await walletRow(stopped.walletId)).toEqual({ balance: '70.00', version: 2 });
+    expect(await ledgerOf(stopped.walletId)).toEqual(['OPENING CREDIT', 'BET DEBIT']);
+    expect(await ledgerOf(free.walletId)).toEqual(['OPENING CREDIT', 'BET DEBIT']);
+  }
+
+  /**
+   * Across processes, which is the shape a database lock wider than the wallet row falls to: the
+   * held operation is in this process and the one that must not wait for it is in a worker, so
+   * nothing the two share is in a heap. A table lock or an advisory lock taken by the held
+   * operation stops the worker's bet here, and the wait is reported instead of being averaged away.
+   */
+  test(
+    "a bet on another wallet commits in another process while one wallet's operation is held mid-transaction",
+    () =>
+      anotherWalletMovesWhileOneIsHeld(async (_instance, free) =>
+        statusesOf(
+          outcomesOf(await unblocked('the bet in another instance', instances.fire([[free]]))),
+        ),
+      ),
+    UNBLOCKED_MS * 2,
+  );
+
+  /**
+   * Inside one process, which is the shape an application-level mutex falls to and the one a
+   * cross-process case cannot see at all: both operations are applied by the same
+   * `SubmitWagerTransaction`, on the same instance, in the suite's own runtime. A mutex held across
+   * the submission — in the use case, in the unit of work, in a module around either — is held by
+   * the stopped operation, and the second bet never reaches the database.
+   */
+  test(
+    "a bet on another wallet commits in the same instance while one wallet's operation is held mid-transaction",
+    () =>
+      anotherWalletMovesWhileOneIsHeld(async ({ submit }, free) => [
+        (
+          await unblocked(
+            'the bet in the same instance',
+            submit.execute(wagerCommandSchema.parse(free)),
+          )
+        ).transaction.status,
+      ]),
+    UNBLOCKED_MS * 2,
   );
 });
 

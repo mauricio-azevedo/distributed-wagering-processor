@@ -74,3 +74,14 @@ export class InvalidWagerTransactionError extends DomainError {}
  * skipped the question instead of a duplicate arriving.
  */
 export class InvalidMessageStateError extends DomainError {}
+
+/**
+ * A value that cannot be hashed into one canonical form: data JSON has no form for reaching the
+ * canonical serializer, or a digest that is not the lowercase hex SHA-256 the contract stores
+ * (`idem.payload-hash`).
+ *
+ * It is a programming error, not a business outcome: the payload is validated before it is
+ * hashed, so a refusal here means the code that assembled the payload, or the code that digested
+ * it, departed from the form every instance has to agree on.
+ */
+export class CanonicalHashError extends DomainError {}

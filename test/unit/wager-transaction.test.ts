@@ -296,6 +296,7 @@ describe('status-transition-table', () => {
       'isTerminal',
       'markPendingReference',
       'markProcessed',
+      'matchesPayload',
       'reject',
     ]);
   });

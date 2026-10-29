@@ -535,7 +535,7 @@ entries:
       - The second answers 409 EXTERNAL_TRANSACTION_ALREADY_BOUND; one row exists.
     evidence: { testId: provider-transaction-id-is-unique, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: TX-003
@@ -1132,13 +1132,14 @@ entries:
     contract: [idem.key-required, idem.key-format]
     enforcement:
       - Header validation on HTTP; data.idempotencyKey validation on the consumer.
+      - isIdempotencyKey of src/domain/idempotency.ts is the one format both entry points validate against.
     scenario:
       - POST without the header; POST with a 300-character key; a message without data.idempotencyKey.
     expected:
       - 400 IDEMPOTENCY_KEY_REQUIRED; 400 VALIDATION_FAILED; the message goes to the dead-letter queue.
     evidence: { testId: idempotency-key-required-and-formatted, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: IDEM-002
@@ -1147,13 +1148,14 @@ entries:
     contract: idem.provider-scoped
     enforcement:
       - UNIQUE (provider_id, idempotency_key).
+      - The reservation insert of WagerTransactionRepository.reserve is what meets that key.
     scenario:
       - Two providers submit different operations with the same key string.
     expected:
       - Both are processed; two rows exist.
     evidence: { testId: idempotency-key-scoped-per-provider, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: IDEM-003
@@ -1162,14 +1164,15 @@ entries:
     contract: idem.recommended-default
     enforcement:
       - External identifiers capped at 120 characters; keys at 255.
+      - recommendedIdempotencyKey builds the key, isIdempotencyKey carries the limit.
     scenario:
       - Build the recommended key from two 120-character identifiers.
     expected:
       - 241 characters, accepted.
     evidence: { testId: recommended-key-fits, layer: unit }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-004
     priority: required
@@ -1177,14 +1180,16 @@ entries:
     contract: idem.payload-hash
     enforcement:
       - 'RFC 8785 canonical JSON over the validated business fields; SHA-256; sha256: prefix.'
+      - canonicalJson of src/domain/canonical-json.ts, held to the RFC's own vectors by canonical-json-follows-rfc-8785, including its UTF-16 code-unit ordering of property names.
+      - payloadHashOf projects exactly the business fields, so transport members of a wider object cannot reach the hash, and the amount passes through the domain money parser.
     scenario:
       - Hash the same payload with keys in different order, with different headers and message ids; hash a payload differing in one business field.
     expected:
       - Identical hashes in the first group, equal to a fixed vector; a different hash for the changed field.
     evidence: { testId: payload-hash-canonical, layer: unit }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: IDEM-005
     priority: required
@@ -1222,13 +1227,14 @@ entries:
     contract: idem.payload-mismatch-conflict
     enforcement:
       - Hash comparison on reservation conflict.
+      - classifyReservationConflict reads the key holder the reservation returned and compares hashes.
     scenario:
       - Submit a BET 40.00; submit a BET 41.00 under the same key.
     expected:
       - 409 IDEMPOTENCY_PAYLOAD_MISMATCH; the first transaction is untouched; no second row.
     evidence: { testId: payload-mismatch-is-conflict, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: IDEM-008
@@ -1237,13 +1243,14 @@ entries:
     contract: idem.external-id-bound
     enforcement:
       - UNIQUE (provider_id, external_transaction_id) checked after the key lookup.
+      - A reservation that lost with the submitted key still free is what identifies this conflict.
     scenario:
       - Submit a BET under key A; submit the same external id under key B.
     expected:
       - 409 EXTERNAL_TRANSACTION_ALREADY_BOUND; nothing stored for B.
     evidence: { testId: external-id-bound-to-first-key, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: IDEM-009
@@ -1252,13 +1259,14 @@ entries:
     contract: idem.persistent
     enforcement:
       - No in-memory state; every lookup hits PostgreSQL.
+      - The reservation is the committed transaction row itself, so a process that exits leaves the decision behind.
     scenario:
       - Submit a BET to instance A; restart A; replay on instance B.
     expected:
       - B answers the stored outcome with idempotentReplay true; one debit exists.
     evidence: { testId: idempotency-survives-restart, layer: integration }
     deliverySlice: atomic-bet
-    implementationStatus: planned
+    implementationStatus: in-progress
     verificationStatus: not-run
 
   - id: IDEM-010
@@ -1304,8 +1312,8 @@ entries:
       - No database and no HTTP layer take part in the decision.
     evidence: { testId: payload-match-decides-replay-or-conflict, layer: unit }
     deliverySlice: atomic-bet
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- CONC
   - id: CONC-001

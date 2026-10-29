@@ -233,6 +233,18 @@ export class WagerTransaction implements WagerTransactionState {
     return TRANSITIONS[this.#status].length === 0;
   }
 
+  /**
+   * `idem.payload-hash`: whether a submission is the operation this row already recorded. It is
+   * the whole of the replay-or-conflict decision (IDEM-012): an arrival whose canonical hash
+   * matches is a repetition to answer from the stored outcome, and one that does not is a key
+   * reused for different content, which is a conflict and never a replay
+   * (`idem.payload-mismatch-conflict`). The comparison lives here because the hash it compares
+   * against is this row's; `classifyReservationConflict` of `idempotency.ts` is the caller.
+   */
+  matchesPayload(payloadHash: string): boolean {
+    return this.payloadHash === payloadHash;
+  }
+
   /** `tx.affects-balance`: whether applying this transaction moves money and writes an entry. */
   affectsBalance(): boolean {
     return affectsBalance(this.kind);

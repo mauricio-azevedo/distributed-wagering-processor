@@ -33,6 +33,7 @@ const OPENING_ENTRY_ID = '0193f0c0-0000-7000-8000-000000000006';
 const REFERENCE_TRANSACTION_ID = '0193f0c0-0000-7000-8000-000000000007';
 const EVENT_ID = '0193f0c0-0000-7000-8000-000000000008';
 const OTHER_WALLET_ID = '0193f0c0-0000-7000-8000-000000000009';
+const OTHER_PLAYER_ID = '0193f0c0-0000-7000-8000-00000000000a';
 const CORRELATION_ID = '01a18266-39e0-7597-812c-a89950b9acf2';
 
 const OPENED_AT = new Date('2026-10-28T12:00:00.000Z');
@@ -148,6 +149,34 @@ const submission = (overrides: Partial<NewWagerTransaction> = {}): NewWagerTrans
   ...overrides,
 });
 
+/** `wallet.opening-credit`: the internal transaction an opening entry belongs to. */
+const openingTransaction = (amount: string): WagerTransaction =>
+  WagerTransaction.create(
+    submission({
+      id: OPENING_TRANSACTION_ID,
+      providerId: 'system',
+      externalTransactionId: WALLET_ID,
+      idempotencyKey: `system:${WALLET_ID}`,
+      roundId: WALLET_ID,
+      gameId: 'wallet-opening',
+      kind: 'OPENING',
+      money: brl(amount),
+    }),
+  );
+
+/**
+ * The rows the foreign keys of ADR 0003 require around whatever a case is really writing: a
+ * transaction points at its wallet, a ledger entry at its transaction.
+ */
+function given(wallet: Wallet, ...rows: WagerTransaction[]): Promise<void> {
+  return unitOfWork.transactional(async ({ wallets, transactions }) => {
+    await wallets.insert(wallet);
+    for (const row of rows) {
+      await transactions.insert(row);
+    }
+  });
+}
+
 const identity: TransactionIdentity = {
   transactionId: TRANSACTION_ID,
   providerId: 'provider-acme',
@@ -202,7 +231,9 @@ describe('persistence-mapping-round-trip', () => {
   });
 
   test('the opening entry rehydrates with its direction, kind and arithmetic', async () => {
-    const openingEntry = stored(openedWallet('500.00').openingEntry, 'opening entry');
+    const opened = openedWallet('500.00');
+    const openingEntry = stored(opened.openingEntry, 'opening entry');
+    await given(opened.wallet, openingTransaction('500.00'));
 
     await unitOfWork.transactional(({ ledger }) => ledger.insert(openingEntry));
 
@@ -227,6 +258,7 @@ describe('persistence-mapping-round-trip', () => {
     if (!outcome.applied) {
       throw new Error(`a covered debit applies, it was refused with ${outcome.failureCode}`);
     }
+    await given(wallet, WagerTransaction.create(submission()));
 
     await unitOfWork.transactional(({ ledger }) => ledger.insert(outcome.entry));
 
@@ -237,6 +269,7 @@ describe('persistence-mapping-round-trip', () => {
 
   test('a pending transaction rehydrates with every outcome column still empty', async () => {
     const transaction = WagerTransaction.create(submission());
+    await given(openedWallet('500.00').wallet);
 
     await unitOfWork.transactional(({ transactions }) => transactions.insert(transaction));
 
@@ -256,6 +289,17 @@ describe('persistence-mapping-round-trip', () => {
       processedAt: PROCESSED_AT,
       referenceTransactionId: REFERENCE_TRANSACTION_ID,
     });
+    await given(
+      openedWallet('500.00').wallet,
+      // the transaction the refund reverses, which its resolved reference points at
+      WagerTransaction.create(
+        submission({
+          id: REFERENCE_TRANSACTION_ID,
+          externalTransactionId: 'acme-tx-000100',
+          idempotencyKey: 'provider-acme:acme-tx-000100',
+        }),
+      ),
+    );
 
     await unitOfWork.transactional(({ transactions }) => transactions.insert(transaction));
 
@@ -274,6 +318,7 @@ describe('persistence-mapping-round-trip', () => {
   test('a rejected transaction keeps the currency of its amount and of its observed balance', async () => {
     const transaction = WagerTransaction.create(submission({ money: Money.from('10.00', 'EUR') }));
     transaction.reject({ failureCode: 'CURRENCY_MISMATCH', observedBalance: brl('500.00') });
+    await given(openedWallet('500.00').wallet);
 
     await unitOfWork.transactional(({ transactions }) => transactions.insert(transaction));
 
@@ -437,14 +482,20 @@ describe('unit-of-work', () => {
     const opened = openedWallet('500.00');
     const openingEntry = stored(opened.openingEntry, 'opening entry');
 
-    const failure = unitOfWork.transactional(async ({ wallets, ledger }) => {
+    const failure = unitOfWork.transactional(async ({ wallets, transactions, ledger }) => {
       await wallets.insert(opened.wallet);
+      await transactions.insert(openingTransaction('500.00'));
       await ledger.insert(openingEntry);
       throw new Error('the use case failed after writing');
     });
 
     expect(await rejection(failure)).toBe('the use case failed after writing');
     expect(await unitOfWork.transactional(({ wallets }) => wallets.findById(WALLET_ID))).toBeNull();
+    expect(
+      await unitOfWork.transactional(({ transactions }) =>
+        transactions.findById(OPENING_TRANSACTION_ID),
+      ),
+    ).toBeNull();
     expect(
       await unitOfWork.transactional(({ ledger }) =>
         ledger.findByTransactionId(OPENING_TRANSACTION_ID),
@@ -474,9 +525,10 @@ describe('unit-of-work', () => {
   });
 
   test('concurrent operations commit their own rows', async () => {
+    // another player, because one wallet per player and currency is a unique key of ADR 0003
     const other = Wallet.rehydrate({
       id: OTHER_WALLET_ID,
-      playerId: PLAYER_ID,
+      playerId: OTHER_PLAYER_ID,
       balance: brl('10.00'),
       version: 1,
       createdAt: OPENED_AT,

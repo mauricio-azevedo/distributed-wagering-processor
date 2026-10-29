@@ -673,8 +673,8 @@ entries:
       - The app role fails on privileges; the migrator role fails on the trigger.
     evidence: { testId: ledger-rejects-update-and-delete, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: LEDGER-002
     priority: required
@@ -686,10 +686,11 @@ entries:
       - Insert a second entry for a transaction by SQL.
     expected:
       - Unique violation.
-    evidence: { testId: one-ledger-entry-per-transaction, layer: schema }
+    # The ledger-area statement of a guarantee the schema area proves; one direct-SQL case, cited twice.
+    evidence: { testId: schema-one-entry-per-transaction, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: LEDGER-003
     priority: required
@@ -746,10 +747,11 @@ entries:
       - Insert an entry with amount 0.00 and one with -1.00 by SQL.
     expected:
       - Both fail on the check constraint.
-    evidence: { testId: ledger-amount-positive, layer: schema }
+    # The ledger-area statement of a guarantee the schema area proves; one direct-SQL case, cited twice.
+    evidence: { testId: schema-positive-amounts, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: LEDGER-007
     priority: required
@@ -791,10 +793,11 @@ entries:
       - Insert an entry in USD for a BRL wallet by SQL.
     expected:
       - Foreign key violation.
-    evidence: { testId: ledger-currency-matches-wallet, layer: schema }
+    # The ledger-area statement of a guarantee the schema area proves; one direct-SQL case, cited twice.
+    evidence: { testId: schema-entry-currency-fk, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: LEDGER-010
     priority: optional
@@ -1453,8 +1456,8 @@ entries:
       - Unique violation on the second insert.
     evidence: { testId: schema-unique-wallet-per-player-currency, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-002
     priority: required
@@ -1468,8 +1471,8 @@ entries:
       - Check violation.
     evidence: { testId: schema-balance-non-negative, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-003
     priority: required
@@ -1483,8 +1486,8 @@ entries:
       - Check violation.
     evidence: { testId: schema-version-at-least-one, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-004
     priority: required
@@ -1498,8 +1501,8 @@ entries:
       - Unique violation.
     evidence: { testId: schema-unique-provider-transaction, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-005
     priority: required
@@ -1513,23 +1516,25 @@ entries:
       - Unique violation for the first pair; success for the other provider.
     evidence: { testId: schema-unique-provider-key, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-006
     priority: required
-    requirement: The schema admits only known kinds and statuses and enforces the reference matrix.
+    requirement: The schema admits only known kinds, statuses, failure codes, directions and event types, and enforces the reference matrix.
     contract: [tx.kinds, tx.reference-matrix]
     enforcement:
-      - Enumerated types for kind and status; CHECK on kind versus reference_external_transaction_id.
+      - One CHECK per vocabulary column, on a TEXT column rather than an enumerated type, so a vocabulary changes by replacing one constraint; CHECK on kind versus reference_external_transaction_id.
     scenario:
-      - Insert kind SPLIT; insert a REFUND without a reference; insert a BET with one; insert an OPENING with one.
+      - Insert kind SPLIT, status SETTLED, an unknown failure code, a ledger direction SIDEWAYS, a ledger entry of kind LOSS and an unknown outbox event type.
+      - Insert a REFUND and a ROLLBACK without a reference; insert a BET with one; insert an OPENING with one; insert a WIN with one and a WIN without one.
     expected:
-      - Every insert fails.
+      - Every insert of the first group fails on the check of its own column, except the unknown direction, which an entry cannot carry without also failing the balanced arithmetic.
+      - Every insert of the second group fails but the two WIN rows, which the matrix leaves free.
     evidence: { testId: schema-kinds-statuses-reference-matrix, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-007
     priority: required
@@ -1543,8 +1548,8 @@ entries:
       - Every insert fails.
     evidence: { testId: schema-terminal-consistency, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-008
     priority: required
@@ -1560,8 +1565,8 @@ entries:
       - The LOSS of 0.00 commits, which is the only amount exception in the schema.
     evidence: { testId: schema-positive-amounts, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-009
     priority: required
@@ -1575,8 +1580,8 @@ entries:
       - Unique violation.
     evidence: { testId: schema-one-entry-per-transaction, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-010
     priority: required
@@ -1590,8 +1595,8 @@ entries:
       - Unique violation; check violation.
     evidence: { testId: schema-unique-wallet-version, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-011
     priority: required
@@ -1605,8 +1610,8 @@ entries:
       - Both inserts fail.
     evidence: { testId: schema-balanced-entries, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-012
     priority: required
@@ -1620,8 +1625,8 @@ entries:
       - Foreign key violation.
     evidence: { testId: schema-entry-currency-fk, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-013
     priority: required
@@ -1635,23 +1640,25 @@ entries:
       - Both statements fail with the trigger's exception.
     evidence: { testId: schema-ledger-trigger, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-014
     priority: required
     requirement: The runtime role cannot modify the ledger or the schema.
     contract: [ledger.immutable, ops.two-db-roles]
     enforcement:
-      - GRANT SELECT, INSERT only on the ledger to wagering_app; no CREATE or ALTER.
+      - GRANT SELECT, INSERT only on the ledger to wagering_app, no DELETE on any table, nothing on the migration log; no CREATE or ALTER, which follows from not owning the tables.
     scenario:
-      - As wagering_app, run UPDATE and DELETE on the ledger, DROP TRIGGER, ALTER TABLE.
+      - As wagering_app, read back its own grants on the ledger and its DELETE grants on every table.
+      - As wagering_app, run DROP TRIGGER, ALTER TABLE and DELETE on the migration log; the UPDATE and DELETE of a ledger entry are run by LEDGER-001.
     expected:
-      - Every statement fails on privileges.
+      - The ledger grants are exactly SELECT and INSERT, and no table grants DELETE.
+      - Every statement fails, the two DDL ones on ownership and the delete on privileges.
     evidence: { testId: schema-runtime-role-privileges, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-015
     priority: required
@@ -1665,8 +1672,8 @@ entries:
       - The second PROCESSED insert fails; the REJECTED insert succeeds.
     evidence: { testId: schema-reversed-once, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-016
     priority: required
@@ -1680,8 +1687,8 @@ entries:
       - Unique violation.
     evidence: { testId: schema-one-opening-per-wallet, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-017
     priority: required
@@ -1710,8 +1717,8 @@ entries:
       - Primary key violation; success.
     evidence: { testId: schema-inbox-identity, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-019
     priority: required
@@ -1720,13 +1727,14 @@ entries:
     enforcement:
       - PRIMARY KEY (event_id); index on (published_at, next_attempt_at, occurred_at).
     scenario:
-      - Insert two rows with one event id; EXPLAIN the pending-claim query.
+      - Insert two rows with one event id.
+      - EXPLAIN the pending-claim query of ADR 0005 with enable_seqscan off, because on a table of a few rows the planner reads it sequentially whatever indexes exist.
     expected:
-      - Primary key violation; the plan uses the index.
+      - Primary key violation; the plan names the claim index.
     evidence: { testId: schema-outbox-identity-and-index, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-020
     priority: required
@@ -1806,8 +1814,8 @@ entries:
       - The table without the trigger accepts the downgrade, which is exactly what SCHEMA-007 alone admits and why this entry exists.
     evidence: { testId: schema-terminal-rows-are-frozen, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: SCHEMA-025
     priority: required
@@ -1823,24 +1831,26 @@ entries:
       - The outcome-field update commits, so a parked transaction can still be resolved and a pending one decided.
     evidence: { testId: schema-transaction-identity-frozen, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
   - id: SCHEMA-026
     priority: required
     requirement: No monetary column can store the non-finite NUMERIC value NaN.
     contract: [money.finite-in-database, money.exact-persistence]
     enforcement:
-      - Every monetary CHECK excludes it with <> 'NaN'::numeric. The range, equality and arithmetic checks do not exclude it, because PostgreSQL orders NaN above every number, NaN = NaN is true, and NaN propagates through addition.
+      - Each monetary column carries a CHECK of its own excluding it with <> 'NaN'::numeric, kept apart from the range check of the same column so that one can be dropped without the other. The range, equality and arithmetic checks do not exclude it, because PostgreSQL orders NaN above every number, NaN = NaN is true, and NaN propagates through addition.
     scenario:
-      - By SQL as the runtime role, insert NaN into each monetary column: wallet balance, ledger amount, balance_before, balance_after, transaction amount and observed_balance.
-      - As the migrator role, drop the exclusion from the ledger amount, insert a NaN entry that satisfies every remaining per-row check and the deferred consistency triggers, restore the constraint NOT VALID, then insert another NaN entry.
+      - Read back every CHECK of the schema carrying the exclusion.
+      - By SQL as the runtime role, insert NaN into each monetary column: wallet balance, transaction amount and observed_balance, ledger amount, balance_before and balance_after.
+      - As the migrator role, drop the three exclusions of the ledger, insert a NaN entry that satisfies every remaining per-row check, restore them NOT VALID, then insert another NaN entry; truncate and validate them again afterwards.
     expected:
-      - Every insert of the first scenario is refused by its own CHECK.
-      - The insert of the second scenario commits while the exclusion is absent, proving the positive-amount check, the balanced arithmetic and the commit-time chain all accept NaN; the insert after the constraint is restored is refused.
+      - The columns they guard are exactly the six monetary columns of the schema.
+      - Every insert of the second scenario is refused by a finiteness CHECK of its own table. Which one reports a ledger entry is the server's choice, because NaN propagates through addition and an entry cannot carry it in one monetary column alone without failing the balanced arithmetic.
+      - The insert of the third scenario commits while the exclusions are absent, proving the positive-amount check, the non-negative balance_after and the balanced arithmetic all accept NaN; the insert after they are restored is refused. The commit-time chain of SCHEMA-021 and SCHEMA-022 is blind to it in the same way and is covered when those triggers land.
     evidence: { testId: schema-refuses-non-finite-amounts, layer: schema }
     deliverySlice: schema-wallet-opening
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- API
   - id: API-001
@@ -2683,15 +2693,15 @@ entries:
     requirement: Migrations are versioned and reversible.
     contract: ops.migrations-reversible
     enforcement:
-      - MikroORM migrations with up and down. The first one, creating the tables, is in place; the ones carrying the constraints, triggers and privileges arrive with them, and the test covers every migration at once.
+      - MikroORM migrations with up and down: one creating the tables, then one each for the unique keys, the checks, the foreign keys, the append-only triggers and the per-table privileges. The test covers every migration at once.
     scenario:
-      - On a clean database run up, down, up.
+      - Run up, down to nothing and up again, snapshotting the catalogue of columns, constraints, indexes, triggers, functions and grants after each up.
     expected:
-      - Each step succeeds; the schema after the second up equals the schema after the first.
+      - Each step succeeds; no financial table survives the down; the two snapshots are equal.
     evidence: { testId: migrations-up-down-up, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OPS-003
     priority: required
@@ -2713,15 +2723,15 @@ entries:
     requirement: Migrations run as the migrator role and the service as the runtime role.
     contract: ops.two-db-roles
     enforcement:
-      - Two connection configurations; Compose bootstrap creates both roles.
+      - Two connection configurations; Compose bootstrap creates both roles; the privileges migration narrows what the runtime role holds per table.
     scenario:
-      - Start the stack; inspect which role owns the tables and which the service connects with.
+      - Start the stack; inspect which role owns the tables and which the service connects with; run DDL as the service role.
     expected:
-      - Tables owned by wagering_migrator; the service's connections authenticate as wagering_app.
+      - Every table is owned by wagering_migrator; the service's connections authenticate as wagering_app, which cannot create a table.
     evidence: { testId: two-database-roles, layer: integration }
     deliverySlice: schema-wallet-opening
-    implementationStatus: in-progress
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: OPS-005
     priority: required

@@ -13,6 +13,8 @@ import { systemClock } from '../../src/infrastructure/clock';
 import { loadEnv, loadMigrationEnv } from '../../src/infrastructure/config/env';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
+import { silentLogger } from '../../src/infrastructure/observability/logger';
+import { uncountedMetrics } from '../../src/infrastructure/observability/metrics';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
@@ -92,6 +94,8 @@ function submitOver(over: UnitOfWork): SubmitWagerTransaction {
     clock: systemClock,
     ids: uuidV7IdGenerator,
     sha256Hex,
+    logger: silentLogger,
+    metrics: uncountedMetrics,
   });
 }
 

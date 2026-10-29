@@ -30,7 +30,8 @@ import {
   WagerTransactionsConsumer,
   type WagerTransactionsConsumerDependencies,
 } from '../../src/infrastructure/messaging/wager-transactions.consumer';
-import { CounterRegistry } from '../../src/infrastructure/observability/metrics';
+import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
+import { silentLogger } from '../../src/infrastructure/observability/logger';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm.unit-of-work';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
@@ -142,7 +143,7 @@ let runtime: MikroORM;
 let openWallet: OpenWallet;
 let submit: UnreachableFor;
 let consumer: WagerTransactionsConsumer;
-let metrics: CounterRegistry;
+let metrics: MetricsRegistry;
 let sqs: SQSClient;
 let queueUrl: string;
 let deadLetterQueueUrl: string;
@@ -153,11 +154,11 @@ beforeAll(async () => {
   runtime = await MikroORM.init(ormConfig(env.DATABASE_URL));
 
   const unitOfWork = new MikroOrmUnitOfWork(runtime.em, env.LOCK_TIMEOUT_MS);
+  metrics = new MetricsRegistry();
   const dependencies = { unitOfWork, clock: systemClock, ids: uuidV7IdGenerator, sha256Hex };
 
   openWallet = new OpenWallet(dependencies);
-  submit = new UnreachableFor(dependencies);
-  metrics = new CounterRegistry();
+  submit = new UnreachableFor({ ...dependencies, logger: silentLogger, metrics });
   sqs = new SQSClient({
     region: env.AWS_REGION,
     ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
@@ -213,7 +214,7 @@ function consumerWith(
     deadLetterQueueUrl: () => Promise.resolve(deadLetterQueueUrl),
     submit,
     metrics,
-    logger: { error: () => undefined },
+    logger: silentLogger,
     consumerName: WAGER_TRANSACTIONS_CONSUMER,
     waitTimeSeconds: WAIT_TIME_SECONDS,
     visibilityTimeoutSeconds: VISIBILITY_TIMEOUT_SECONDS,
@@ -546,6 +547,8 @@ describe('consumer-outcome-classification', () => {
       clock: systemClock,
       ids: uuidV7IdGenerator,
       sha256Hex,
+      logger: silentLogger,
+      metrics,
     };
   }
 });
@@ -588,6 +591,7 @@ describe('transient-backoff-then-dlq', () => {
   test('a transient failure that clears is applied on a later receive, with nothing lost', async () => {
     const walletId = await wallet('500.00');
     const failing = submit.outageFor('acme-msg-000123');
+    const retries = await metrics.total('wager_retries_total', { component: 'queue' });
 
     await send(message(walletId), walletId);
 
@@ -596,6 +600,9 @@ describe('transient-backoff-then-dlq', () => {
       disposition: 'returned',
     });
     expect(await transactionsOf(walletId)).toEqual([]);
+    // `obs.metrics`: the retry is counted by the component that backed off, and only once the
+    // broker accepted the new visibility (OBS-003).
+    expect(await metrics.total('wager_retries_total', { component: 'queue' })).toBe(retries + 1);
 
     submit.recovers(failing);
 
@@ -620,12 +627,16 @@ describe('transient-backoff-then-dlq', () => {
 describe('permanent-failure-to-dlq', () => {
   /** `msg.unknown-wallet-permanent`: the row cannot be written, so nothing is. */
   test('a message for a wallet that does not exist is dead-lettered on the first receive', async () => {
+    const dead = await metrics.total('wager_dlq_messages_total');
+
     await send(message(UNKNOWN_WALLET_ID), UNKNOWN_WALLET_ID);
 
     expect(await pollOne()).toMatchObject({
       classification: 'permanent',
       disposition: 'dead-lettered',
     });
+    // `obs.metrics`: counted once the forward and the delete both happened (OBS-003).
+    expect(await metrics.total('wager_dlq_messages_total')).toBe(dead + 1);
     expect(await transactionsOf(UNKNOWN_WALLET_ID)).toEqual([]);
     expect(await inboxMessageIds()).toEqual([]);
     expect(await awaitContents(deadLetterQueueUrl, ['acme-msg-000123'])).toEqual([
@@ -693,7 +704,7 @@ describe('correct-without-fifo', () => {
     });
 
     // The same body again, with a deduplication id the broker has not seen: the inbox absorbs it.
-    const duplicates = metrics.total('wager_duplicates_detected_total', { source: 'inbox' });
+    const duplicates = await metrics.total('wager_duplicates_detected_total', { source: 'inbox' });
 
     await send(message(walletId), walletId);
 
@@ -701,7 +712,7 @@ describe('correct-without-fifo', () => {
 
     expect(redelivered).toMatchObject({ classification: 'business', disposition: 'acknowledged' });
     expect(redelivered.classification === 'business' && redelivered.outcome.absorbed).toBe(true);
-    expect(metrics.total('wager_duplicates_detected_total', { source: 'inbox' })).toBe(
+    expect(await metrics.total('wager_duplicates_detected_total', { source: 'inbox' })).toBe(
       duplicates + 1,
     );
 

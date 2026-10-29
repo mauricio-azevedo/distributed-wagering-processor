@@ -6,25 +6,24 @@ import { ApplicationError, ServiceUnavailableError, WalletNotFoundError } from '
 import type { Clock } from '../ports/clock';
 import type { IdGenerator } from '../ports/id-generator';
 import type { Logger } from '../ports/logger';
+import type { Metrics, PendingReferenceOutcome } from '../ports/metrics';
 import type { Repositories, UnitOfWork } from '../ports/unit-of-work';
 
 /**
- * How one attempt ended. The labels are the outcomes `ref.*` distinguishes, which is also the
- * dimension `wager_pending_reference_total{outcome}` counts them by when the metrics arrive:
- *
- * - `settled`: the reference resolved and the operation was applied under the normal rules, which
- *   records `PROCESSED` or the `REJECTED` one of those rules decides (`ref.resolution-on-arrival`).
- * - `pending`: the reference still has not resolved and the window is open, so the attempt was
- *   counted and the next one scheduled (`ref.backoff`).
- * - `expired`: the window closed with the reference still unresolved (`ref.expiry`).
- * - `retried`: a transient failure, so nothing was recorded and the attempt was rescheduled
- *   (`ref.transient-failure`).
- * - `failed`: a permanent failure, so the transaction is `FAILED` (`ref.permanent-failure`).
+ * How one attempt ended. The vocabulary is the label dimension of
+ * `wager_pending_reference_total{outcome}`, so it is defined with the metric it is counted by
+ * (`obs.metrics`) and re-exported here, where the behaviour that reaches each case lives.
  */
-export type PendingReferenceOutcome = 'settled' | 'pending' | 'expired' | 'retried' | 'failed';
+export type { PendingReferenceOutcome };
 
 export interface PendingReferenceAttempt {
   readonly transactionId: string;
+  /**
+   * `obs.correlation-propagation`: the correlation id of the arrival that parked the transaction,
+   * carried by the claim row, so the attempt and its events are searchable under the operation that
+   * created the work rather than under an id minted for this sweep (OBS-005).
+   */
+  readonly correlationId: string;
   readonly outcome: PendingReferenceOutcome;
 }
 
@@ -33,6 +32,7 @@ export interface ReprocessPendingReferenceDependencies {
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly logger: Logger;
+  readonly metrics: Metrics;
   /** How many claims one sweep takes at most; `DEFAULT_SWEEP_SIZE` when absent. */
   readonly sweepSize?: number;
 }
@@ -89,7 +89,9 @@ export class ReprocessPendingReference {
 
   /**
    * One sweep: due transactions, claimed and attempted one by one until none is due or the sweep
-   * is full. It reports what each attempt ended in, which is what a driver logs and counts.
+   * is full. Each attempt is reported as it resolves — the line an operator follows it by and the
+   * counter its outcome belongs to — and answered to the caller as well, so a driver reads what the
+   * sweep did without having to read the logs.
    *
    * A transient failure with nothing claimed — the database itself being unreachable — ends the
    * sweep by rejecting: there is no transaction to report an attempt for, and the caller has to
@@ -106,6 +108,7 @@ export class ReprocessPendingReference {
         break;
       }
 
+      this.report(attempt);
       attempts.push(attempt);
     }
 
@@ -118,14 +121,13 @@ export class ReprocessPendingReference {
    * and no row id is minted while the wallet lock is held (`conc.lock-order`), and the attempt is
    * decided against one moment throughout.
    *
-   * The correlation id is minted per attempt: a scheduled attempt has no request or message behind
-   * it, so there is no id to propagate, and a fresh one ties the rows and events of this attempt
-   * together in the logs (`obs.correlation-propagation`).
+   * The correlation id is the claim row's and is never minted here: a scheduled attempt has no
+   * request and no message behind it, but it does have an arrival that created the work, and that
+   * is the id an operator follows the operation by (`obs.correlation-propagation`, OBS-005).
    */
   private async attempt(): Promise<PendingReferenceAttempt | null> {
     const attemptedAt = this.dependencies.clock.now();
     const entryId = this.dependencies.ids.next();
-    const correlationId = this.dependencies.ids.next();
 
     try {
       return await this.dependencies.unitOfWork.transactional(async (repositories) => {
@@ -139,14 +141,18 @@ export class ReprocessPendingReference {
           const operation = await this.claimedOperation(repositories, schedule, {
             entryId,
             attemptedAt,
-            correlationId,
+            correlationId: schedule.correlationId,
           });
           const outcome = await this.reprocess(repositories, operation, schedule, attemptedAt);
 
           schedule.recordAttempt(attemptedAt);
           await repositories.pendingReferences.update(schedule);
 
-          return { transactionId: schedule.transactionId, outcome };
+          return {
+            transactionId: schedule.transactionId,
+            correlationId: schedule.correlationId,
+            outcome,
+          };
         } catch (failure) {
           // Thrown on, so the attempt's transaction rolls back and nothing it wrote survives, and
           // carrying the claim with it, so the classification below knows what was being attempted.
@@ -239,12 +245,48 @@ export class ReprocessPendingReference {
     if (isPermanent(error)) {
       await this.fail(schedule, error);
 
-      return { transactionId: schedule.transactionId, outcome: 'failed' };
+      return {
+        transactionId: schedule.transactionId,
+        correlationId: schedule.correlationId,
+        outcome: 'failed',
+      };
     }
 
     await this.reschedule(schedule);
 
-    return { transactionId: schedule.transactionId, outcome: 'retried' };
+    return {
+      transactionId: schedule.transactionId,
+      correlationId: schedule.correlationId,
+      outcome: 'retried',
+    };
+  }
+
+  /**
+   * What one attempt reports: the counter its outcome belongs to and the line the operator follows
+   * it by (`obs.metrics`, `obs.structured-logs`). A rescheduled attempt is also a retry of this
+   * component, which is the measurement that separates a dependency outage from a reference that
+   * simply has not arrived (`ref.transient-failure`).
+   *
+   * It runs after the attempt's transaction resolved, so nothing is reported for work that rolled
+   * back, and it reports every attempt including the ones that changed nothing: an attempt that
+   * found no reference is the fact an operator is looking for when a transaction stays pending.
+   */
+  private report(attempt: PendingReferenceAttempt): void {
+    this.dependencies.metrics.increment('wager_pending_reference_total', {
+      outcome: attempt.outcome,
+    });
+
+    if (attempt.outcome === 'retried') {
+      this.dependencies.metrics.increment('wager_retries_total', {
+        component: 'pending-reference',
+      });
+    }
+
+    this.dependencies.logger.info('wager.pending-reference.attempted', {
+      correlationId: attempt.correlationId,
+      transactionId: attempt.transactionId,
+      outcome: attempt.outcome,
+    });
   }
 
   /**
@@ -272,29 +314,41 @@ export class ReprocessPendingReference {
    * operation was last decided against (`tx.observed-balance`).
    *
    * A transaction that reached a terminal outcome meanwhile is left alone: the row is the
-   * authority, and nothing may overwrite an outcome (`tx.terminal-immutable`).
+   * authority, and nothing may overwrite an outcome (`tx.terminal-immutable`). `FAILED` is then
+   * counted as the recorded outcome it is, after the commit that recorded it and only by the write
+   * that did record it, so a transaction another worker had already finished is not counted twice
+   * (`obs.metrics`).
    */
   private async fail(schedule: PendingReferenceSchedule, error: unknown): Promise<void> {
-    this.dependencies.logger.error(
-      'reprocessing a pending reference hit a permanent failure, so the transaction is FAILED',
-      {
-        transactionId: schedule.transactionId,
-        attempts: schedule.attempts,
-        reason: error instanceof Error ? error.message : String(error),
+    this.dependencies.logger.error('wager.pending-reference.failed', {
+      correlationId: schedule.correlationId,
+      transactionId: schedule.transactionId,
+      attempts: schedule.attempts,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+
+    const failed = await this.dependencies.unitOfWork.transactional(
+      async ({ transactions }): Promise<WagerTransaction | null> => {
+        const transaction = await transactions.findById(schedule.transactionId);
+
+        if (transaction === null || transaction.isTerminal()) {
+          return null;
+        }
+
+        transaction.fail({ observedBalance: observedBalanceOf(transaction) });
+
+        await transactions.recordOutcome(transaction);
+
+        return transaction;
       },
     );
 
-    await this.dependencies.unitOfWork.transactional(async ({ transactions }) => {
-      const transaction = await transactions.findById(schedule.transactionId);
-
-      if (transaction === null || transaction.isTerminal()) {
-        return;
-      }
-
-      transaction.fail({ observedBalance: observedBalanceOf(transaction) });
-
-      await transactions.recordOutcome(transaction);
-    });
+    if (failed !== null) {
+      this.dependencies.metrics.increment('wager_transactions_total', {
+        kind: failed.kind,
+        status: 'FAILED',
+      });
+    }
   }
 }
 

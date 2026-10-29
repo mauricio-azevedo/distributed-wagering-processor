@@ -21,6 +21,8 @@ import { contentHashOf, payloadHashOf } from '../../src/domain/idempotency';
 import { InboxMessage } from '../../src/domain/inbox-message';
 import type { IntegrationEventType } from '../../src/domain/integration-events';
 import { Money } from '../../src/domain/money';
+import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
+import { recordingLogger } from '../helpers/recording-logger';
 import type { OutboxMessage } from '../../src/domain/outbox-message';
 import type { TransactionKind, WagerOperationKind } from '../../src/domain/transaction-kind';
 import { PendingReferenceSchedule } from '../../src/domain/pending-reference-schedule';
@@ -238,6 +240,7 @@ function repositoriesOver(staged: Committed, calls: string[], ports: Ports): Rep
         return Promise.resolve();
       },
       findByEventId: unreachable('outbox lookup'),
+      backlog: unreachable('outbox backlog'),
       claimPending: unreachable('outbox claim'),
       recordAttempt: unreachable('publication attempt'),
     },
@@ -271,11 +274,15 @@ function sequencedIds(): IdGenerator {
 
 function submitWagerTransaction(ports: Ports = {}) {
   const { unitOfWork, committed, calls } = fakeUnitOfWork(ports);
+  const log = recordingLogger();
+  const metrics = new MetricsRegistry();
   const useCase = new SubmitWagerTransaction({
     unitOfWork,
     clock: fixedClock,
     ids: sequencedIds(),
     sha256Hex,
+    logger: log.logger,
+    metrics,
   });
 
   const execute = (operation: SubmittedWagerOperation = BET, idempotencyKey = IDEMPOTENCY_KEY) =>
@@ -296,7 +303,7 @@ function submitWagerTransaction(ports: Ports = {}) {
       },
     );
 
-  return { execute, deliver, committed, calls };
+  return { execute, deliver, committed, calls, metrics, log };
 }
 
 const eventTypes = (committed: Committed): IntegrationEventType[] =>

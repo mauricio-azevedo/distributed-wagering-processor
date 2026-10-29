@@ -13,6 +13,7 @@ import { TerminusModule } from '@nestjs/terminus';
 import { sha256Hex } from './application/sha256';
 import { GetWagerTransaction } from './application/use-cases/get-wager-transaction';
 import { GetWallet } from './application/use-cases/get-wallet';
+import { ObserveOutboxBacklog } from './application/use-cases/observe-outbox-backlog';
 import { OpenWallet } from './application/use-cases/open-wallet';
 import { PageWalletLedger } from './application/use-cases/page-wallet-ledger';
 import { ReconcileWallet } from './application/use-cases/reconcile-wallet';
@@ -23,7 +24,7 @@ import type { Env } from './infrastructure/config/env';
 import { HealthController } from './infrastructure/health/health.controller';
 import { PostgresHealthIndicator } from './infrastructure/health/postgres.health';
 import { SqsHealthIndicator } from './infrastructure/health/sqs.health';
-import { bindCorrelationId } from './infrastructure/http/correlation-id';
+import { ObserveRequest } from './infrastructure/http/observe-request';
 import { ProblemDetailsFilter } from './infrastructure/http/problem-details.filter';
 import { ProviderTransactionsController } from './infrastructure/http/provider-transactions.controller';
 import { WageringController } from './infrastructure/http/wagering.controller';
@@ -39,8 +40,12 @@ import {
   WAGER_TRANSACTIONS_CONSUMER,
   WagerTransactionsConsumer,
 } from './infrastructure/messaging/wager-transactions.consumer';
-import { nestLogger } from './infrastructure/observability/logger';
-import { CounterRegistry } from './infrastructure/observability/metrics';
+import { jsonLinesLogger } from './infrastructure/observability/logger';
+import { MetricsRegistry } from './infrastructure/observability/metrics';
+import {
+  MetricsController,
+  OBSERVABILITY_LOGGER,
+} from './infrastructure/observability/metrics.controller';
 import { ormConfig } from './infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm.unit-of-work';
 
@@ -51,8 +56,13 @@ import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm.unit-
  * The use cases are constructed here with their ports rather than injected into: they carry no
  * framework decorator, which is what keeps the application layer free of NestJS
  * (`model.framework-free-domain`, ARCHITECTURE.md section 4). The adapters they are given — the
- * unit of work over the entity manager, the clock and the id mint — are the only places a use case
- * can reach the outside.
+ * unit of work over the entity manager, the clock, the id mint, the log sink and the metric
+ * registry — are the only places a use case can reach the outside.
+ *
+ * One registry serves the whole instance, because a counter is per instance and the `/metrics`
+ * endpoint has to read what the use cases raised (`obs.metrics`). Each component gets a logger
+ * named after it, so the `component` field of a line says which part of the service wrote it
+ * (`obs.structured-logs`).
  *
  * `WagerTransactionsConsumer` is constructed with the very `SubmitWagerTransaction` the controller
  * receives, which is what `msg.same-use-case` asks of the composition root, and is not started
@@ -66,6 +76,7 @@ export class AppModule implements NestModule {
       imports: [MikroOrmModule.forRoot(ormConfig(env.DATABASE_URL)), TerminusModule],
       controllers: [
         HealthController,
+        MetricsController,
         WalletsController,
         WageringController,
         ProviderTransactionsController,
@@ -75,14 +86,16 @@ export class AppModule implements NestModule {
         PostgresHealthIndicator,
         SqsHealthIndicator,
         { provide: APP_FILTER, useClass: ProblemDetailsFilter },
-        CounterRegistry,
+        MetricsRegistry,
+        ObserveRequest,
+        { provide: OBSERVABILITY_LOGGER, useValue: jsonLinesLogger('observability') },
         {
           provide: MikroOrmUnitOfWork,
-          // The registry the use cases and the consumer increment, so a lock wait is counted on the
+          // The registry the use cases and the consumer raise, so a lock wait is counted on the
           // instance that waited whichever entry point it arrived through (CONC-002).
-          useFactory: (em: EntityManager, metrics: CounterRegistry) =>
+          useFactory: (em: EntityManager, metrics: MetricsRegistry) =>
             new MikroOrmUnitOfWork(em, env.LOCK_TIMEOUT_MS, metrics),
-          inject: [EntityManager, CounterRegistry],
+          inject: [EntityManager, MetricsRegistry],
         },
         {
           provide: OpenWallet,
@@ -107,14 +120,25 @@ export class AppModule implements NestModule {
         },
         {
           provide: ReconcileWallet,
-          useFactory: (unitOfWork: MikroOrmUnitOfWork, metrics: CounterRegistry) =>
+          useFactory: (unitOfWork: MikroOrmUnitOfWork, metrics: MetricsRegistry) =>
             new ReconcileWallet({
               unitOfWork,
               clock: systemClock,
-              logger: nestLogger('reconciliation'),
+              logger: jsonLinesLogger('reconciliation'),
               metrics,
             }),
-          inject: [MikroOrmUnitOfWork, CounterRegistry],
+          inject: [MikroOrmUnitOfWork, MetricsRegistry],
+        },
+        {
+          /*
+           * The backlog the `/metrics` endpoint measures on every scrape, so the two gauges of
+           * `outbox.lag-metrics` are answered by any instance and not only by one running a
+           * publisher (OUTBOX-008).
+           */
+          provide: ObserveOutboxBacklog,
+          useFactory: (unitOfWork: MikroOrmUnitOfWork, metrics: MetricsRegistry) =>
+            new ObserveOutboxBacklog({ unitOfWork, clock: systemClock, metrics }),
+          inject: [MikroOrmUnitOfWork, MetricsRegistry],
         },
         {
           /*
@@ -124,36 +148,39 @@ export class AppModule implements NestModule {
            * transaction is reprocessed by whatever drives a sweep — the integration suites do.
            */
           provide: ReprocessPendingReference,
-          useFactory: (unitOfWork: MikroOrmUnitOfWork) =>
+          useFactory: (unitOfWork: MikroOrmUnitOfWork, metrics: MetricsRegistry) =>
             new ReprocessPendingReference({
               unitOfWork,
               clock: systemClock,
               ids: uuidV7IdGenerator,
-              logger: nestLogger('pending-reference-scheduler'),
+              logger: jsonLinesLogger('pending-reference-scheduler'),
+              metrics,
             }),
-          inject: [MikroOrmUnitOfWork],
+          inject: [MikroOrmUnitOfWork, MetricsRegistry],
         },
         {
           provide: SubmitWagerTransaction,
-          useFactory: (unitOfWork: MikroOrmUnitOfWork) =>
+          useFactory: (unitOfWork: MikroOrmUnitOfWork, metrics: MetricsRegistry) =>
             new SubmitWagerTransaction({
               unitOfWork,
               clock: systemClock,
               ids: uuidV7IdGenerator,
               sha256Hex,
+              logger: jsonLinesLogger('wagering'),
+              metrics,
             }),
-          inject: [MikroOrmUnitOfWork],
+          inject: [MikroOrmUnitOfWork, MetricsRegistry],
         },
         {
           provide: WagerTransactionsConsumer,
-          useFactory: (sqs: SQSClient, submit: SubmitWagerTransaction, metrics: CounterRegistry) =>
+          useFactory: (sqs: SQSClient, submit: SubmitWagerTransaction, metrics: MetricsRegistry) =>
             new WagerTransactionsConsumer({
               sqs,
               queueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_QUEUE),
               deadLetterQueueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_DLQ),
               submit,
               metrics,
-              logger: nestLogger(WAGER_TRANSACTIONS_CONSUMER),
+              logger: jsonLinesLogger(WAGER_TRANSACTIONS_CONSUMER),
               consumerName: WAGER_TRANSACTIONS_CONSUMER,
               waitTimeSeconds: env.SQS_WAIT_TIME_SECONDS,
               visibilityTimeoutSeconds: env.SQS_VISIBILITY_TIMEOUT_SECONDS,
@@ -162,18 +189,19 @@ export class AppModule implements NestModule {
                 maxSeconds: env.SQS_RETRY_BACKOFF_MAX_SECONDS,
               },
             }),
-          inject: [SQSClient, SubmitWagerTransaction, CounterRegistry],
+          inject: [SQSClient, SubmitWagerTransaction, MetricsRegistry],
         },
       ],
     };
   }
 
   /**
-   * The correlation id is bound to every request, the health routes included, so no response leaves
-   * without one and the exception filter always has an id to put in a problem
-   * (`api.correlation-header`).
+   * Every request runs inside `ObserveRequest`, the health and metrics routes included: no response
+   * leaves without a correlation id, the exception filter always has one to put in a problem
+   * (`api.correlation-header`), and every line a request produces carries it
+   * (`obs.correlation-propagation`).
    */
   configure(consumer: MiddlewareConsumer): void {
-    consumer.apply(bindCorrelationId).forRoutes('*splat');
+    consumer.apply(ObserveRequest).forRoutes('*splat');
   }
 }

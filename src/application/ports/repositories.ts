@@ -264,6 +264,16 @@ export interface OutboxClaim {
   readonly limit: number;
 }
 
+/**
+ * What the outbox has yet to announce (`outbox.lag-metrics`): how many rows are unpublished and
+ * when the oldest of them was recorded, `null` when there are none. The age is left to the caller
+ * because the moment it is measured against belongs to the measurement and not to the table.
+ */
+export interface OutboxBacklog {
+  readonly pending: number;
+  readonly oldestOccurredAt: Date | null;
+}
+
 export interface OutboxRepository {
   /** Enqueues a committed fact, in the transaction that produced it (`outbox.single-transaction`). */
   insert(message: OutboxMessage): Promise<void>;
@@ -289,4 +299,11 @@ export interface OutboxRepository {
    * and the aggregate are what every publication of it repeats (`outbox.duplicate-safe`).
    */
   recordAttempt(message: OutboxMessage): Promise<void>;
+
+  /**
+   * The backlog, as the two gauges of `outbox.lag-metrics` read it (OUTBOX-008). It takes no lock
+   * and claims nothing: a measurement must not wait on the publisher it is measuring, and must not
+   * hold a row it was only counting.
+   */
+  backlog(): Promise<OutboxBacklog>;
 }

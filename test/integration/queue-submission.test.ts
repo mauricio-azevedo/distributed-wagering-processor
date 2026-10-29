@@ -23,7 +23,7 @@ import {
   WAGER_TRANSACTIONS_CONSUMER,
   WagerTransactionsConsumer,
 } from '../../src/infrastructure/messaging/wager-transactions.consumer';
-import { CounterRegistry } from '../../src/infrastructure/observability/metrics';
+import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
 import { ormConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { TouchedWallets } from '../helpers/wallet-reconciliation';
 
@@ -70,7 +70,7 @@ let runtime: MikroORM;
 let app: INestApplication;
 let baseUrl: string;
 let consumer: WagerTransactionsConsumer;
-let metrics: CounterRegistry;
+let metrics: MetricsRegistry;
 let sqs: SQSClient;
 let queueUrl: string;
 let deadLetterQueueUrl: string;
@@ -86,7 +86,7 @@ beforeAll(async () => {
   await app.listen(0);
   baseUrl = await app.getUrl();
   consumer = app.get(WagerTransactionsConsumer);
-  metrics = app.get(CounterRegistry);
+  metrics = app.get(MetricsRegistry);
   sqs = new SQSClient({
     region: env.AWS_REGION,
     ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),
@@ -636,7 +636,7 @@ describe('inbox-keyed-by-body-message-id', () => {
 describe('inbox-payload-conflict', () => {
   test('a reused message id with another amount is permanent and changes nothing', async () => {
     const walletId = await openWallet('500.00');
-    const conflicts = metrics.total('wager_duplicates_detected_total', {
+    const conflicts = await metrics.total('wager_duplicates_detected_total', {
       source: 'inbox-conflict',
     });
 
@@ -653,9 +653,9 @@ describe('inbox-payload-conflict', () => {
     expect(report.classification === 'business' ? null : report.error).toBeInstanceOf(
       InboxPayloadConflictError,
     );
-    expect(metrics.total('wager_duplicates_detected_total', { source: 'inbox-conflict' })).toBe(
-      conflicts + 1,
-    );
+    expect(
+      await metrics.total('wager_duplicates_detected_total', { source: 'inbox-conflict' }),
+    ).toBe(conflicts + 1);
 
     expect(await transactionsOf(walletId)).toMatchObject([
       { status: 'PROCESSED', amount: '40.00', observed_balance: '460.00' },
@@ -702,7 +702,7 @@ describe('message-correlation', () => {
 describe('idempotency-across-entry-points', () => {
   test('the same operation over HTTP and through the queue is one debit and a replay', async () => {
     const walletId = await openWallet('500.00');
-    const duplicates = metrics.total('wager_duplicates_detected_total', { source: 'inbox' });
+    const duplicates = await metrics.total('wager_duplicates_detected_total', { source: 'inbox' });
 
     expect(await submitOverHttp(bet(walletId), 'provider-acme:acme-tx-000123')).toBe(200);
 
@@ -720,12 +720,14 @@ describe('idempotency-across-entry-points', () => {
     expect(await entriesOf(walletId)).toHaveLength(1);
     expect(await balanceOf(walletId)).toEqual({ balance: '460.00', version: 2 });
     expect(await queueContents()).toEqual([]);
-    expect(metrics.total('wager_duplicates_detected_total', { source: 'inbox' })).toBe(duplicates);
+    expect(await metrics.total('wager_duplicates_detected_total', { source: 'inbox' })).toBe(
+      duplicates,
+    );
   });
 
   test('a replayed delivery redelivered again is absorbed by the inbox', async () => {
     const walletId = await openWallet('500.00');
-    const duplicates = metrics.total('wager_duplicates_detected_total', { source: 'inbox' });
+    const duplicates = await metrics.total('wager_duplicates_detected_total', { source: 'inbox' });
 
     expect(await submitOverHttp(bet(walletId), 'provider-acme:acme-tx-000123')).toBe(200);
     await send(betMessage(walletId), walletId);
@@ -734,7 +736,7 @@ describe('idempotency-across-entry-points', () => {
     const second = await pollOne();
 
     expect(second.classification === 'business' && second.outcome.absorbed).toBe(true);
-    expect(metrics.total('wager_duplicates_detected_total', { source: 'inbox' })).toBe(
+    expect(await metrics.total('wager_duplicates_detected_total', { source: 'inbox' })).toBe(
       duplicates + 1,
     );
     expect(await entriesOf(walletId)).toHaveLength(1);
@@ -749,7 +751,7 @@ describe('idempotency-across-entry-points', () => {
 describe('killed-after-commit-before-ack', () => {
   test('a worker killed after the commit leaves one effect and a redelivery with none', async () => {
     const walletId = await openWallet('500.00');
-    const duplicates = metrics.total('wager_duplicates_detected_total', { source: 'inbox' });
+    const duplicates = await metrics.total('wager_duplicates_detected_total', { source: 'inbox' });
 
     await send(betMessage(walletId), walletId);
 
@@ -776,7 +778,7 @@ describe('killed-after-commit-before-ack', () => {
 
     expect(redelivery).toMatchObject({ classification: 'business', disposition: 'acknowledged' });
     expect(redelivery.classification === 'business' && redelivery.outcome.absorbed).toBe(true);
-    expect(metrics.total('wager_duplicates_detected_total', { source: 'inbox' })).toBe(
+    expect(await metrics.total('wager_duplicates_detected_total', { source: 'inbox' })).toBe(
       duplicates + 1,
     );
 
@@ -827,7 +829,7 @@ describe('consumer-loop-drains-the-queue', () => {
 describe('lock-timeout-is-transient', () => {
   test('a message that cannot take the wallet lock is retried, and succeeds once it is released', async () => {
     const walletId = await openWallet('500.00');
-    const conflicts = metrics.total('wager_lock_conflicts_total');
+    const conflicts = await metrics.total('wager_lock_conflicts_total');
 
     await send(betMessage(walletId), walletId);
 
@@ -854,7 +856,7 @@ describe('lock-timeout-is-transient', () => {
     expect(refused.classification === 'business' ? null : refused.error).toBeInstanceOf(
       ServiceUnavailableError,
     );
-    expect(metrics.total('wager_lock_conflicts_total')).toBe(conflicts + 1);
+    expect(await metrics.total('wager_lock_conflicts_total')).toBe(conflicts + 1);
 
     // Nothing was written, so the redelivery is a new operation and not a replay
     // (`api.transient-failure`): the inbox row of a rolled-back delivery never committed either.

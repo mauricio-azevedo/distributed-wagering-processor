@@ -2,7 +2,6 @@ import { describe, expect, test } from 'bun:test';
 
 import type { Clock } from '../../src/application/ports/clock';
 import type { EventPublisher } from '../../src/application/ports/event-publisher';
-import type { LogFields, Logger } from '../../src/application/ports/logger';
 import type { OutboxClaim } from '../../src/application/ports/repositories';
 import type { Repositories, UnitOfWork } from '../../src/application/ports/unit-of-work';
 import {
@@ -15,6 +14,8 @@ import {
 } from '../../src/domain/integration-events';
 import { Money } from '../../src/domain/money';
 import { OutboxMessage, type OutboxMessageState } from '../../src/domain/outbox-message';
+import { MetricsRegistry } from '../../src/infrastructure/observability/metrics';
+import { recordingLogger } from '../helpers/recording-logger';
 
 const WALLET_ID = '0193f0c0-0000-7000-8000-00000000000a';
 const OTHER_WALLET_ID = '0193f0c0-0000-7000-8000-00000000000b';
@@ -159,19 +160,6 @@ function recordingPublisher(failing: readonly string[] = []) {
   };
 }
 
-function recordingLogger() {
-  const records: { readonly event: string; readonly fields: LogFields }[] = [];
-
-  return {
-    records,
-    logger: {
-      error: (event: string, fields: LogFields) => {
-        records.push({ event, fields });
-      },
-    } satisfies Logger,
-  };
-}
-
 interface CycleOptions {
   readonly rows?: readonly OutboxMessage[];
   readonly failing?: readonly string[];
@@ -183,6 +171,7 @@ interface CycleOptions {
 function publisherOver(options: CycleOptions = {}) {
   const store = outboxStore(options.rows ?? []);
   const broker = recordingPublisher(options.failing);
+  const metrics = new MetricsRegistry();
   const log = recordingLogger();
   const unitOfWork: UnitOfWork = {
     snapshot() {
@@ -209,11 +198,13 @@ function publisherOver(options: CycleOptions = {}) {
     store,
     broker,
     log,
+    metrics,
     useCase: new PublishOutbox({
       unitOfWork,
       publisher: broker.publisher,
       clock: { now: () => PUBLISHED_AT } satisfies Clock,
       logger: log.logger,
+      metrics,
       ...(options.batchSize !== undefined && { batchSize: options.batchSize }),
     }),
   };
@@ -315,12 +306,15 @@ describe('publisher-sends-the-stored-envelope', () => {
 
 describe('publisher-retries-without-dropping', () => {
   test('a failed publication counts an attempt, schedules the backoff and stays pending', async () => {
-    const { useCase, store } = publisherOver({
+    const { useCase, store, metrics } = publisherOver({
       rows: [pending(FIRST, WALLET_ID)],
       failing: [FIRST],
     });
 
     expect(await useCase.execute()).toEqual({ claimed: 1, published: 0, failed: 1 });
+
+    // `obs.metrics`: the backoff this publisher scheduled, counted as its own component (OBS-003).
+    expect(await metrics.total('wager_retries_total', { component: 'outbox' })).toBe(1);
 
     const row = store.row(FIRST);
     expect(row.attempts).toBe(1);
@@ -349,8 +343,9 @@ describe('publisher-retries-without-dropping', () => {
     });
 
     expect(await useCase.execute()).toEqual({ claimed: 1, published: 0, failed: 1 });
-    expect(log.records).toEqual([
+    expect(log.at('error')).toEqual([
       {
+        level: 'error',
         event: 'outbox.publication-stalled',
         fields: {
           eventId: FIRST,

@@ -19,8 +19,10 @@ import type {
   DeliveryOutcome,
   SubmitWagerTransaction,
 } from '../../application/use-cases/submit-wager-transaction';
+import { type LogContext, withLogContext } from '../observability/log-context';
 import {
   MessageContractError,
+  type WagerTransactionRequested,
   commandOf,
   deliveryOf,
   wagerTransactionRequestedOf,
@@ -48,6 +50,11 @@ import { type VisibilityBackoff, visibilityBackoffSeconds } from './visibility-b
  *   and then deleted, without waiting out five receives of a failure nobody can fix
  *   (`msg.permanent-to-dlq`).
  *
+ * Every delivery is bound to the identity its message carries and measured as one processing of the
+ * queue entrypoint: the correlation id and the message id reach every line the delivery produces
+ * without being handed to anything (`obs.correlation-propagation`), and what was done about the
+ * message is counted where the disposition is known and nowhere else (`obs.metrics`).
+ *
  * None of it depends on the queue being FIFO or on the broker's deduplication window
  * (`msg.broker-features-optional`): the order deliveries arrive in decides nothing here, and a
  * duplicate the broker did not filter is absorbed by the inbox row rather than by this consumer.
@@ -67,6 +74,8 @@ export const WAGER_TRANSACTIONS_CONSUMER = 'wager-transactions-consumer';
  * holding their visibility while the ones before them commit.
  */
 const MAX_MESSAGES_PER_RECEIVE = 10;
+
+const MILLISECONDS_PER_SECOND = 1000;
 
 /**
  * The delivery attributes this consumer reads. The receive count drives the transient backoff; the
@@ -171,7 +180,7 @@ export class WagerTransactionsConsumer {
     const reports: DeliveryReport[] = [];
 
     for (const message of received.Messages ?? []) {
-      reports.push(await this.act(queueUrl, message, await this.deliver(message)));
+      reports.push(await this.handle(queueUrl, message));
     }
 
     return reports;
@@ -199,28 +208,52 @@ export class WagerTransactionsConsumer {
     return this.polling;
   }
 
-  /** One message: validated, delivered to the use case, and classified by what came back. */
-  private async deliver(message: Message): Promise<ClassifiedDelivery> {
-    let messageId: string | null = null;
+  /**
+   * One message, from its body to what was done about it. The identity the message carries is bound
+   * before anything else runs, so every line this delivery produces — the use case's, this
+   * consumer's, a broker refusal's — carries the correlation id and the message id without being
+   * handed them (`obs.correlation-propagation`, OBS-005). A body that never parsed binds nothing,
+   * because nothing about it is known.
+   *
+   * The whole of it is one measurement of the queue entrypoint: the processing an operator cares
+   * about is how long the service held the message, acknowledgement included (`obs.metrics`). It is
+   * taken from a monotonic reading and not from the `Clock` port, because a duration is not a
+   * moment any financial decision is taken against.
+   */
+  private async handle(queueUrl: string, message: Message): Promise<DeliveryReport> {
+    const parsed = parsedOf(message.Body);
+    const startedAt = performance.now();
+
+    return withLogContext(contextOf(parsed), async () => {
+      try {
+        return await this.act(queueUrl, message, await this.deliver(parsed, message));
+      } finally {
+        this.dependencies.metrics.observe(
+          'wager_processing_duration_seconds',
+          { entrypoint: 'queue' },
+          (performance.now() - startedAt) / MILLISECONDS_PER_SECOND,
+        );
+      }
+    });
+  }
+
+  /** The parsed message delivered to the use case, and classified by what came back. */
+  private async deliver(parsed: ParsedBody, message: Message): Promise<ClassifiedDelivery> {
+    if (!('requested' in parsed)) {
+      return this.failure(parsed.failure, null, message);
+    }
+
+    const requested = parsed.requested;
 
     try {
-      const requested = wagerTransactionRequestedOf(message.Body);
-      messageId = requested.messageId;
-
       const outcome = await this.dependencies.submit.deliver(
         commandOf(requested),
         deliveryOf(requested, this.dependencies.consumerName),
       );
 
-      if (outcome.absorbed) {
-        this.dependencies.metrics.increment('wager_duplicates_detected_total', {
-          source: 'inbox',
-        });
-      }
-
-      return { classification: 'business', messageId, outcome };
+      return { classification: 'business', messageId: requested.messageId, outcome };
     } catch (error) {
-      return this.failure(error, messageId, message);
+      return this.failure(error, requested.messageId, message);
     }
   }
 
@@ -231,11 +264,11 @@ export class WagerTransactionsConsumer {
     delivery: ClassifiedDelivery,
   ): Promise<DeliveryReport> {
     if (delivery.classification === 'business') {
-      return { ...delivery, disposition: await this.acknowledge(queueUrl, message) };
+      return this.reported({ ...delivery, disposition: await this.acknowledge(queueUrl, message) });
     }
 
     if (delivery.classification === 'permanent') {
-      return { ...delivery, disposition: await this.deadLetter(queueUrl, message) };
+      return this.reported({ ...delivery, disposition: await this.deadLetter(queueUrl, message) });
     }
 
     const visibilitySeconds = visibilityBackoffSeconds(
@@ -243,11 +276,36 @@ export class WagerTransactionsConsumer {
       this.dependencies.retryBackoff,
     );
 
-    return {
+    return this.reported({
       ...delivery,
       visibilitySeconds,
       disposition: await this.returnToQueue(queueUrl, message, visibilitySeconds),
-    };
+    });
+  }
+
+  /**
+   * What was done about one message, counted and logged. The counters are raised here because this
+   * is where the disposition is known and nowhere else: a retry is a message the broker accepted a
+   * new visibility for (`msg.transient-backoff`), a dead letter is one it accepted the forward of
+   * (`msg.permanent-to-dlq`), and a `retained` report — a call the broker refused — counts neither,
+   * so the numbers stay a count of what happened rather than of what was attempted.
+   */
+  private reported(report: DeliveryReport): DeliveryReport {
+    if (report.disposition === 'returned') {
+      this.dependencies.metrics.increment('wager_retries_total', { component: 'queue' });
+    }
+
+    if (report.disposition === 'dead-lettered') {
+      this.dependencies.metrics.increment('wager_dlq_messages_total');
+    }
+
+    this.dependencies.logger.info('wager.message.handled', {
+      classification: report.classification,
+      disposition: report.disposition,
+      messageId: report.messageId,
+    });
+
+    return report;
   }
 
   /**
@@ -349,10 +407,13 @@ export class WagerTransactionsConsumer {
   }
 
   /**
-   * The failure as its class, counted and logged. The reused message id is counted as the duplicate
-   * it is (`msg.inbox-payload-conflict`), and the broker's receipt id is logged for diagnosis and
-   * for nothing else (`msg.inbox-identity`). The log carries the failure, never the body: a message
-   * an operator has to read is the one in the dead-letter queue (`obs.no-sensitive-data`).
+   * The failure as its class, logged with the broker's receipt id for diagnosis and for nothing
+   * else (`msg.inbox-identity`). The log carries the failure, never the body: a message an operator
+   * has to read is the one in the dead-letter queue (`obs.no-sensitive-data`).
+   *
+   * The duplicate a reused message id is is counted by the use case that claimed the inbox row,
+   * which is where the reuse is recognised (`msg.inbox-payload-conflict`): this consumer sees a
+   * refusal it could not tell from any other permanent one.
    */
   private failure(
     error: unknown,
@@ -360,12 +421,6 @@ export class WagerTransactionsConsumer {
     message: Message,
   ): FailedDelivery<'transient'> | FailedDelivery<'permanent'> {
     const classification = classificationOf(error);
-
-    if (error instanceof InboxPayloadConflictError) {
-      this.dependencies.metrics.increment('wager_duplicates_detected_total', {
-        source: 'inbox-conflict',
-      });
-    }
 
     this.dependencies.logger.error('wager.message.not-applied', {
       classification,
@@ -388,6 +443,42 @@ export class WagerTransactionsConsumer {
       ...describe(error),
     });
   }
+}
+
+/**
+ * A body read before anything is done with it: the message it is, or whatever refused to parse it.
+ * The failure is carried as it was raised rather than as a contract error, so the classification
+ * below still decides it: a validation failure is permanent, and a defect nobody classified stays
+ * transient instead of being dead-lettered on the strength of where it happened.
+ */
+type ParsedBody = { readonly requested: WagerTransactionRequested } | { readonly failure: unknown };
+
+/**
+ * The message a body is, or the refusal it is not (`msg.message-contract`). It is read before the
+ * identity is bound rather than inside the delivery, because the correlation id and the message id
+ * every line of that delivery is searched by are only known once the body parsed.
+ */
+function parsedOf(body: string | undefined): ParsedBody {
+  try {
+    return { requested: wagerTransactionRequestedOf(body) };
+  } catch (failure) {
+    return { failure };
+  }
+}
+
+/**
+ * The identity one delivery binds (`msg.correlation`, `msg.inbox-identity`). A body that never
+ * parsed carries none: a line about it says what is known, which is the broker's receipt id.
+ */
+function contextOf(parsed: ParsedBody): LogContext {
+  if (!('requested' in parsed)) {
+    return {};
+  }
+
+  return {
+    correlationId: commandOf(parsed.requested).correlationId,
+    messageId: parsed.requested.messageId,
+  };
 }
 
 /**

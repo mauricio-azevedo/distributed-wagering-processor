@@ -4,10 +4,12 @@ import type { EntityManager } from '@mikro-orm/postgresql';
 import type { Clock } from '../../application/ports/clock';
 import type { EventPublisher } from '../../application/ports/event-publisher';
 import type { Logger } from '../../application/ports/logger';
+import type { Metrics } from '../../application/ports/metrics';
 import { PublishOutbox } from '../../application/use-cases/publish-outbox';
 import { systemClock } from '../clock';
 import type { Env } from '../config/env';
-import { nestLogger } from '../observability/logger';
+import { jsonLinesLogger } from '../observability/logger';
+import { uncountedMetrics } from '../observability/metrics';
 import { MikroOrmUnitOfWork } from '../persistence/mikro-orm.unit-of-work';
 import { SqsEventPublisher } from './sqs-event-publisher';
 
@@ -107,6 +109,12 @@ export interface OutboxPublisherDependencies {
   readonly publisher?: EventPublisher;
   readonly clock?: Clock;
   readonly logger?: Logger;
+  /**
+   * The registry of the process this publisher runs in, so `wager_retries_total{component="outbox"}`
+   * is counted on the instance that backed off. A caller with no registry — a probe, or a suite
+   * that asserts rows rather than metrics — counts nothing (`uncountedMetrics`).
+   */
+  readonly metrics?: Metrics;
 }
 
 /**
@@ -115,7 +123,7 @@ export interface OutboxPublisherDependencies {
  */
 export function outboxPublisher(dependencies: OutboxPublisherDependencies): OutboxPublisher {
   const { em, env } = dependencies;
-  const logger = dependencies.logger ?? nestLogger('outbox-publisher');
+  const logger = dependencies.logger ?? jsonLinesLogger('outbox-publisher');
   const sqs =
     dependencies.sqs ??
     new SQSClient({
@@ -131,6 +139,7 @@ export function outboxPublisher(dependencies: OutboxPublisherDependencies): Outb
         new SqsEventPublisher(sqs, { timeoutMs: env.OUTBOX_PUBLISH_TIMEOUT_MS }),
       clock: dependencies.clock ?? systemClock,
       logger,
+      metrics: dependencies.metrics ?? uncountedMetrics,
       batchSize: env.OUTBOX_BATCH_SIZE,
     }),
     { pollIntervalMs: env.OUTBOX_POLL_INTERVAL_MS, logger },

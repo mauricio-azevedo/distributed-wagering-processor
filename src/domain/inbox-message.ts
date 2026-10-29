@@ -73,6 +73,16 @@ export class InboxMessage implements InboxMessageState {
   }
 
   /**
+   * Whether a message arriving under this identity carries the content the first one did
+   * (`msg.inbox-payload-conflict`). The same question `WagerTransaction.matchesPayload` answers
+   * for an operation, asked of a delivery: equal means redelivery, different means the producer
+   * reused a message id for another message, which is a permanent error (ADR 0010).
+   */
+  matchesPayload(payloadHash: string): boolean {
+    return this.payloadHash === payloadHash;
+  }
+
+  /**
    * Completes the row, in the transaction that recorded the outcome of the message
    * (`outbox.single-transaction`). Completing a completed row is a programming error: the
    * consumer asks `isProcessed` first.

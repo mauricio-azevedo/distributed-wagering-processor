@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 
 import { sha256Hex } from '../../src/application/sha256';
-import { MoneyValidationError } from '../../src/domain/errors';
+import { canonicalJson } from '../../src/domain/canonical-json';
+import { CanonicalHashError, MoneyValidationError } from '../../src/domain/errors';
 import {
   type SubmittedOperation,
   canonicalOperationPayload,
   classifyReservationConflict,
+  contentHashOf,
   isIdempotencyKey,
   isPayloadHash,
   payloadHashOf,
@@ -176,6 +178,66 @@ describe('payload-hash-canonical', () => {
     expect(() => hashOf({ ...BET, money: { ...BET.money, currency: 'brl' } })).toThrow(
       MoneyValidationError,
     );
+  });
+});
+
+/**
+ * `msg.inbox-payload-conflict`: the hash a delivery stores is taken over the message's `data`, so
+ * it answers a different question than the operation's — whether this `messageId` carries the
+ * content it carried before — while sharing the canonical form and the stored spelling (ADR 0010).
+ */
+describe('content-hash-identifies-a-delivery', () => {
+  /** The `data` of the `bet` message example of [docs/asyncapi.yaml]: the operation plus its key. */
+  const CONTENT = {
+    providerId: 'provider-acme',
+    externalTransactionId: 'acme-tx-000123',
+    idempotencyKey: 'provider-acme:acme-tx-000123',
+    playerId: PLAYER_ID,
+    walletId: WALLET_ID,
+    roundId: 'round-7f3a',
+    gameId: 'lucky-sevens',
+    kind: 'BET' as const,
+    money: { amount: '40.00', currency: 'BRL' },
+  };
+
+  test('the hash is the stored spelling of the canonical JSON of the content', () => {
+    expect(contentHashOf(CONTENT, sha256Hex)).toBe(`sha256:${sha256Hex(canonicalJson(CONTENT))}`);
+    expect(isPayloadHash(contentHashOf(CONTENT, sha256Hex))).toBe(true);
+  });
+
+  test('the member order of the content does not change the hash', () => {
+    const reordered = {
+      money: { currency: CONTENT.money.currency, amount: CONTENT.money.amount },
+      kind: CONTENT.kind,
+      gameId: CONTENT.gameId,
+      roundId: CONTENT.roundId,
+      walletId: CONTENT.walletId,
+      playerId: CONTENT.playerId,
+      idempotencyKey: CONTENT.idempotencyKey,
+      externalTransactionId: CONTENT.externalTransactionId,
+      providerId: CONTENT.providerId,
+    };
+
+    expect(contentHashOf(reordered, sha256Hex)).toBe(contentHashOf(CONTENT, sha256Hex));
+  });
+
+  test('the idempotency key belongs to a delivery, unlike to an operation payload', () => {
+    const underAnotherKey = { ...CONTENT, idempotencyKey: 'provider-acme:another-key' };
+
+    expect(contentHashOf(underAnotherKey, sha256Hex)).not.toBe(contentHashOf(CONTENT, sha256Hex));
+    expect(payloadHashOf(underAnotherKey, sha256Hex)).toBe(payloadHashOf(CONTENT, sha256Hex));
+  });
+
+  test('other content under one delivery identity hashes differently', () => {
+    const otherAmount = { ...CONTENT, money: { amount: '41.00', currency: 'BRL' } };
+
+    expect(contentHashOf(otherAmount, sha256Hex)).not.toBe(contentHashOf(CONTENT, sha256Hex));
+  });
+
+  test('a digest that is not a SHA-256 hex string is refused, as for an operation', () => {
+    const hashWith = (): string => contentHashOf(CONTENT, () => 'not-a-digest');
+
+    expect(hashWith).toThrow(CanonicalHashError);
   });
 });
 

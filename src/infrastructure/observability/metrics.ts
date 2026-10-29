@@ -1,4 +1,4 @@
-import type { CounterName, Metrics } from '../../application/ports/metrics';
+import type { CounterLabels, CounterName, Metrics } from '../../application/ports/metrics';
 
 /**
  * The `Metrics` port as counters held by the process, the shape every Prometheus client has: a
@@ -10,14 +10,24 @@ import type { CounterName, Metrics } from '../../application/ports/metrics';
  * in one process do not share totals.
  */
 export class CounterRegistry implements Metrics {
-  private readonly counters = new Map<CounterName, number>();
+  private readonly counters = new Map<string, number>();
 
-  increment(counter: CounterName): void {
-    this.counters.set(counter, this.total(counter) + 1);
+  increment(counter: CounterName, labels?: CounterLabels): void {
+    this.counters.set(seriesOf(counter, labels), this.total(counter, labels) + 1);
   }
 
-  /** The value of a counter; one never raised reads `0`, as an unseen counter does in Prometheus. */
-  total(counter: CounterName): number {
-    return this.counters.get(counter) ?? 0;
+  /** The value of one series; one never raised reads `0`, as an unseen counter does in Prometheus. */
+  total(counter: CounterName, labels?: CounterLabels): number {
+    return this.counters.get(seriesOf(counter, labels)) ?? 0;
   }
+}
+
+/**
+ * `name{label="value"}`, the exposition spelling of one series, which is what a counter is counted
+ * per: two label sets of one counter are two totals of it. The labels are spelled out rather than
+ * walked, so the series a counter has are the ones `CounterLabels` can describe and a label added
+ * to that type is added here too.
+ */
+function seriesOf(counter: CounterName, labels: CounterLabels | undefined): string {
+  return labels === undefined ? counter : `${counter}{source="${labels.source}"}`;
 }

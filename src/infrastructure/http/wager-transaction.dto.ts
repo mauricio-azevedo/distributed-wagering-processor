@@ -1,22 +1,16 @@
 import { type ExecutionContext, createParamDecorator } from '@nestjs/common';
-import { z } from 'zod';
 
 import { ApplicationError } from '../../application/errors';
-import type {
-  SubmissionOutcome,
-  SubmittedWagerOperation,
-} from '../../application/use-cases/submit-wager-transaction';
+import type { SubmissionOutcome } from '../../application/use-cases/submit-wager-transaction';
 import type { FailureCode } from '../../domain/failure-code';
 import { isIdempotencyKey } from '../../domain/idempotency';
 import type { MoneyProps } from '../../domain/money';
-import { WAGER_OPERATION_KINDS } from '../../domain/transaction-kind';
+import type { RecordedTransactionStatus, WagerTransaction } from '../../domain/wager-transaction';
 import {
-  type RecordedTransactionStatus,
-  type WagerTransaction,
-  allowsReference,
-  requiresReference,
-} from '../../domain/wager-transaction';
-import { externalIdSchema, moneyPropsSchema, movesNoMoney, uuidSchema } from './contract.dto';
+  type WagerOperationFields,
+  checkWagerOperationRules,
+  wagerOperationFieldsSchema,
+} from '../transport/wager-operation.dto';
 import { RequestValidationError } from './request-validation';
 
 /**
@@ -24,113 +18,22 @@ import { RequestValidationError } from './request-validation';
  * `SubmitWagerTransactionRequest`, `TransactionOutcome` and the `Idempotency-Key` parameter of
  * [docs/openapi.yaml](../../../docs/openapi.yaml) (`model.contract-first`).
  *
- * The document states the operation as five per-kind variants; one object plus the matrix below
+ * The operation and the rules it has to satisfy live in `transport/wager-operation.dto.ts`, because
+ * the queue validates the same object and must admit exactly the same operations
+ * (`msg.same-use-case`). What is HTTP's own is here: where the idempotency key comes from, and
+ * which status each recorded outcome answers with.
+ */
+
+/**
+ * `SubmitWagerTransactionRequest`: the operation, with the rules that need more than one member to
+ * decide. The document states it as five per-kind variants; one object plus the shared check
  * enforces the same rules and names the same members, because what a caller has to fix is the
- * member and not the variant it belongs to. Every rule here is request-level: it depends on the
- * payload alone, persists nothing and answers the same every time (`api.validation-stateless`).
- * Everything that depends on stored state — the balance, the wallet's owner and currency, the
- * reference — is the use case's decision and comes back as a persisted outcome.
+ * member and not the variant it belongs to.
  */
-
-/** `tx.opening-internal`: the provider id the service keeps for its own opening credits. */
-const RESERVED_PROVIDER_ID = 'system';
-
-/**
- * `WagerOperationFields` with `WagerOperationKind` as its `kind`, so the internal `OPENING` credit
- * is unrepresentable in a request rather than refused by a check (`tx.kinds`). An unknown member is
- * a violation and not an ignored extra, which is what `additionalProperties: false` means.
- */
-const wagerOperationFieldsSchema = z.strictObject({
-  providerId: externalIdSchema.refine((providerId) => providerId !== RESERVED_PROVIDER_ID, {
-    error: `must not be ${RESERVED_PROVIDER_ID}, which the service keeps for its own transactions`,
-  }),
-  externalTransactionId: externalIdSchema,
-  playerId: uuidSchema,
-  walletId: uuidSchema,
-  roundId: externalIdSchema,
-  gameId: externalIdSchema,
-  kind: z.enum(WAGER_OPERATION_KINDS, {
-    error: `must be one of ${WAGER_OPERATION_KINDS.join(', ')}`,
-  }),
-  money: moneyPropsSchema,
-  referenceExternalTransactionId: externalIdSchema.optional(),
-});
-
-type WagerOperationFields = z.infer<typeof wagerOperationFieldsSchema>;
-
-/**
- * `SubmitWagerTransactionRequest`: the operation, with the three rules that need more than one
- * member to decide.
- *
- * The reference matrix is the domain's (`tx.reference-matrix`), read here rather than restated, so
- * the request boundary, the transaction factory and the `CHECK` constraint of SCHEMA-006 cannot
- * disagree about which kind carries a reference. The amount is strictly positive on every kind that
- * moves money and `0.00` only on a `LOSS` (`money.positive-in-operations`), and a reference to the
- * operation's own id is refused (`tx.self-reference-invalid`).
- *
- * Whether the referenced transaction exists, is of a kind this one may reference, shares its
- * context and has not been reversed already is decided nowhere near here: it depends on stored
- * state, so it is the use case's decision and comes back as a persisted outcome with its failure
- * code (`rule.reference.*`).
- */
-export const submitWagerTransactionRequestSchema = wagerOperationFieldsSchema.check((context) => {
-  const operation = context.value;
-  const reference = operation.referenceExternalTransactionId;
-
-  if (reference === undefined && requiresReference(operation.kind)) {
-    context.issues.push({
-      code: 'custom',
-      input: reference,
-      path: ['referenceExternalTransactionId'],
-      message: `is required when kind is ${operation.kind}`,
-    });
-  }
-
-  if (reference !== undefined && !allowsReference(operation.kind)) {
-    context.issues.push({
-      code: 'custom',
-      input: reference,
-      path: ['referenceExternalTransactionId'],
-      message: `must be absent when kind is ${operation.kind}`,
-    });
-  }
-
-  if (reference !== undefined && reference === operation.externalTransactionId) {
-    context.issues.push({
-      code: 'custom',
-      input: reference,
-      path: ['referenceExternalTransactionId'],
-      message: 'must differ from externalTransactionId',
-    });
-  }
-
-  // `money.positive-in-operations`: every kind but a `LOSS` becomes a ledger entry, and an entry
-  // records a movement. An amount the pattern already refused is not this rule's violation.
-  if (operation.kind !== 'LOSS' && movesNoMoney(operation.money)) {
-    context.issues.push({
-      code: 'custom',
-      input: operation.money.amount,
-      path: ['money', 'amount'],
-      message: 'must be greater than 0.00',
-    });
-  }
-});
+export const submitWagerTransactionRequestSchema =
+  wagerOperationFieldsSchema.check(checkWagerOperationRules);
 
 export type SubmitWagerTransactionRequest = WagerOperationFields;
-
-/**
- * The validated body as the use case takes it. The absent reference becomes `null`, which the
- * contract treats as the same thing — a reference sent as `null` hashes as an absent one
- * (`idem.payload-hash`) — so the operation has one shape whichever entry point assembled it.
- */
-export function submittedOperationOf(
-  request: SubmitWagerTransactionRequest,
-): SubmittedWagerOperation {
-  return {
-    ...request,
-    referenceExternalTransactionId: request.referenceExternalTransactionId ?? null,
-  };
-}
 
 /**
  * `idem.key-required`: the header is missing. It is its own `ErrorCode` rather than one more

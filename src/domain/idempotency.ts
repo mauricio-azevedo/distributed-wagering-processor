@@ -1,4 +1,4 @@
-import { canonicalJson } from './canonical-json';
+import { type CanonicalValue, canonicalJson } from './canonical-json';
 import type { ErrorCode } from './error-code';
 import { CanonicalHashError } from './errors';
 import { Money, type MoneyProps } from './money';
@@ -96,7 +96,27 @@ export function canonicalOperationPayload(operation: SubmittedOperation): string
 
 /** `idem.payload-hash`: the value stored in `payload_hash` and compared on every arrival. */
 export function payloadHashOf(operation: SubmittedOperation, sha256Hex: Sha256Hex): string {
-  const digest = sha256Hex(canonicalOperationPayload(operation));
+  return storedHash(canonicalOperationPayload(operation), sha256Hex);
+}
+
+/**
+ * `msg.inbox-payload-conflict`: the hash a delivery is recorded with, over whatever the transport
+ * calls the content of one message — the `data` of a `WagerTransactionRequested`, which is the
+ * operation plus its idempotency key (ADR 0010).
+ *
+ * It is the same canonical form and the same stored spelling as an operation's payload hash and a
+ * deliberately different projection: an operation is identified by its business fields, so the key
+ * is outside that hash, while a delivery is identified by the message, so the key is inside this
+ * one. The two therefore answer different questions about the same arrival, and neither can be
+ * used for the other's.
+ */
+export function contentHashOf(content: CanonicalValue, sha256Hex: Sha256Hex): string {
+  return storedHash(canonicalJson(content), sha256Hex);
+}
+
+/** The one spelling of a stored hash: `sha256:` and the digest, refused unless it is one. */
+function storedHash(canonical: string, sha256Hex: Sha256Hex): string {
+  const digest = sha256Hex(canonical);
 
   if (!SHA256_HEX.test(digest)) {
     throw new CanonicalHashError(

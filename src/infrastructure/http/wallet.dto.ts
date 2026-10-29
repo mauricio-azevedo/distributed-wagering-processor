@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { ReconciliationReport } from '../../application/use-cases/reconcile-wallet';
 import type { MoneyProps } from '../../domain/money';
 import type { Wallet } from '../../domain/wallet';
-import { moneyPropsSchema, uuidSchema } from './contract.dto';
+import { moneyPropsSchema, uuidSchema } from '../transport/contract.dto';
 
 /**
  * The request and response shapes of the wallet endpoints, implementing `OpenWalletRequest`,

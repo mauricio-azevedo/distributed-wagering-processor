@@ -103,7 +103,8 @@ function repositoriesOver(staged: Committed, options: { rejectWallet?: Error }):
       summarize: unreachable('ledger summary'),
     },
     inbox: {
-      insert: unreachable('inbox'),
+      claim: unreachable('inbox'),
+      complete: unreachable('inbox'),
       findByIdentity: unreachable('inbox'),
     },
     outbox: {

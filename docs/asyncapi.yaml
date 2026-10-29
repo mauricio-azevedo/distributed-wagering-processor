@@ -176,14 +176,17 @@ operations:
       1. Validate the body against `WagerTransactionRequested`. A body that fails validation, an
          unknown `type`, an unsupported `version`, kind `OPENING` or provider `system` is a
          permanent failure (`msg.message-contract`, `tx.opening-internal`).
-      2. Look up the inbox by `(consumerName, messageId)` (`msg.inbox-identity`). A processed row
-         with the same payload hash means a redelivery: acknowledge without any effect
-         (`msg.redelivery-safe`). A processed row with another payload hash is a permanent failure
-         (`msg.inbox-payload-conflict`).
+      2. Claim the inbox row for `(consumerName, messageId)` as the first statement of the
+         transaction that will carry the effect (`msg.inbox-identity`, `conc.lock-order`). It is a
+         claim and not a lookup, because two deliveries of one message id would both pass a
+         look-then-write. A row already there with the same payload hash, which is taken over
+         `data`, means a redelivery: nothing is written and the message is acknowledged
+         (`msg.redelivery-safe`); with another payload hash it is a permanent failure
+         (`msg.inbox-payload-conflict`), decided before the operation's own identity is claimed.
       3. Run the use case with `data.idempotencyKey` as the idempotency key; the same operation
          first seen over HTTP is a replay (`idem.cross-entry-point`).
-      4. Commit the transaction row, the wallet update, the ledger entry, the outbox rows and the
-         inbox row together (`outbox.single-transaction`), then delete the message
+      4. Complete the inbox row and commit it with the transaction row, the wallet update, the
+         ledger entry and the outbox rows (`outbox.single-transaction`), then delete the message
          (`msg.ack-after-commit`). A crash between commit and delete leads to a redelivery that
          step 2 absorbs.
 
@@ -263,8 +266,11 @@ components:
         (`idem.payload-hash`).
 
         `messageId` is assigned by the producer, is the inbox identity and is kept on a resend
-        (`msg.inbox-identity`); the broker's own message id is diagnostic only. Unknown members
-        anywhere in the body are a validation failure, hence a permanent error.
+        (`msg.inbox-identity`); the broker's own message id is diagnostic only. The inbox stores a
+        second hash beside the operation's, taken over `data` in the same canonical form, so a
+        reused `messageId` carrying other content is a permanent error however the operation
+        fields differ (`msg.inbox-payload-conflict`). Unknown members anywhere in the body are a
+        validation failure, hence a permanent error.
       contentType: application/json
       correlationId:
         location: '$message.payload#/correlationId'

@@ -95,7 +95,7 @@ describe('readiness-tracks-dependencies', () => {
   });
 });
 
-describe('compose-stack', () => {
+describe('queues-bootstrapped', () => {
   const sqs = new SQSClient({
     region: env.AWS_REGION,
     ...(env.SQS_ENDPOINT !== undefined && { endpoint: env.SQS_ENDPOINT }),

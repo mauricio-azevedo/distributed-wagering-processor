@@ -171,11 +171,35 @@ export interface InboxMessageIdentity {
   readonly messageId: string;
 }
 
-export interface InboxRepository {
-  /** Records a message accepted for processing, in the transaction that applies it. */
-  insert(message: InboxMessage): Promise<void>;
+/**
+ * The outcome of claiming a delivery (ADR 0010). A lost claim reports the row that holds the
+ * identity, which is what decides between a redelivery and a reused message id: the port carries
+ * the fact, `InboxMessage.matchesPayload` the decision.
+ */
+export type InboxClaim =
+  { readonly claimed: true } | { readonly claimed: false; readonly stored: InboxMessage };
 
-  /** What a consumer asks before acting, to absorb a redelivery (`msg.redelivery-safe`). */
+export interface InboxRepository {
+  /**
+   * Claims a delivery: the first statement of a message's financial transaction
+   * (`conc.lock-order`). The row either exists afterwards because this call wrote it, or it existed
+   * already, and the primary key of the table decides which for every instance at once
+   * (`msg.inbox-identity`).
+   *
+   * A redelivery arriving while the first attempt is still open waits on the primary key and then
+   * reads what that attempt committed, so the claim is also what absorbs a redelivery that a crash
+   * between commit and acknowledgement caused (`msg.ack-after-commit`, `msg.redelivery-safe`).
+   */
+  claim(message: InboxMessage): Promise<InboxClaim>;
+
+  /**
+   * Writes the completion of a claimed row, last in the transaction that applied the message
+   * (`conc.lock-order`), so a committed inbox row always carries a `processedAt` and an
+   * uncompleted one can only belong to a transaction that never committed.
+   */
+  complete(message: InboxMessage): Promise<void>;
+
+  /** The row of a delivery identity, which is what a reader asks about one (`msg.inbox-identity`). */
   findByIdentity(identity: InboxMessageIdentity): Promise<InboxMessage | null>;
 }
 

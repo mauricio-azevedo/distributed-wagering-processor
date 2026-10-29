@@ -461,10 +461,18 @@ describe('persistence-mapping-round-trip', () => {
       receivedAt: OCCURRED_AT,
     });
     completed.markProcessed(PROCESSED_AT);
+    // The claim of a delivery already recorded hands back the stored row (`msg.redelivery-safe`).
+    const redelivered = InboxMessage.receive({
+      consumerName: 'wager-transactions',
+      messageId: 'acme-msg-000124',
+      payloadHash: `sha256:${'8'.repeat(64)}`,
+      receivedAt: PROCESSED_AT,
+    });
 
     await unitOfWork.transactional(async ({ inbox }) => {
-      await inbox.insert(received);
-      await inbox.insert(completed);
+      expect(await inbox.claim(received)).toEqual({ claimed: true });
+      expect(await inbox.claim(completed)).toEqual({ claimed: true });
+      await inbox.complete(completed);
     });
 
     const [loadedReceived, loadedCompleted] = await unitOfWork.transactional(({ inbox }) =>
@@ -484,6 +492,11 @@ describe('persistence-mapping-round-trip', () => {
     expect(loadedReceived?.isProcessed()).toBe(false);
     expect(loadedCompleted).toStrictEqual(completed);
     expect(loadedCompleted?.isProcessed()).toBe(true);
+
+    const lost = await unitOfWork.transactional(({ inbox }) => inbox.claim(redelivered));
+
+    expect(lost).toEqual({ claimed: false, stored: completed });
+    expect(lost.claimed ? null : lost.stored.matchesPayload(redelivered.payloadHash)).toBe(true);
   });
 
   test('an outbox message rehydrates with its envelope, attempts and next attempt', async () => {

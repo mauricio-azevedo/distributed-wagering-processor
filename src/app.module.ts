@@ -1,3 +1,4 @@
+import { SQSClient } from '@aws-sdk/client-sqs';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { EntityManager } from '@mikro-orm/postgresql';
 import {
@@ -24,7 +25,15 @@ import { ProblemDetailsFilter } from './infrastructure/http/problem-details.filt
 import { WageringController } from './infrastructure/http/wagering.controller';
 import { WalletsController } from './infrastructure/http/wallets.controller';
 import { uuidV7IdGenerator } from './infrastructure/id-generator';
-import { sqsClientProvider } from './infrastructure/messaging/sqs';
+import {
+  WAGER_TRANSACTIONS_QUEUE,
+  queueUrlResolver,
+  sqsClientProvider,
+} from './infrastructure/messaging/sqs';
+import {
+  WAGER_TRANSACTIONS_CONSUMER,
+  WagerTransactionsConsumer,
+} from './infrastructure/messaging/wager-transactions.consumer';
 import { nestLogger } from './infrastructure/observability/logger';
 import { CounterRegistry } from './infrastructure/observability/metrics';
 import { ormConfig } from './infrastructure/persistence/mikro-orm.config';
@@ -39,6 +48,10 @@ import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm.unit-
  * (`model.framework-free-domain`, ARCHITECTURE.md section 4). The adapters they are given — the
  * unit of work over the entity manager, the clock and the id mint — are the only places a use case
  * can reach the outside.
+ *
+ * `WagerTransactionsConsumer` is constructed with the very `SubmitWagerTransaction` the controller
+ * receives, which is what `msg.same-use-case` asks of the composition root, and is not started
+ * here: which process polls the queue is `APP_ROLE`, and that with its shutdown behaviour is #19.
  */
 @Module({})
 export class AppModule implements NestModule {
@@ -90,6 +103,21 @@ export class AppModule implements NestModule {
               sha256Hex,
             }),
           inject: [MikroOrmUnitOfWork],
+        },
+        {
+          provide: WagerTransactionsConsumer,
+          useFactory: (sqs: SQSClient, submit: SubmitWagerTransaction, metrics: CounterRegistry) =>
+            new WagerTransactionsConsumer({
+              sqs,
+              queueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_QUEUE),
+              submit,
+              metrics,
+              logger: nestLogger(WAGER_TRANSACTIONS_CONSUMER),
+              consumerName: WAGER_TRANSACTIONS_CONSUMER,
+              waitTimeSeconds: env.SQS_WAIT_TIME_SECONDS,
+              visibilityTimeoutSeconds: env.SQS_VISIBILITY_TIMEOUT_SECONDS,
+            }),
+          inject: [SQSClient, SubmitWagerTransaction, CounterRegistry],
         },
       ],
     };

@@ -60,8 +60,10 @@ and `updated_at`, none of them in a unique index, so the `UPDATE` itself also ta
 in the service needs `FOR UPDATE` on a wallet: wallet keys never change and wallets are never deleted. Checked
 against PostgreSQL 18 with two sessions on one wallet: `FOR UPDATE NOWAIT` fails while another reservation is
 open and `FOR NO KEY UPDATE NOWAIT` succeeds; ten concurrent reservation pairs deadlocked ten times with
-`FOR UPDATE` and zero times with `FOR NO KEY UPDATE`, every pair serializing with consecutive versions. Two
-other ways out were rejected: locking the wallet before reserving makes every duplicate queue on the wallet
+`FOR UPDATE` and zero times with `FOR NO KEY UPDATE`, every pair serializing with consecutive versions. That
+check is now CONC-009 and runs in the gate instead of having been made once: the suite drives both arms, the
+repository's own statement and the `FOR UPDATE` control, so this paragraph fails with the code if either half
+of it stops holding. Two other ways out were rejected: locking the wallet before reserving makes every duplicate queue on the wallet
 lock (fifty copies, fifty acquisitions) and lengthens the time the lock is held; a `DEFERRABLE` foreign key
 moves the unknown-wallet failure to commit time and weakens a reference the ledger's composite key builds on.
 

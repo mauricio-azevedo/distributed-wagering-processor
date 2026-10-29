@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 
 import { ServiceUnavailableError } from '../../src/application/errors';
-import { transientDatabaseFailure } from '../../src/infrastructure/persistence/transient-failure';
+import {
+  isWalletLockTimeout,
+  transientDatabaseFailure,
+} from '../../src/infrastructure/persistence/transient-failure';
 
 const LIMITS = { lockTimeoutMs: 3000 };
 
@@ -52,5 +55,28 @@ describe('transient-failures-become-a-retryable-refusal', () => {
     for (const code of ['55P03', '08006']) {
       expect(classify(sqlState(code))?.message).not.toMatch(/\d+\.\d{2}/);
     }
+  });
+});
+
+/**
+ * The one transient class that is counted separately (`wager_lock_conflicts_total`, CONC-002). It
+ * is a question of its own because the answer is narrower than "transient": an unreachable database
+ * and a wallet under contention both answer `503`, and only the second says anything about the
+ * ceiling of ADR 0002. The counting itself is asserted through both entry points, in
+ * `bet-submission.test.ts` and `queue-submission.test.ts`.
+ */
+describe('lock-waits-are-told-from-other-transient-failures', () => {
+  test('the state lock_timeout raises is the lock wait, wrapped or not', () => {
+    expect(isWalletLockTimeout(sqlState('55P03'))).toBe(true);
+    expect(isWalletLockTimeout(new Error('wrapped', { cause: sqlState('55P03') }))).toBe(true);
+  });
+
+  test('no other transient failure, and no refusal at all, counts as a lock wait', () => {
+    for (const code of ['40001', '40P01', '55006', '08006', '57014', '23505']) {
+      expect(isWalletLockTimeout(sqlState(code))).toBe(false);
+    }
+
+    expect(isWalletLockTimeout(new Error('a defect'))).toBe(false);
+    expect(isWalletLockTimeout(null)).toBe(false);
   });
 });

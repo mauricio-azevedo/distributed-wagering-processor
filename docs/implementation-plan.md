@@ -48,7 +48,7 @@ Exit evidence: atomicity test with an injected failure after the ledger insert l
 
 Scope: the concurrency suite with real parallelism: two bets against one balance, fifty copies of one bet, distinct wallets in parallel, three processes against one database; `lock_timeout` handling; reconciliation under load.
 
-Acceptance: CONC-001 through CONC-009, RECON-001.
+Acceptance: CONC-001 through CONC-009, RECON-001, RECON-004.
 
 Exit evidence: the canonical scenario (opening 100.00, two bets of 80.00) ends with one `PROCESSED`, one `REJECTED`, balance 20.00 and one `DEBIT` entry, repeatedly and across three processes.
 

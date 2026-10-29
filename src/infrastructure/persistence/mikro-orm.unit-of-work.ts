@@ -1,19 +1,22 @@
 import { type EntityManager, IsolationLevel } from '@mikro-orm/postgresql';
 
+import type { Metrics } from '../../application/ports/metrics';
 import type { Repositories, UnitOfWork } from '../../application/ports/unit-of-work';
+import { uncountedMetrics } from '../observability/metrics';
 import { MikroOrmInboxRepository } from './repositories/inbox.repository';
 import { MikroOrmLedgerRepository } from './repositories/ledger.repository';
 import { MikroOrmOutboxRepository } from './repositories/outbox.repository';
 import { MikroOrmPendingReferenceScheduleRepository } from './repositories/pending-reference-schedule.repository';
 import { MikroOrmWagerTransactionRepository } from './repositories/wager-transaction.repository';
 import { MikroOrmWalletRepository } from './repositories/wallet.repository';
-import { transientDatabaseFailure } from './transient-failure';
+import { isWalletLockTimeout, transientDatabaseFailure } from './transient-failure';
 
 /**
  * ADR 0002's "about three seconds": long enough that a wallet under ordinary contention waits its
  * turn, short enough that a caller is told to retry instead of holding a connection open. It is the
  * fallback for a unit of work built without the environment — a test helper or a probe — so that
- * such a caller still cannot wait without bound; the service passes `LOCK_TIMEOUT_MS`.
+ * such a caller still cannot wait without bound; the service passes `LOCK_TIMEOUT_MS`. The
+ * `Metrics` default is there for the same callers and for the same reason (`uncountedMetrics`).
  */
 const DEFAULT_LOCK_TIMEOUT_MS = 3000;
 
@@ -33,6 +36,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
   constructor(
     private readonly em: EntityManager,
     private readonly lockTimeoutMs: number = DEFAULT_LOCK_TIMEOUT_MS,
+    private readonly metrics: Metrics = uncountedMetrics,
   ) {}
 
   /**
@@ -78,11 +82,21 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
    *
    * Only a classified failure is translated, so a constraint violation, a defect or an application
    * error still reaches the caller as itself.
+   *
+   * It is also where a lock wait is counted (`wager_lock_conflicts_total`, CONC-002). The count
+   * belongs here and not in the entry points because this is where the wait is recognised: HTTP
+   * answers `503` and the queue leaves the message for a later receive, and both do so from this
+   * one refusal, so counting here is what makes the number the same measurement whichever of them
+   * the operation arrived through (`msg.same-use-case`).
    */
   private async classifying<T>(run: () => Promise<T>): Promise<T> {
     try {
       return await run();
     } catch (error) {
+      if (isWalletLockTimeout(error)) {
+        this.metrics.increment('wager_lock_conflicts_total');
+      }
+
       throw transientDatabaseFailure(error, { lockTimeoutMs: this.lockTimeoutMs }) ?? error;
     }
   }

@@ -95,6 +95,19 @@ export function transientDatabaseFailure(
   return null;
 }
 
+/**
+ * Whether the failure is the wallet lock of ADR 0002 giving up, which is the one transient class
+ * the service counts separately (`wager_lock_conflicts_total`, CONC-002): a rising count means
+ * wallets are hotter than the ceiling allows, while a rising count of unreachable databases means
+ * something else entirely.
+ *
+ * It reads the same SQLSTATE the refusal above is built from, so the count and the message a caller
+ * receives can never disagree about what happened.
+ */
+export function isWalletLockTimeout(error: unknown): boolean {
+  return failureCodeOf(error) === LOCK_NOT_AVAILABLE;
+}
+
 function isTransient(code: string | null): boolean {
   return code !== null && (TRANSIENT_SQL_STATES.has(code) || TRANSIENT_SOCKET_CODES.has(code));
 }

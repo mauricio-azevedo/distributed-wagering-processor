@@ -11,10 +11,11 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
  * (`api.problem-details`). The first caller fixes the id and puts it on the response; every later
  * one reads the same value, so the header and the body of one response can never disagree.
  *
- * `CorrelationId` of [docs/openapi.yaml](../../../docs/openapi.yaml) is the authoritative form.
- * A caller's value is taken when it matches and replaced with a generated one when it does not:
- * refusing a malformed one as `400` arrives with the sweep of API-001, and until then a response
- * always carries an id an operator can search for, which is the point of the header.
+ * `CorrelationId` of [docs/openapi.yaml](../../../docs/openapi.yaml) is the authoritative form. A
+ * caller's value is taken when it matches and replaced with a generated one when it does not, which
+ * the contract states as its one exception to strict input (`api.correlation-header`): the header
+ * names the request for an operator and decides nothing about the operation, so a financial
+ * submission must not fail over it, and the response carries the id that was used.
  */
 const CORRELATION_ID = /^[!-~]{1,128}$/;
 

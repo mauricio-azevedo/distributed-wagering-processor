@@ -112,15 +112,18 @@ entries:
     requirement: Shapes are defined once, in the transport contracts; the code implements them and every amount is a string.
     contract: [model.money-props-in-contracts, model.contract-first, api.contract-document]
     enforcement:
-      - DTOs with validation implement docs/openapi.yaml; message and event classes implement docs/asyncapi.yaml; review on change.
+      - DTOs with validation implement docs/openapi.yaml; message and event classes implement docs/asyncapi.yaml.
+      - A contract suite validates the service's own answers and payloads against the schemas of both documents, parsed at run time, and walks each payload for an amount sent as a JSON number.
     scenario:
-      - Submit a bet, read the wallet, page the ledger and reconcile; capture one message and one event of each type.
+      - Submit a bet that is applied, one that is rejected and one that parks on a missing reference; read the wallet, the ledger, both transaction views and the three operational endpoints; take the events the three submissions enqueued.
+      - Validate every example either contract document carries against the schema beside it, including the message examples of docs/asyncapi.yaml.
     expected:
-      - Every captured body and payload validates against the schema of its operation or message in the contract documents; every money field is a string with the two-decimal pattern.
+      - Every body, every event payload and every example validates against the schema its document declares for it, and every operation of docs/openapi.yaml is exercised.
+      - No amount anywhere is a JSON number; every money field is a string with the two-decimal pattern.
     evidence: { testId: payloads-validate-against-contracts, layer: contract }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   # ---------------------------------------------------------------- MONEY
   - id: MONEY-001
@@ -1886,15 +1889,18 @@ entries:
     requirement: Status classes are used consistently across every endpoint.
     contract: api.status-classes
     enforcement:
-      - One exception filter maps domain and infrastructure errors to statuses.
+      - One exception filter maps domain and infrastructure errors to statuses, from one complete table of ErrorCode to status.
+      - A matrix over every operation and the four situations, exercised against the running service.
     scenario:
-      - Exercise every endpoint with a malformed input, an unknown id, a conflict and a transient failure.
+      - Exercise every endpoint with a malformed input, an unknown id, a conflict and a transient failure, each where the situation can arise; the transient column runs against an instance whose PostgreSQL address is unreachable.
+      - Submit an operation the balance refuses, and reconcile a wallet.
     expected:
-      - 400, 404, 409 and 503 respectively on every endpoint where the situation applies; 422 only for business rejections.
+      - 400, 404, 409 and 503 respectively, each with the problem details code the system contract tabulates for it.
+      - 422 only for the business rejection, which is persisted; the reconciliation answers 200 whatever it finds.
     evidence: { testId: status-classes-consistent, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-002
     priority: required
@@ -2012,15 +2018,17 @@ entries:
     requirement: Health and metrics endpoints are open and readiness reflects dependencies.
     contract: [api.health-open, obs.health-split, auth.open-endpoints]
     enforcement:
-      - Terminus probes; guard excludes the three routes.
+      - Terminus probes; the three routes carry the guard exemption of auth.open-endpoints, declared on the controller.
     scenario:
-      - Call live, ready and metrics with no credentials; stop LocalStack and call ready again.
+      - Call live, ready and metrics with no credentials.
+      - Call the three on an instance whose SQS endpoint is unreachable.
     expected:
-      - 200, 200, 200; then ready answers 503 with sqs down while live still answers 200.
+      - 200, 200, 200, the metrics in the Prometheus text format.
+      - Ready answers 503 with sqs down; live and metrics still answer 200, because neither speaks for a dependency.
     evidence: { testId: health-endpoints, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-010
     priority: required
@@ -2042,30 +2050,34 @@ entries:
     requirement: The service serves docs/openapi.yaml unchanged and its routes are exactly the operations of that document.
     contract: [api.contract-document, model.contract-first]
     enforcement:
-      - The api role serves the document at /docs-json and renders it at /docs; nothing is generated in either direction.
+      - The api role serves the file's bytes at /docs-json and renders that route at /docs; nothing is generated in either direction, and the image carries the document.
     scenario:
-      - Fetch /docs-json; parse docs/openapi.yaml; list the routes registered by the running application.
+      - Fetch /docs-json and /docs; parse docs/openapi.yaml; list the routes the running application registered in its router.
     expected:
-      - The served document equals the file; every registered route and method except /docs and /docs-json is an operation of the document, and every operation is a registered route.
-    evidence: { testId: openapi-document-served-and-complete, layer: integration }
+      - The served document is the file byte for byte, and /docs renders it from that route.
+      - Every registered route and method except /docs and /docs-json is an operation of the document, every operation is a registered route, and those two are the only routes outside the document.
+    evidence: { testId: openapi-document-served-and-complete, layer: contract }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: API-012
     priority: required
     requirement: Failure codes are stable and each documents a caller action.
     contract: [failure.stable-codes, failure.caller-action]
     enforcement:
-      - FailureCode and ErrorCode enumerations in code, in docs/openapi.yaml and in docs/asyncapi.yaml mirror the tables in the system contract; review on change.
+      - FailureCode and ErrorCode enumerations in code, in docs/openapi.yaml and in docs/asyncapi.yaml mirror the tables in the system contract.
+      - A contract suite compares all five places, the ErrorCode set being the status table the HTTP adapter is built on, which its own type makes exhaustive.
     scenario:
-      - Compare the enumerations in code and in the contract documents with the two tables.
+      - Compare the enumerations in the domain, in the adapter's status mapping and in both contract documents with the two tables of the system contract.
+      - Read the caller action of every row, and the status of every error code.
     expected:
-      - Same sets, every row with a caller action.
+      - Same sets in the same order, each code appearing once in each place and the two taxonomies disjoint.
+      - Every row carries a caller action, and each error code answers with the status its row tabulates.
     evidence: { testId: failure-codes-match-contract, layer: contract }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
   - id: API-013
     priority: required
     requirement: An unknown commit outcome is recovered by resending the same idempotency key, and the operation takes effect exactly once.
@@ -2858,27 +2870,31 @@ entries:
     requirement: Authentication is deferred behind an explicit port and a guard that admits every request.
     contract: [auth.deferred, auth.extension-point, auth.intended-design]
     enforcement:
-      - ProviderIdentityPort in the application layer; no-op guard in the HTTP layer; design recorded in ARCHITECTURE.md.
+      - ProviderIdentityPort in the application layer, with the implementation of this version establishing no identity; one HTTP guard asks it and is the only place a caller's identity is enforced; the composition root takes the implementation as an argument, so replacing it touches nothing else; design recorded in ARCHITECTURE.md.
     scenario:
-      - Submit without credentials; replace the guard with a test implementation that binds a provider identity.
+      - Submit without credentials against the application as it ships.
+      - Build the same application with a test implementation of the port that identifies every caller as one provider, and submit a payload naming another provider, then one naming that provider; read another provider's transaction on the provider path.
     expected:
-      - The first request is processed; with the test guard, a payload naming another provider is rejected before reaching the domain.
+      - The first request is processed.
+      - The payload naming another provider is refused before reaching the domain, with no transaction written, and so is the provider read; the payload naming the identified provider is applied.
     evidence: { testId: auth-extension-point, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing
 
   - id: AUTH-002
     priority: required
     requirement: Health and metrics stay open, and queue messages are validated like any other input.
     contract: [auth.open-endpoints, auth.queue-trusted-channel]
     enforcement:
-      - Guard exclusions; consumer runs the full domain validation.
+      - The exemption is declared on the controller, so a route added later is covered unless it says otherwise; the consumer never meets the guard and runs the full domain validation.
     scenario:
-      - Enable the test guard; call health and metrics without credentials; send a message with a mismatching player and wallet.
+      - With the identifying test implementation bound, call health, metrics and the two documentation routes without credentials.
+      - Send a message, carrying no credentials, whose player is not the owner of its wallet.
     expected:
-      - 200 on the three endpoints; the message is rejected with WALLET_PLAYER_MISMATCH.
+      - 200 on all of them, on that instance and on the one that ships.
+      - The message is rejected with WALLET_PLAYER_MISMATCH and acknowledged, and no other wallet is touched.
     evidence: { testId: open-endpoints-and-queue-validation, layer: integration }
     deliverySlice: http-observability-shutdown
-    implementationStatus: planned
-    verificationStatus: not-run
+    implementationStatus: implemented
+    verificationStatus: passing

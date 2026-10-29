@@ -9,9 +9,11 @@ import {
   type Provider,
   type Type,
 } from '@nestjs/common';
-import { APP_FILTER } from '@nestjs/core';
+import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { TerminusModule } from '@nestjs/terminus';
 
+import type { ProviderIdentityPort } from './application/ports/provider-identity';
+import { unauthenticatedProviderIdentity } from './application/ports/provider-identity';
 import { sha256Hex } from './application/sha256';
 import { GetWagerTransaction } from './application/use-cases/get-wager-transaction';
 import { GetWallet } from './application/use-cases/get-wallet';
@@ -26,8 +28,13 @@ import { type AppRole, type Env, runsWorkers } from './infrastructure/config/env
 import { HealthController } from './infrastructure/health/health.controller';
 import { PostgresHealthIndicator } from './infrastructure/health/postgres.health';
 import { SqsHealthIndicator } from './infrastructure/health/sqs.health';
+import { ContractDocumentController } from './infrastructure/http/contract-document.controller';
 import { ObserveRequest } from './infrastructure/http/observe-request';
 import { ProblemDetailsFilter } from './infrastructure/http/problem-details.filter';
+import {
+  PROVIDER_IDENTITY,
+  ProviderIdentityGuard,
+} from './infrastructure/http/provider-identity.guard';
 import { ProviderTransactionsController } from './infrastructure/http/provider-transactions.controller';
 import { WageringController } from './infrastructure/http/wagering.controller';
 import { WalletsController } from './infrastructure/http/wallets.controller';
@@ -70,7 +77,15 @@ function controllersOf(role: AppRole): Type<unknown>[] {
 
   return role === 'worker'
     ? everyRole
-    : [...everyRole, WalletsController, WageringController, ProviderTransactionsController];
+    : [
+        ...everyRole,
+        // The contract document goes with the surface it describes (`api.contract-document`): an
+        // instance that answers none of its operations has no business publishing it.
+        ContractDocumentController,
+        WalletsController,
+        WageringController,
+        ProviderTransactionsController,
+      ];
 }
 
 /**
@@ -110,7 +125,17 @@ const workerRuntimeProvider: Provider = {
  */
 @Module({})
 export class AppModule implements NestModule {
-  static create(env: Env): DynamicModule {
+  /**
+   * The adapters a deployment chooses, as the composition root takes them. Each one has the
+   * implementation this version runs with as its default, so naming one is the whole of replacing
+   * it: `providerIdentity` is the authentication extension point, and binding another
+   * implementation here is what enabling authentication consists of (`auth.extension-point`,
+   * AUTH-001).
+   */
+  static create(
+    env: Env,
+    adapters: { readonly providerIdentity?: ProviderIdentityPort } = {},
+  ): DynamicModule {
     return {
       module: AppModule,
       imports: [MikroOrmModule.forRoot(ormConfig(env.DATABASE_URL)), TerminusModule],
@@ -120,6 +145,11 @@ export class AppModule implements NestModule {
         PostgresHealthIndicator,
         SqsHealthIndicator,
         { provide: APP_FILTER, useClass: ProblemDetailsFilter },
+        { provide: APP_GUARD, useClass: ProviderIdentityGuard },
+        {
+          provide: PROVIDER_IDENTITY,
+          useValue: adapters.providerIdentity ?? unauthenticatedProviderIdentity,
+        },
         MetricsRegistry,
         ObserveRequest,
         { provide: OBSERVABILITY_LOGGER, useValue: jsonLinesLogger('observability') },

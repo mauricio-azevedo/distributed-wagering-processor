@@ -2,6 +2,7 @@ import { Controller, Get, Inject, Res } from '@nestjs/common';
 
 import type { Logger } from '../../application/ports/logger';
 import { ObserveOutboxBacklog } from '../../application/use-cases/observe-outbox-backlog';
+import { OpenEndpoint } from '../http/open-endpoint';
 import { MetricsRegistry } from './metrics';
 
 /** The `Logger` port as a Nest token: an interface cannot be one, and the adapter is chosen once. */
@@ -29,6 +30,7 @@ interface ExpositionResponse {
  * one gauge could not be read would lose the metrics that say why. The two gauges then keep the
  * last value they were measured at, and the failure is a line of its own.
  */
+@OpenEndpoint()
 @Controller('metrics')
 export class MetricsController {
   constructor(

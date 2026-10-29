@@ -10,6 +10,8 @@
   "devDependencies": {
     "@eslint/js": "^10",
     "@types/bun": "^1.4.4",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "eslint": "^10",
     "eslint-config-prettier": "^10",
     "prettier": "^3",

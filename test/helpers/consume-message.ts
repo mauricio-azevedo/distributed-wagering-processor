@@ -23,7 +23,11 @@ import { sha256Hex } from '../../src/application/sha256';
 import { systemClock } from '../../src/infrastructure/clock';
 import { loadEnv } from '../../src/infrastructure/config/env';
 import { uuidV7IdGenerator } from '../../src/infrastructure/id-generator';
-import { WAGER_TRANSACTIONS_QUEUE, queueUrlResolver } from '../../src/infrastructure/messaging/sqs';
+import {
+  WAGER_TRANSACTIONS_DLQ,
+  WAGER_TRANSACTIONS_QUEUE,
+  queueUrlResolver,
+} from '../../src/infrastructure/messaging/sqs';
 import {
   WAGER_TRANSACTIONS_CONSUMER,
   WagerTransactionsConsumer,
@@ -58,6 +62,7 @@ try {
   const consumer = new WagerTransactionsConsumer({
     sqs,
     queueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_QUEUE),
+    deadLetterQueueUrl: queueUrlResolver(sqs, WAGER_TRANSACTIONS_DLQ),
     submit: new DiesBeforeAcknowledgement({
       unitOfWork: new MikroOrmUnitOfWork(orm.em, env.LOCK_TIMEOUT_MS),
       clock: systemClock,
@@ -71,6 +76,10 @@ try {
     consumerName: WAGER_TRANSACTIONS_CONSUMER,
     waitTimeSeconds: 5,
     visibilityTimeoutSeconds: env.SQS_VISIBILITY_TIMEOUT_SECONDS,
+    retryBackoff: {
+      baseSeconds: env.SQS_RETRY_BACKOFF_BASE_SECONDS,
+      maxSeconds: env.SQS_RETRY_BACKOFF_MAX_SECONDS,
+    },
   });
 
   await consumer.poll();
